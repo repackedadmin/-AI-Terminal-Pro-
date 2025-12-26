@@ -98,9 +98,11 @@ REINFORCEMENT_DIR = os.path.join(TRAINING_DIR, "reinforcement")
 API_DIR = os.path.join(BASE_DIR, "api")
 API_CONFIG_FILE = os.path.join(API_DIR, "api_config.json")
 API_KEYS_FILE = os.path.join(API_DIR, "api_keys.json")
+APPS_DIR = os.path.join(BASE_DIR, "apps")
+APP_PROJECTS_DB = os.path.join(BASE_DIR, "app_projects.sqlite")
 
 # Ensure all workspace directories exist
-for directory in [SANDBOX_DIR, DOCS_DIR, CUSTOM_TOOLS_DIR, TRAINING_DIR, TRAINING_DATA_DIR, MODELS_DIR, LORA_DIR, REINFORCEMENT_DIR, API_DIR]:
+for directory in [SANDBOX_DIR, DOCS_DIR, CUSTOM_TOOLS_DIR, TRAINING_DIR, TRAINING_DATA_DIR, MODELS_DIR, LORA_DIR, REINFORCEMENT_DIR, API_DIR, APPS_DIR]:
     if not os.path.exists(directory):
         os.makedirs(directory)
 
@@ -1442,6 +1444,156 @@ def check_ollama_running():
     except:
         return False
 
+def detect_os():
+    """Detect the operating system."""
+    system = platform.system()
+    if system == "Windows":
+        return "windows"
+    elif system == "Darwin":
+        return "macos"
+    elif system == "Linux":
+        return "linux"
+    else:
+        return "unknown"
+
+def check_ollama_installed():
+    """Check if Ollama is installed."""
+    try:
+        result = subprocess.run(["ollama", "--version"], capture_output=True, text=True)
+        return result.returncode == 0
+    except FileNotFoundError:
+        return False
+
+def download_ollama():
+    """Download Ollama installer for the detected OS."""
+    os_type = detect_os()
+    
+    print(f"\n{Colors.BRIGHT_CYAN}Detected OS: {Colors.BRIGHT_WHITE}{os_type}{Colors.RESET}")
+    print(f"{Colors.BRIGHT_CYAN}Downloading Ollama installer...{Colors.RESET}\n")
+    
+    urls = {
+        "windows": "https://ollama.com/download/OllamaSetup.exe",
+        "macos": "https://ollama.com/download/Ollama-darwin.zip",
+        "linux": None  # Linux uses install script
+    }
+    
+    try:
+        if os_type == "linux":
+            print(f"{Colors.BRIGHT_CYAN}Installing Ollama on Linux...{Colors.RESET}")
+            print(f"{Colors.DIM}Running: curl -fsSL https://ollama.com/install.sh | sh{Colors.RESET}\n")
+            
+            # Download and run install script
+            result = subprocess.run(
+                "curl -fsSL https://ollama.com/install.sh | sh",
+                shell=True,
+                capture_output=True,
+                text=True
+            )
+            
+            if result.returncode == 0:
+                print(f"\n{Colors.BRIGHT_GREEN}✓ Ollama installed successfully!{Colors.RESET}")
+                return True
+            else:
+                print(f"\n{Colors.BRIGHT_RED}✗ Installation failed: {result.stderr}{Colors.RESET}")
+                return False
+        
+        elif os_type in urls and urls[os_type]:
+            url = urls[os_type]
+            filename = os.path.basename(url)
+            download_path = os.path.join(BASE_DIR, filename)
+            
+            print(f"{Colors.BRIGHT_CYAN}Downloading from: {Colors.DIM}{url}{Colors.RESET}")
+            
+            response = requests.get(url, stream=True, timeout=30)
+            total_size = int(response.headers.get('content-length', 0))
+            
+            with open(download_path, 'wb') as f:
+                downloaded = 0
+                for chunk in response.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+                        downloaded += len(chunk)
+                        if total_size > 0:
+                            percent = (downloaded / total_size) * 100
+                            print(f"\r{Colors.BRIGHT_CYAN}Progress: {percent:.1f}%{Colors.RESET}", end='', flush=True)
+            
+            print(f"\n{Colors.BRIGHT_GREEN}✓ Downloaded: {download_path}{Colors.RESET}\n")
+            
+            if os_type == "windows":
+                print(f"{Colors.BRIGHT_YELLOW}Please run the installer: {download_path}{Colors.RESET}")
+                print(f"{Colors.DIM}After installation, restart this setup.{Colors.RESET}")
+                run_installer = input(f"\n{Colors.BRIGHT_GREEN}Run installer now? [Y/n]: {Colors.RESET}").strip().lower()
+                if run_installer != 'n':
+                    subprocess.Popen([download_path], shell=True)
+                    print(f"{Colors.BRIGHT_CYAN}Installer launched. Please complete the installation and restart this application.{Colors.RESET}")
+                    sys.exit(0)
+                return False
+            
+            elif os_type == "macos":
+                print(f"{Colors.BRIGHT_YELLOW}Please install Ollama from: {download_path}{Colors.RESET}")
+                print(f"{Colors.DIM}Extract the zip and move Ollama to Applications.{Colors.RESET}")
+                return False
+            
+        else:
+            print(f"{Colors.BRIGHT_RED}✗ Unsupported OS or download URL not available.{Colors.RESET}")
+            print(f"{Colors.YELLOW}Please visit https://ollama.ai to download manually.{Colors.RESET}")
+            return False
+            
+    except Exception as e:
+        print(f"\n{Colors.BRIGHT_RED}✗ Download failed: {e}{Colors.RESET}")
+        return False
+
+def install_and_start_ollama():
+    """Check, install, and start Ollama if needed."""
+    print(f"\n{Colors.BRIGHT_CYAN}{'='*79}{Colors.RESET}")
+    print(f"{Colors.BRIGHT_YELLOW}{Colors.BOLD}  OLLAMA SETUP{Colors.RESET}")
+    print(f"{Colors.BRIGHT_CYAN}{'='*79}{Colors.RESET}\n")
+    
+    # Check if Ollama is installed
+    if check_ollama_installed():
+        print(f"{Colors.BRIGHT_GREEN}✓ Ollama is installed.{Colors.RESET}")
+        
+        # Check if running
+        if check_ollama_running():
+            print(f"{Colors.BRIGHT_GREEN}✓ Ollama is running.{Colors.RESET}")
+            return True
+        else:
+            print(f"{Colors.YELLOW}⚠ Ollama is installed but not running.{Colors.RESET}")
+            print(f"{Colors.BRIGHT_CYAN}Attempting to start Ollama...{Colors.RESET}\n")
+            
+            # Try to start Ollama
+            try:
+                os_type = detect_os()
+                if os_type == "windows":
+                    subprocess.Popen(["ollama", "serve"], creationflags=subprocess.CREATE_NEW_CONSOLE)
+                else:
+                    subprocess.Popen(["ollama", "serve"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                
+                # Wait for it to start
+                time.sleep(3)
+                
+                if check_ollama_running():
+                    print(f"{Colors.BRIGHT_GREEN}✓ Ollama started successfully!{Colors.RESET}")
+                    return True
+                else:
+                    print(f"{Colors.YELLOW}⚠ Ollama started but not responding yet. Please wait a moment...{Colors.RESET}")
+                    return False
+            except Exception as e:
+                print(f"{Colors.BRIGHT_RED}✗ Failed to start Ollama: {e}{Colors.RESET}")
+                return False
+    else:
+        print(f"{Colors.YELLOW}⚠ Ollama is not installed.{Colors.RESET}")
+        install_choice = input(f"\n{Colors.BRIGHT_GREEN}Would you like to install Ollama now? [Y/n]: {Colors.RESET}").strip().lower()
+        
+        if install_choice != 'n':
+            if download_ollama():
+                return True
+            else:
+                return False
+        else:
+            print(f"{Colors.DIM}You can install Ollama later from: https://ollama.ai{Colors.RESET}")
+            return False
+
 def pull_ollama_model(model_name):
     """Pull/download an Ollama model."""
     try:
@@ -1945,6 +2097,639 @@ class ReinforcementLearningManager:
 
 
 # ==============================================================================
+#                           6. MULTI-AGENT APP BUILDER SYSTEM
+# ==============================================================================
+
+class BaseAgent:
+    """Base class for all AI agents."""
+    
+    def __init__(self, name, role, system_prompt, ai_engine):
+        self.name = name
+        self.role = role
+        self.system_prompt = system_prompt
+        self.ai_engine = ai_engine
+    
+    def think(self, context, max_tokens=500):
+        """Generate response based on context."""
+        prompt = f"{self.system_prompt}\n\nContext:\n{context}\n\n{self.role} Response:"
+        
+        # Temporarily adjust max tokens for this agent
+        original_max = self.ai_engine.config.get('max_response_tokens', 250)
+        self.ai_engine.config['max_response_tokens'] = max_tokens
+        
+        response = self.ai_engine.generate(prompt)
+        
+        # Restore original
+        self.ai_engine.config['max_response_tokens'] = original_max
+        
+        return response
+
+
+class SpecificationWriterAgent(BaseAgent):
+    """Clarifies requirements and writes specifications."""
+    
+    def __init__(self, ai_engine):
+        system_prompt = (
+            "You are a Specification Writer. Your job is to understand project requirements deeply. "
+            "Ask clarifying questions if the description is vague. Write clear, detailed specifications. "
+            "Output format: questions OR final specification document."
+        )
+        super().__init__("Specification Writer", "SPEC_WRITER", system_prompt, ai_engine)
+    
+    def analyze_description(self, app_name, description):
+        """Analyze if description is sufficient."""
+        context = f"App Name: {app_name}\nDescription: {description}\n\nIs this description clear and complete? If not, what questions should I ask?"
+        return self.think(context, 300)
+    
+    def write_specification(self, app_name, description, qa_pairs=None):
+        """Write final specification."""
+        context = f"App Name: {app_name}\nDescription: {description}\n"
+        if qa_pairs:
+            context += "\nQ&A:\n" + "\n".join([f"Q: {q}\nA: {a}" for q, a in qa_pairs])
+        context += "\n\nWrite a detailed specification document."
+        return self.think(context, 800)
+
+
+class ArchitectAgent(BaseAgent):
+    """Designs architecture and checks dependencies."""
+    
+    def __init__(self, ai_engine):
+        system_prompt = (
+            "You are a Software Architect. Design system architecture, choose technologies, "
+            "list required dependencies. Be specific about versions and installation commands. "
+            "Consider scalability, maintainability, and best practices."
+        )
+        super().__init__("Architect", "ARCHITECT", system_prompt, ai_engine)
+    
+    def design_architecture(self, specification):
+        """Design system architecture."""
+        context = f"Specification:\n{specification}\n\nDesign the architecture. List: tech stack, dependencies, system design, folder structure."
+        return self.think(context, 1000)
+    
+    def check_and_install_dependencies(self, architecture):
+        """Parse architecture and install dependencies."""
+        # Extract dependencies from architecture document
+        dependencies = []
+        lines = architecture.split('\n')
+        for line in lines:
+            if 'pip install' in line.lower():
+                # Extract package names
+                parts = line.lower().split('pip install')
+                if len(parts) > 1:
+                    packages = parts[1].strip().split()
+                    dependencies.extend(packages)
+        
+        installed = []
+        failed = []
+        
+        for dep in dependencies:
+            print(f"{Colors.BRIGHT_CYAN}Checking dependency: {dep}...{Colors.RESET}")
+            try:
+                subprocess.check_call([sys.executable, "-m", "pip", "install", dep], 
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                installed.append(dep)
+                print(f"{Colors.BRIGHT_GREEN}✓ Installed{Colors.RESET}")
+            except:
+                failed.append(dep)
+                print(f"{Colors.BRIGHT_RED}✗ Failed{Colors.RESET}")
+        
+        return installed, failed
+
+
+class TechLeadAgent(BaseAgent):
+    """Breaks down work into development tasks."""
+    
+    def __init__(self, ai_engine):
+        system_prompt = (
+            "You are a Tech Lead. Break down projects into specific, actionable development tasks. "
+            "Each task should be clear, focused, and achievable. Order tasks logically (dependencies first). "
+            "Format: numbered list with task name and brief description."
+        )
+        super().__init__("Tech Lead", "TECH_LEAD", system_prompt, ai_engine)
+    
+    def create_tasks(self, specification, architecture):
+        """Create development task list."""
+        context = f"Specification:\n{specification}\n\nArchitecture:\n{architecture}\n\nCreate a numbered list of development tasks."
+        return self.think(context, 1000)
+
+
+class DeveloperAgent(BaseAgent):
+    """Plans implementation details for tasks."""
+    
+    def __init__(self, ai_engine):
+        system_prompt = (
+            "You are a Senior Developer. For each task, write detailed implementation notes. "
+            "Describe what files to create/modify, what functions/classes to add, what logic is needed. "
+            "Be specific but write in human-readable form (not code yet)."
+        )
+        super().__init__("Developer", "DEVELOPER", system_prompt, ai_engine)
+    
+    def plan_task(self, task, specification, architecture, existing_files):
+        """Plan how to implement a task."""
+        context = f"Task: {task}\n\nSpecification:\n{specification}\n\nArchitecture:\n{architecture}\n\nExisting Files:\n{existing_files}\n\nWrite implementation plan."
+        return self.think(context, 800)
+
+
+class CodeMonkeyAgent(BaseAgent):
+    """Writes actual code based on developer's plan."""
+    
+    def __init__(self, ai_engine):
+        system_prompt = (
+            "You are a Code Monkey. Implement code based on the Developer's plan. "
+            "Write clean, commented, production-ready code. Follow best practices and PEP 8 (for Python). "
+            "Output only the code, no explanations unless in comments."
+        )
+        super().__init__("Code Monkey", "CODE_MONKEY", system_prompt, ai_engine)
+    
+    def write_code(self, implementation_plan, existing_code=""):
+        """Write code based on plan."""
+        context = f"Implementation Plan:\n{implementation_plan}\n\nExisting Code:\n{existing_code}\n\nWrite the code:"
+        return self.think(context, 1500)
+
+
+class ReviewerAgent(BaseAgent):
+    """Reviews code for issues."""
+    
+    def __init__(self, ai_engine):
+        system_prompt = (
+            "You are a Code Reviewer. Review code for bugs, bad practices, security issues, and logic errors. "
+            "Be critical but constructive. If code is good, approve it. If not, explain what needs fixing. "
+            "Format: 'APPROVED' or 'REJECTED: [reasons]'"
+        )
+        super().__init__("Reviewer", "REVIEWER", system_prompt, ai_engine)
+    
+    def review_code(self, code, task, implementation_plan):
+        """Review code quality."""
+        context = f"Task: {task}\n\nImplementation Plan:\n{implementation_plan}\n\nCode:\n{code}\n\nReview this code:"
+        return self.think(context, 500)
+
+
+class TroubleshooterAgent(BaseAgent):
+    """Helps formulate good feedback."""
+    
+    def __init__(self, ai_engine):
+        system_prompt = (
+            "You are a Troubleshooter. Help users give good feedback to the development team. "
+            "Convert vague complaints into actionable bug reports. Ask clarifying questions. "
+            "Format feedback professionally."
+        )
+        super().__init__("Troubleshooter", "TROUBLESHOOTER", system_prompt, ai_engine)
+    
+    def analyze_feedback(self, user_feedback, current_state):
+        """Analyze user feedback and make it actionable."""
+        context = f"User Feedback: {user_feedback}\n\nCurrent State:\n{current_state}\n\nConvert to actionable feedback:"
+        return self.think(context, 400)
+
+
+class DebuggerAgent(BaseAgent):
+    """Debugs issues in the code."""
+    
+    def __init__(self, ai_engine):
+        system_prompt = (
+            "You are a Debugger. Find and fix bugs. Analyze error messages, stack traces, and logs. "
+            "Identify root causes and propose fixes. Be methodical and thorough."
+        )
+        super().__init__("Debugger", "DEBUGGER", system_prompt, ai_engine)
+    
+    def debug_issue(self, error_message, relevant_code, context=""):
+        """Debug an issue."""
+        context_str = f"Error: {error_message}\n\nRelevant Code:\n{relevant_code}\n\nContext:\n{context}\n\nIdentify the bug and suggest a fix:"
+        return self.think(context_str, 800)
+
+
+class TechnicalWriterAgent(BaseAgent):
+    """Writes documentation."""
+    
+    def __init__(self, ai_engine):
+        system_prompt = (
+            "You are a Technical Writer. Write clear, comprehensive documentation. "
+            "Include: overview, installation, usage, API docs, examples. Use markdown format."
+        )
+        super().__init__("Technical Writer", "TECH_WRITER", system_prompt, ai_engine)
+    
+    def write_documentation(self, project_name, specification, architecture, codebase_summary):
+        """Write project documentation."""
+        context = f"Project: {project_name}\n\nSpec:\n{specification}\n\nArchitecture:\n{architecture}\n\nCodebase:\n{codebase_summary}\n\nWrite comprehensive documentation:"
+        return self.think(context, 1500)
+
+
+class AppBuilderOrchestrator:
+    """Orchestrates the multi-agent app building process."""
+    
+    def __init__(self, ai_engine, memory_manager):
+        self.ai_engine = ai_engine
+        self.memory = memory_manager
+        
+        # Initialize agents
+        self.spec_writer = SpecificationWriterAgent(ai_engine)
+        self.architect = ArchitectAgent(ai_engine)
+        self.tech_lead = TechLeadAgent(ai_engine)
+        self.developer = DeveloperAgent(ai_engine)
+        self.code_monkey = CodeMonkeyAgent(ai_engine)
+        self.reviewer = ReviewerAgent(ai_engine)
+        self.troubleshooter = TroubleshooterAgent(ai_engine)
+        self.debugger = DebuggerAgent(ai_engine)
+        self.tech_writer = TechnicalWriterAgent(ai_engine)
+        
+        self.current_project = None
+        self.init_app_database()
+    
+    def init_app_database(self):
+        """Initialize app projects database."""
+        conn = sqlite3.connect(APP_PROJECTS_DB)
+        cursor = conn.cursor()
+        
+        # App projects table
+        cursor.execute('''CREATE TABLE IF NOT EXISTS app_projects (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT UNIQUE,
+            description TEXT,
+            specification TEXT,
+            architecture TEXT,
+            status TEXT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )''')
+        
+        # Tasks table
+        cursor.execute('''CREATE TABLE IF NOT EXISTS app_tasks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id INTEGER,
+            task_number INTEGER,
+            description TEXT,
+            implementation_plan TEXT,
+            status TEXT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (project_id) REFERENCES app_projects(id)
+        )''')
+        
+        # Files table
+        cursor.execute('''CREATE TABLE IF NOT EXISTS app_files (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id INTEGER,
+            filepath TEXT,
+            content TEXT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (project_id) REFERENCES app_projects(id)
+        )''')
+        
+        # Reviews table
+        cursor.execute('''CREATE TABLE IF NOT EXISTS app_reviews (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id INTEGER,
+            task_id INTEGER,
+            review_result TEXT,
+            feedback TEXT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (project_id) REFERENCES app_projects(id),
+            FOREIGN KEY (task_id) REFERENCES app_tasks(id)
+        )''')
+        
+        conn.commit()
+        conn.close()
+    
+    def create_project(self, name, description):
+        """Create a new app project."""
+        conn = sqlite3.connect(APP_PROJECTS_DB)
+        cursor = conn.cursor()
+        
+        try:
+            cursor.execute("INSERT INTO app_projects (name, description, status) VALUES (?, ?, ?)",
+                          (name, description, "specification"))
+            project_id = cursor.lastrowid
+            conn.commit()
+            
+            # Create project directory
+            project_dir = os.path.join(APPS_DIR, name)
+            os.makedirs(project_dir, exist_ok=True)
+            
+            return project_id
+        except sqlite3.IntegrityError:
+            print(f"{Colors.BRIGHT_RED}✗ Project '{name}' already exists.{Colors.RESET}")
+            return None
+        finally:
+            conn.close()
+    
+    def get_project(self, project_id):
+        """Get project details."""
+        conn = sqlite3.connect(APP_PROJECTS_DB)
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM app_projects WHERE id=?", (project_id,))
+        project = cursor.fetchone()
+        conn.close()
+        return project
+    
+    def update_project_field(self, project_id, field, value):
+        """Update a project field."""
+        conn = sqlite3.connect(APP_PROJECTS_DB)
+        cursor = conn.cursor()
+        cursor.execute(f"UPDATE app_projects SET {field}=?, updated_at=CURRENT_TIMESTAMP WHERE id=?", 
+                      (value, project_id))
+        conn.commit()
+        conn.close()
+    
+    def save_file(self, project_id, filepath, content):
+        """Save a file for the project."""
+        conn = sqlite3.connect(APP_PROJECTS_DB)
+        cursor = conn.cursor()
+        
+        # Check if file exists
+        cursor.execute("SELECT id FROM app_files WHERE project_id=? AND filepath=?", (project_id, filepath))
+        existing = cursor.fetchone()
+        
+        if existing:
+            cursor.execute("UPDATE app_files SET content=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                          (content, existing[0]))
+        else:
+            cursor.execute("INSERT INTO app_files (project_id, filepath, content) VALUES (?, ?, ?)",
+                          (project_id, filepath, content))
+        
+        conn.commit()
+        conn.close()
+        
+        # Also write to actual file
+        project = self.get_project(project_id)
+        if project:
+            project_name = project[1]
+            project_dir = os.path.join(APPS_DIR, project_name)
+            full_path = os.path.join(project_dir, filepath)
+            
+            os.makedirs(os.path.dirname(full_path), exist_ok=True)
+            with open(full_path, 'w', encoding='utf-8') as f:
+                f.write(content)
+    
+    def get_project_files(self, project_id):
+        """Get all files for a project."""
+        conn = sqlite3.connect(APP_PROJECTS_DB)
+        cursor = conn.cursor()
+        cursor.execute("SELECT filepath, content FROM app_files WHERE project_id=?", (project_id,))
+        files = cursor.fetchall()
+        conn.close()
+        return files
+    
+    def filter_relevant_context(self, task_description, all_files, max_context=5000):
+        """Filter relevant files for current task context."""
+        # Simple keyword-based filtering
+        keywords = set(task_description.lower().split())
+        relevant_files = []
+        
+        for filepath, content in all_files:
+            # Check if file is relevant based on keywords
+            file_text = (filepath + " " + content).lower()
+            matches = sum(1 for keyword in keywords if keyword in file_text)
+            if matches > 0:
+                relevant_files.append((filepath, content, matches))
+        
+        # Sort by relevance
+        relevant_files.sort(key=lambda x: x[2], reverse=True)
+        
+        # Build context within token limit
+        context = ""
+        for filepath, content, _ in relevant_files:
+            file_context = f"\n### {filepath} ###\n{content}\n"
+            if len(context) + len(file_context) < max_context:
+                context += file_context
+            else:
+                break
+        
+        return context
+    
+    def build_app(self, project_id):
+        """Main app building workflow."""
+        project = self.get_project(project_id)
+        if not project:
+            return False, "Project not found"
+        
+        project_name = project[1]
+        description = project[2]
+        status = project[5]
+        
+        print(f"\n{Colors.BRIGHT_CYAN}{Colors.BOLD}{'='*79}{Colors.RESET}")
+        print(f"{Colors.BRIGHT_YELLOW}{Colors.BOLD}  BUILDING APP: {project_name}{Colors.RESET}")
+        print(f"{Colors.BRIGHT_CYAN}{Colors.BOLD}{'='*79}{Colors.RESET}\n")
+        
+        # Stage 1: Specification
+        if status == "specification":
+            print(f"{Colors.BRIGHT_CYAN}[1/5] Specification Writer analyzing requirements...{Colors.RESET}")
+            analysis = self.spec_writer.analyze_description(project_name, description)
+            print(f"\n{Colors.CYAN}Analysis:{Colors.RESET}\n{analysis}\n")
+            
+            # Check if questions are needed
+            if "?" in analysis or "question" in analysis.lower():
+                print(f"{Colors.BRIGHT_YELLOW}Specification Writer has questions:{Colors.RESET}")
+                # Extract questions and get answers
+                qa_pairs = []
+                question_lines = [line for line in analysis.split('\n') if '?' in line]
+                for q in question_lines[:5]:  # Limit to 5 questions
+                    print(f"\n{Colors.CYAN}Q:{Colors.RESET} {q}")
+                    answer = input(f"{Colors.BRIGHT_GREEN}A: {Colors.RESET}")
+                    qa_pairs.append((q, answer))
+                
+                spec = self.spec_writer.write_specification(project_name, description, qa_pairs)
+            else:
+                spec = self.spec_writer.write_specification(project_name, description)
+            
+            self.update_project_field(project_id, "specification", spec)
+            self.update_project_field(project_id, "status", "architecture")
+            
+            print(f"\n{Colors.BRIGHT_GREEN}✓ Specification complete!{Colors.RESET}")
+            input(f"\n{Colors.DIM}Press Enter to continue...{Colors.RESET}")
+        
+        # Stage 2: Architecture
+        project = self.get_project(project_id)
+        if project[5] == "architecture":
+            spec = project[3]
+            
+            print(f"\n{Colors.BRIGHT_CYAN}[2/5] Architect designing system...{Colors.RESET}")
+            architecture = self.architect.design_architecture(spec)
+            print(f"\n{Colors.CYAN}Architecture:{Colors.RESET}\n{architecture[:500]}...\n")
+            
+            self.update_project_field(project_id, "architecture", architecture)
+            
+            # Check and install dependencies
+            print(f"\n{Colors.BRIGHT_CYAN}Checking dependencies...{Colors.RESET}")
+            installed, failed = self.architect.check_and_install_dependencies(architecture)
+            
+            if installed:
+                print(f"\n{Colors.BRIGHT_GREEN}✓ Installed: {', '.join(installed)}{Colors.RESET}")
+            if failed:
+                print(f"{Colors.YELLOW}⚠ Failed: {', '.join(failed)}{Colors.RESET}")
+            
+            self.update_project_field(project_id, "status", "tasks")
+            print(f"\n{Colors.BRIGHT_GREEN}✓ Architecture complete!{Colors.RESET}")
+            input(f"\n{Colors.DIM}Press Enter to continue...{Colors.RESET}")
+        
+        # Stage 3: Create Tasks
+        project = self.get_project(project_id)
+        if project[5] == "tasks":
+            spec = project[3]
+            architecture = project[4]
+            
+            print(f"\n{Colors.BRIGHT_CYAN}[3/5] Tech Lead creating task list...{Colors.RESET}")
+            tasks_doc = self.tech_lead.create_tasks(spec, architecture)
+            print(f"\n{Colors.CYAN}Tasks:{Colors.RESET}\n{tasks_doc}\n")
+            
+            # Parse and save tasks
+            conn = sqlite3.connect(APP_PROJECTS_DB)
+            cursor = conn.cursor()
+            
+            task_lines = [line.strip() for line in tasks_doc.split('\n') if line.strip() and (line.strip()[0].isdigit() or line.strip().startswith('-'))]
+            for i, task_line in enumerate(task_lines, 1):
+                cursor.execute("INSERT INTO app_tasks (project_id, task_number, description, status) VALUES (?, ?, ?, ?)",
+                              (project_id, i, task_line, "pending"))
+            
+            conn.commit()
+            conn.close()
+            
+            self.update_project_field(project_id, "status", "development")
+            print(f"\n{Colors.BRIGHT_GREEN}✓ {len(task_lines)} tasks created!{Colors.RESET}")
+            input(f"\n{Colors.DIM}Press Enter to start development...{Colors.RESET}")
+        
+        # Stage 4: Development (iterative)
+        project = self.get_project(project_id)
+        if project[5] == "development":
+            self.develop_tasks(project_id)
+        
+        return True, "App building process initiated"
+    
+    def develop_tasks(self, project_id):
+        """Develop tasks iteratively."""
+        project = self.get_project(project_id)
+        spec = project[3]
+        architecture = project[4]
+        
+        conn = sqlite3.connect(APP_PROJECTS_DB)
+        cursor = conn.cursor()
+        
+        cursor.execute("SELECT id, task_number, description, status FROM app_tasks WHERE project_id=? ORDER BY task_number", 
+                      (project_id,))
+        tasks = cursor.fetchall()
+        conn.close()
+        
+        for task_id, task_num, task_desc, task_status in tasks:
+            if task_status == "completed":
+                print(f"{Colors.DIM}[Task {task_num}] Already completed: {task_desc[:50]}...{Colors.RESET}")
+                continue
+            
+            print(f"\n{Colors.BRIGHT_CYAN}{Colors.BOLD}{'='*79}{Colors.RESET}")
+            print(f"{Colors.BRIGHT_YELLOW}[Task {task_num}/{len(tasks)}] {task_desc[:60]}...{Colors.RESET}")
+            print(f"{Colors.BRIGHT_CYAN}{Colors.BOLD}{'='*79}{Colors.RESET}\n")
+            
+            # Get existing files
+            existing_files = self.get_project_files(project_id)
+            files_context = "\n".join([f"{fp}: {len(content)} chars" for fp, content in existing_files])
+            
+            # Developer plans implementation
+            print(f"{Colors.BRIGHT_CYAN}[4/5] Developer planning implementation...{Colors.RESET}")
+            impl_plan = self.developer.plan_task(task_desc, spec, architecture, files_context)
+            print(f"\n{Colors.CYAN}Implementation Plan:{Colors.RESET}\n{impl_plan[:300]}...\n")
+            
+            # Save implementation plan
+            conn = sqlite3.connect(APP_PROJECTS_DB)
+            cursor = conn.cursor()
+            cursor.execute("UPDATE app_tasks SET implementation_plan=? WHERE id=?", (impl_plan, task_id))
+            conn.commit()
+            conn.close()
+            
+            # Code Monkey writes code
+            print(f"{Colors.BRIGHT_CYAN}[5/5] Code Monkey writing code...{Colors.RESET}")
+            
+            # Get relevant context
+            relevant_context = self.filter_relevant_context(task_desc + " " + impl_plan, existing_files)
+            
+            code = self.code_monkey.write_code(impl_plan, relevant_context)
+            print(f"\n{Colors.CYAN}Code Generated:{Colors.RESET}\n{code[:200]}...\n")
+            
+            # Reviewer reviews code
+            print(f"{Colors.BRIGHT_CYAN}Reviewer checking code...{Colors.RESET}")
+            review = self.reviewer.review_code(code, task_desc, impl_plan)
+            print(f"\n{Colors.CYAN}Review:{Colors.RESET} {review}\n")
+            
+            # Check if approved
+            if "APPROVED" in review.upper():
+                # Extract filename from code or plan
+                filename = self.extract_filename(code, impl_plan, task_desc)
+                if filename:
+                    self.save_file(project_id, filename, code)
+                    print(f"{Colors.BRIGHT_GREEN}✓ Code approved and saved: {filename}{Colors.RESET}")
+                else:
+                    # Ask user for filename
+                    filename = input(f"{Colors.BRIGHT_GREEN}Enter filename for this code: {Colors.RESET}").strip()
+                    if filename:
+                        self.save_file(project_id, filename, code)
+                        print(f"{Colors.BRIGHT_GREEN}✓ Code saved: {filename}{Colors.RESET}")
+                
+                # Mark task as completed
+                conn = sqlite3.connect(APP_PROJECTS_DB)
+                cursor = conn.cursor()
+                cursor.execute("UPDATE app_tasks SET status='completed' WHERE id=?", (task_id,))
+                cursor.execute("INSERT INTO app_reviews (project_id, task_id, review_result, feedback) VALUES (?, ?, ?, ?)",
+                              (project_id, task_id, "approved", review))
+                conn.commit()
+                conn.close()
+                
+            else:
+                print(f"{Colors.BRIGHT_RED}✗ Code rejected. Needs revision.{Colors.RESET}")
+                print(f"{Colors.YELLOW}Feedback:{Colors.RESET} {review}")
+                
+                # Save review
+                conn = sqlite3.connect(APP_PROJECTS_DB)
+                cursor = conn.cursor()
+                cursor.execute("INSERT INTO app_reviews (project_id, task_id, review_result, feedback) VALUES (?, ?, ?, ?)",
+                              (project_id, task_id, "rejected", review))
+                conn.commit()
+                conn.close()
+                
+                # Ask user if they want to retry or skip
+                retry = input(f"\n{Colors.BRIGHT_GREEN}Retry this task? [Y/n]: {Colors.RESET}").strip().lower()
+                if retry != 'n':
+                    # Recursively retry
+                    continue
+                else:
+                    print(f"{Colors.YELLOW}Task skipped. You can revisit it later.{Colors.RESET}")
+            
+            input(f"\n{Colors.DIM}Press Enter for next task...{Colors.RESET}")
+        
+        # All tasks completed
+        self.update_project_field(project_id, "status", "completed")
+        print(f"\n{Colors.BRIGHT_GREEN}{Colors.BOLD}✓ All tasks completed!{Colors.RESET}")
+        
+        # Generate documentation
+        print(f"\n{Colors.BRIGHT_CYAN}Technical Writer creating documentation...{Colors.RESET}")
+        files = self.get_project_files(project_id)
+        codebase_summary = "\n".join([f"{fp}: {len(content)} lines" for fp, content in files])
+        
+        docs = self.tech_writer.write_documentation(project[1], spec, architecture, codebase_summary)
+        
+        # Save documentation
+        self.save_file(project_id, "README.md", docs)
+        print(f"{Colors.BRIGHT_GREEN}✓ Documentation saved: README.md{Colors.RESET}")
+    
+    def extract_filename(self, code, plan, task):
+        """Extract filename from code or plan."""
+        # Look for common patterns
+        import re
+        
+        # Check for file path in comments
+        match = re.search(r'# (?:File|Filename|Path):\s*(.+)', code, re.IGNORECASE)
+        if match:
+            return match.group(1).strip()
+        
+        # Check in plan
+        match = re.search(r'(?:create|modify|file)\s+[\'"]?([a-zA-Z0-9_/\\.]+\.[a-zA-Z0-9]+)', plan, re.IGNORECASE)
+        if match:
+            return match.group(1).strip()
+        
+        # Check in task description
+        match = re.search(r'[\'"]?([a-zA-Z0-9_/\\.]+\.[a-zA-Z0-9]+)', task, re.IGNORECASE)
+        if match:
+            return match.group(1).strip()
+        
+        return None
+
+
+# ==============================================================================
 #                           7. SPLASH SCREEN & LOADING
 # ==============================================================================
 
@@ -2035,6 +2820,7 @@ class App:
         self.current_session_id = None
         self.api_manager = None
         self.current_project_id = None
+        self.app_builder = None
 
     def clear(self):
         os.system('cls' if os.name == 'nt' else 'clear')
@@ -2064,6 +2850,13 @@ class App:
             print(f"{Colors.YELLOW}⚠ API Manager initialization failed: {e}{Colors.RESET}")
             self.api_manager = None
         
+        show_loading_screen("Initializing App Builder", 0.5)
+        try:
+            self.app_builder = AppBuilderOrchestrator(self.engine, self.memory)
+        except Exception as e:
+            print(f"{Colors.YELLOW}⚠ App Builder initialization failed: {e}{Colors.RESET}")
+            self.app_builder = None
+        
         print(f"\n{Colors.BRIGHT_GREEN}{Colors.BOLD}✓ System Ready!{Colors.RESET}\n")
         time.sleep(0.5)
         
@@ -2087,13 +2880,13 @@ class App:
             # Ollama setup
             self.cfg_mgr.update("backend", "ollama")
             
-            # Check if Ollama is running
-            print(f"\n{Colors.BRIGHT_CYAN}Checking Ollama connection...{Colors.RESET}")
-            if not check_ollama_running():
-                print(f"{Colors.BRIGHT_RED}⚠ Ollama is not running!{Colors.RESET}")
-                print(f"{Colors.YELLOW}Please start Ollama first, then run this setup again.{Colors.RESET}")
-                print(f"{Colors.DIM}Download Ollama from: https://ollama.ai{Colors.RESET}\n")
-                input(f"{Colors.DIM}Press Enter to continue anyway...{Colors.RESET}")
+            # Check/install/start Ollama
+            if not install_and_start_ollama():
+                print(f"\n{Colors.YELLOW}⚠ Ollama setup incomplete.{Colors.RESET}")
+                print(f"{Colors.DIM}You can complete the setup later from the main menu.{Colors.RESET}")
+                cont = input(f"\n{Colors.BRIGHT_GREEN}Continue anyway? [y/N]: {Colors.RESET}").strip().lower()
+                if cont != 'y':
+                    sys.exit(0)
             
             # List available models
             print(f"\n{Colors.BRIGHT_CYAN}Fetching available Ollama models...{Colors.RESET}")
@@ -2161,6 +2954,19 @@ class App:
             
             self.cfg_mgr.update("model_name", selected_model)
             print(f"\n{Colors.BRIGHT_GREEN}✓ Selected Ollama model: {selected_model}{Colors.RESET}")
+            
+            # Verify model is available or pull it
+            current_models = get_ollama_models()
+            if selected_model not in current_models:
+                print(f"\n{Colors.YELLOW}⚠ Model '{selected_model}' is not downloaded yet.{Colors.RESET}")
+                pull_now = input(f"{Colors.BRIGHT_GREEN}Download it now? [Y/n]: {Colors.RESET}").strip().lower()
+                if pull_now != 'n':
+                    if not pull_ollama_model(selected_model):
+                        print(f"{Colors.YELLOW}⚠ Model download incomplete. You can pull it later with: ollama pull {selected_model}{Colors.RESET}")
+                else:
+                    print(f"{Colors.DIM}Model will need to be pulled before use: ollama pull {selected_model}{Colors.RESET}")
+            else:
+                print(f"{Colors.BRIGHT_GREEN}✓ Model is ready to use!{Colors.RESET}")
             
         else:
             # HuggingFace setup
@@ -2242,7 +3048,35 @@ class App:
             
             self.cfg_mgr.update("model_name", selected_model)
             print(f"\n{Colors.BRIGHT_GREEN}✓ Selected HuggingFace model: {selected_model}{Colors.RESET}")
-            print(f"{Colors.DIM}Note: Model will be downloaded automatically on first use.{Colors.RESET}")
+            
+            # Ask if user wants to download now
+            download_now = input(f"\n{Colors.BRIGHT_GREEN}Download model now? [Y/n]: {Colors.RESET}").strip().lower()
+            if download_now != 'n':
+                print(f"\n{Colors.BRIGHT_CYAN}Downloading model...{Colors.RESET}")
+                print(f"{Colors.DIM}This may take several minutes depending on model size...{Colors.RESET}\n")
+                
+                try:
+                    # Pre-download tokenizer and model
+                    print(f"{Colors.BRIGHT_CYAN}Downloading tokenizer...{Colors.RESET}")
+                    tokenizer = AutoTokenizer.from_pretrained(selected_model)
+                    print(f"{Colors.BRIGHT_GREEN}✓ Tokenizer downloaded{Colors.RESET}")
+                    
+                    print(f"{Colors.BRIGHT_CYAN}Downloading model weights...{Colors.RESET}")
+                    print(f"{Colors.DIM}This is the large download...{Colors.RESET}")
+                    model = AutoModelForCausalLM.from_pretrained(selected_model)
+                    print(f"\n{Colors.BRIGHT_GREEN}✓ Model '{selected_model}' downloaded successfully!{Colors.RESET}")
+                    
+                    # Clean up memory
+                    del model
+                    del tokenizer
+                    import gc
+                    gc.collect()
+                    
+                except Exception as e:
+                    print(f"\n{Colors.BRIGHT_RED}✗ Download failed: {e}{Colors.RESET}")
+                    print(f"{Colors.YELLOW}The model will be downloaded on first use.{Colors.RESET}")
+            else:
+                print(f"{Colors.DIM}Model will be downloaded automatically on first use.{Colors.RESET}")
             
         self.cfg_mgr.update("first_run", False)
         print(f"\n{Colors.BRIGHT_GREEN}{Colors.BOLD}✓ Setup Complete!{Colors.RESET}")
@@ -2264,8 +3098,9 @@ class App:
             print(f"{Colors.BRIGHT_GREEN}  [4]{Colors.RESET} MCP Server Management")
             print(f"{Colors.BRIGHT_GREEN}  [5]{Colors.RESET} Model Training")
             print(f"{Colors.BRIGHT_GREEN}  [6]{Colors.RESET} API Management")
-            print(f"{Colors.BRIGHT_GREEN}  [7]{Colors.RESET} Settings")
-            print(f"{Colors.BRIGHT_RED}  [8]{Colors.RESET} Exit\n")
+            print(f"{Colors.BRIGHT_GREEN}  [7]{Colors.RESET} App Builder {Colors.DIM}(Multi-Agent Development){Colors.RESET}")
+            print(f"{Colors.BRIGHT_GREEN}  [8]{Colors.RESET} Settings")
+            print(f"{Colors.BRIGHT_RED}  [9]{Colors.RESET} Exit\n")
             
             c = input(f"{Colors.BRIGHT_GREEN}Select: {Colors.RESET}")
             if c == "1": self.chat_loop()
@@ -2274,8 +3109,9 @@ class App:
             elif c == "4": self.mcp_server_menu()
             elif c == "5": self.model_training_menu()
             elif c == "6": self.api_management_menu()
-            elif c == "7": self.settings_menu()
-            elif c == "8":
+            elif c == "7": self.app_builder_menu()
+            elif c == "8": self.settings_menu()
+            elif c == "9":
                 print(f"\n{Colors.BRIGHT_YELLOW}Shutting down...{Colors.RESET}")
                 if self.registry:
                     for c in self.registry.mcp_clients.values(): c.stop()
@@ -3257,6 +4093,327 @@ class App:
                     time.sleep(1)
             
             elif c == "6":
+                break
+
+    def app_builder_menu(self):
+        """App Builder menu - multi-agent development system."""
+        if not self.app_builder:
+            print(f"\n{Colors.BRIGHT_RED}✗ App Builder not initialized.{Colors.RESET}")
+            input(f"\n{Colors.DIM}Press Enter...{Colors.RESET}")
+            return
+        
+        while True:
+            self.clear()
+            print(f"\n{Colors.BRIGHT_CYAN}{Colors.BOLD}{'='*79}{Colors.RESET}")
+            print(f"{Colors.BRIGHT_YELLOW}{Colors.BOLD}  APP BUILDER - Multi-Agent Development{Colors.RESET}")
+            print(f"{Colors.BRIGHT_CYAN}{Colors.BOLD}{'='*79}{Colors.RESET}\n")
+            
+            print(f"{Colors.CYAN}Apps Directory:{Colors.RESET} {Colors.BRIGHT_WHITE}{APPS_DIR}{Colors.RESET}\n")
+            
+            # List existing projects
+            conn = sqlite3.connect(APP_PROJECTS_DB)
+            cursor = conn.cursor()
+            cursor.execute("SELECT id, name, description, status FROM app_projects ORDER BY updated_at DESC")
+            projects = cursor.fetchall()
+            conn.close()
+            
+            if projects:
+                print(f"{Colors.CYAN}Your Projects:{Colors.RESET}\n")
+                for i, (pid, name, desc, status) in enumerate(projects[:10], 1):
+                    status_colors = {
+                        "specification": Colors.YELLOW,
+                        "architecture": Colors.CYAN,
+                        "tasks": Colors.BLUE,
+                        "development": Colors.BRIGHT_CYAN,
+                        "completed": Colors.BRIGHT_GREEN
+                    }
+                    status_color = status_colors.get(status, Colors.WHITE)
+                    print(f"  {Colors.CYAN}[{i}]{Colors.RESET} {Colors.BRIGHT_WHITE}{name}{Colors.RESET} {status_color}({status}){Colors.RESET}")
+                    print(f"      {Colors.DIM}{desc[:60]}...{Colors.RESET}\n")
+            else:
+                print(f"{Colors.YELLOW}No projects yet. Create your first app!{Colors.RESET}\n")
+            
+            print(f"{Colors.BRIGHT_GREEN}  [1]{Colors.RESET} Create New App")
+            print(f"{Colors.BRIGHT_GREEN}  [2]{Colors.RESET} Continue Building App")
+            print(f"{Colors.BRIGHT_GREEN}  [3]{Colors.RESET} View App Details")
+            print(f"{Colors.BRIGHT_GREEN}  [4]{Colors.RESET} Add Feature to Existing App")
+            print(f"{Colors.BRIGHT_GREEN}  [5]{Colors.RESET} Debug App")
+            print(f"{Colors.BRIGHT_GREEN}  [6]{Colors.RESET} Generate Documentation")
+            print(f"{Colors.BRIGHT_GREEN}  [7]{Colors.RESET} Back\n")
+            
+            c = input(f"{Colors.BRIGHT_GREEN}Choice: {Colors.RESET}")
+            
+            if c == "1":
+                # Create new app
+                self.clear()
+                print(f"\n{Colors.BRIGHT_CYAN}{Colors.BOLD}{'='*79}{Colors.RESET}")
+                print(f"{Colors.BRIGHT_YELLOW}{Colors.BOLD}  CREATE NEW APP{Colors.RESET}")
+                print(f"{Colors.BRIGHT_CYAN}{Colors.BOLD}{'='*79}{Colors.RESET}\n")
+                
+                print(f"{Colors.CYAN}The AI team will help you build this app step by step.{Colors.RESET}")
+                print(f"{Colors.DIM}Agents involved: Spec Writer, Architect, Tech Lead, Developer, Code Monkey, Reviewer{Colors.RESET}\n")
+                
+                app_name = input(f"{Colors.BRIGHT_GREEN}App Name: {Colors.RESET}").strip()
+                if not app_name:
+                    print(f"{Colors.YELLOW}⚠ Name cannot be empty.{Colors.RESET}")
+                    time.sleep(1)
+                    continue
+                
+                description = input(f"{Colors.BRIGHT_GREEN}Description {Colors.DIM}(what should this app do?): {Colors.RESET}").strip()
+                if not description:
+                    print(f"{Colors.YELLOW}⚠ Description cannot be empty.{Colors.RESET}")
+                    time.sleep(1)
+                    continue
+                
+                print(f"\n{Colors.BRIGHT_CYAN}Creating project...{Colors.RESET}")
+                project_id = self.app_builder.create_project(app_name, description)
+                
+                if project_id:
+                    print(f"{Colors.BRIGHT_GREEN}✓ Project '{app_name}' created!{Colors.RESET}")
+                    print(f"{Colors.DIM}Project ID: {project_id}{Colors.RESET}\n")
+                    
+                    start_now = input(f"{Colors.BRIGHT_GREEN}Start building now? [Y/n]: {Colors.RESET}").strip().lower()
+                    if start_now != 'n':
+                        self.app_builder.build_app(project_id)
+                else:
+                    print(f"{Colors.BRIGHT_RED}✗ Failed to create project.{Colors.RESET}")
+                
+                input(f"\n{Colors.DIM}Press Enter...{Colors.RESET}")
+            
+            elif c == "2":
+                # Continue building app
+                if not projects:
+                    print(f"\n{Colors.YELLOW}⚠ No projects to continue.{Colors.RESET}")
+                    time.sleep(1.5)
+                    continue
+                
+                print(f"\n{Colors.CYAN}Select project to continue:{Colors.RESET}\n")
+                for i, (pid, name, desc, status) in enumerate(projects, 1):
+                    if status != "completed":
+                        print(f"  {Colors.CYAN}[{i}]{Colors.RESET} {Colors.BRIGHT_WHITE}{name}{Colors.RESET} {Colors.YELLOW}({status}){Colors.RESET}")
+                
+                try:
+                    idx = int(input(f"\n{Colors.BRIGHT_GREEN}Select [1-{len(projects)}]: {Colors.RESET}").strip())
+                    if 1 <= idx <= len(projects):
+                        project_id = projects[idx - 1][0]
+                        self.app_builder.build_app(project_id)
+                    else:
+                        print(f"{Colors.YELLOW}⚠ Invalid selection.{Colors.RESET}")
+                        time.sleep(1)
+                except ValueError:
+                    print(f"{Colors.YELLOW}⚠ Invalid input.{Colors.RESET}")
+                    time.sleep(1)
+                
+                input(f"\n{Colors.DIM}Press Enter...{Colors.RESET}")
+            
+            elif c == "3":
+                # View app details
+                if not projects:
+                    print(f"\n{Colors.YELLOW}⚠ No projects available.{Colors.RESET}")
+                    time.sleep(1.5)
+                    continue
+                
+                print(f"\n{Colors.CYAN}Select project to view:{Colors.RESET}\n")
+                for i, (pid, name, desc, status) in enumerate(projects, 1):
+                    print(f"  {Colors.CYAN}[{i}]{Colors.RESET} {Colors.BRIGHT_WHITE}{name}{Colors.RESET}")
+                
+                try:
+                    idx = int(input(f"\n{Colors.BRIGHT_GREEN}Select [1-{len(projects)}]: {Colors.RESET}").strip())
+                    if 1 <= idx <= len(projects):
+                        project_id, project_name, desc, status = projects[idx - 1]
+                        project = self.app_builder.get_project(project_id)
+                        
+                        self.clear()
+                        print(f"\n{Colors.BRIGHT_CYAN}{Colors.BOLD}{'='*79}{Colors.RESET}")
+                        print(f"{Colors.BRIGHT_YELLOW}{Colors.BOLD}  PROJECT: {project_name}{Colors.RESET}")
+                        print(f"{Colors.BRIGHT_CYAN}{Colors.BOLD}{'='*79}{Colors.RESET}\n")
+                        
+                        print(f"{Colors.CYAN}Name:{Colors.RESET} {Colors.BRIGHT_WHITE}{project[1]}{Colors.RESET}")
+                        print(f"{Colors.CYAN}Description:{Colors.RESET} {Colors.BRIGHT_WHITE}{project[2]}{Colors.RESET}")
+                        print(f"{Colors.CYAN}Status:{Colors.RESET} {Colors.BRIGHT_WHITE}{project[5]}{Colors.RESET}")
+                        print(f"{Colors.CYAN}Created:{Colors.RESET} {Colors.DIM}{project[6]}{Colors.RESET}")
+                        
+                        # Show files
+                        files = self.app_builder.get_project_files(project_id)
+                        if files:
+                            print(f"\n{Colors.CYAN}Files ({len(files)}):{Colors.RESET}")
+                            for fp, content in files:
+                                lines = len(content.split('\n'))
+                                print(f"  {Colors.DIM}-{Colors.RESET} {Colors.BRIGHT_WHITE}{fp}{Colors.RESET} {Colors.DIM}({lines} lines){Colors.RESET}")
+                        
+                        # Show tasks
+                        conn = sqlite3.connect(APP_PROJECTS_DB)
+                        cursor = conn.cursor()
+                        cursor.execute("SELECT task_number, description, status FROM app_tasks WHERE project_id=? ORDER BY task_number", (project_id,))
+                        tasks = cursor.fetchall()
+                        conn.close()
+                        
+                        if tasks:
+                            print(f"\n{Colors.CYAN}Tasks ({len(tasks)}):{Colors.RESET}")
+                            for num, desc, task_status in tasks:
+                                status_marker = "✓" if task_status == "completed" else "○"
+                                status_color = Colors.BRIGHT_GREEN if task_status == "completed" else Colors.DIM
+                                print(f"  {status_color}{status_marker}{Colors.RESET} {Colors.DIM}[{num}]{Colors.RESET} {desc[:60]}...")
+                        
+                        input(f"\n{Colors.DIM}Press Enter...{Colors.RESET}")
+                    else:
+                        print(f"{Colors.YELLOW}⚠ Invalid selection.{Colors.RESET}")
+                        time.sleep(1)
+                except ValueError:
+                    print(f"{Colors.YELLOW}⚠ Invalid input.{Colors.RESET}")
+                    time.sleep(1)
+            
+            elif c == "4":
+                # Add feature to existing app
+                if not projects:
+                    print(f"\n{Colors.YELLOW}⚠ No projects available.{Colors.RESET}")
+                    time.sleep(1.5)
+                    continue
+                
+                # Filter only completed projects
+                completed_projects = [(pid, name, desc, status) for pid, name, desc, status in projects if status == "completed"]
+                
+                if not completed_projects:
+                    print(f"\n{Colors.YELLOW}⚠ No completed projects to add features to.{Colors.RESET}")
+                    time.sleep(1.5)
+                    continue
+                
+                print(f"\n{Colors.CYAN}Select project:{Colors.RESET}\n")
+                for i, (pid, name, desc, status) in enumerate(completed_projects, 1):
+                    print(f"  {Colors.CYAN}[{i}]{Colors.RESET} {Colors.BRIGHT_WHITE}{name}{Colors.RESET}")
+                
+                try:
+                    idx = int(input(f"\n{Colors.BRIGHT_GREEN}Select [1-{len(completed_projects)}]: {Colors.RESET}").strip())
+                    if 1 <= idx <= len(completed_projects):
+                        project_id = completed_projects[idx - 1][0]
+                        
+                        feature_desc = input(f"{Colors.BRIGHT_GREEN}Feature Description: {Colors.RESET}").strip()
+                        if not feature_desc:
+                            print(f"{Colors.YELLOW}⚠ Description cannot be empty.{Colors.RESET}")
+                            time.sleep(1)
+                            continue
+                        
+                        # Add feature as new tasks
+                        print(f"\n{Colors.BRIGHT_CYAN}Tech Lead analyzing feature...{Colors.RESET}")
+                        project = self.app_builder.get_project(project_id)
+                        spec = project[3] + f"\n\nNEW FEATURE: {feature_desc}"
+                        architecture = project[4]
+                        
+                        tasks_doc = self.app_builder.tech_lead.create_tasks(feature_desc, architecture)
+                        
+                        # Save new tasks
+                        conn = sqlite3.connect(APP_PROJECTS_DB)
+                        cursor = conn.cursor()
+                        cursor.execute("SELECT MAX(task_number) FROM app_tasks WHERE project_id=?", (project_id,))
+                        max_task = cursor.fetchone()[0] or 0
+                        
+                        task_lines = [line.strip() for line in tasks_doc.split('\n') if line.strip() and (line.strip()[0].isdigit() or line.strip().startswith('-'))]
+                        for i, task_line in enumerate(task_lines, 1):
+                            cursor.execute("INSERT INTO app_tasks (project_id, task_number, description, status) VALUES (?, ?, ?, ?)",
+                                          (project_id, max_task + i, task_line, "pending"))
+                        
+                        conn.commit()
+                        conn.close()
+                        
+                        self.app_builder.update_project_field(project_id, "status", "development")
+                        
+                        print(f"\n{Colors.BRIGHT_GREEN}✓ {len(task_lines)} new tasks created!{Colors.RESET}")
+                        
+                        start_now = input(f"\n{Colors.BRIGHT_GREEN}Start implementing now? [Y/n]: {Colors.RESET}").strip().lower()
+                        if start_now != 'n':
+                            self.app_builder.develop_tasks(project_id)
+                    else:
+                        print(f"{Colors.YELLOW}⚠ Invalid selection.{Colors.RESET}")
+                        time.sleep(1)
+                except ValueError:
+                    print(f"{Colors.YELLOW}⚠ Invalid input.{Colors.RESET}")
+                    time.sleep(1)
+                
+                input(f"\n{Colors.DIM}Press Enter...{Colors.RESET}")
+            
+            elif c == "5":
+                # Debug app
+                if not projects:
+                    print(f"\n{Colors.YELLOW}⚠ No projects available.{Colors.RESET}")
+                    time.sleep(1.5)
+                    continue
+                
+                print(f"\n{Colors.CYAN}Select project to debug:{Colors.RESET}\n")
+                for i, (pid, name, desc, status) in enumerate(projects, 1):
+                    print(f"  {Colors.CYAN}[{i}]{Colors.RESET} {Colors.BRIGHT_WHITE}{name}{Colors.RESET}")
+                
+                try:
+                    idx = int(input(f"\n{Colors.BRIGHT_GREEN}Select [1-{len(projects)}]: {Colors.RESET}").strip())
+                    if 1 <= idx <= len(projects):
+                        project_id = projects[idx - 1][0]
+                        
+                        error_message = input(f"\n{Colors.BRIGHT_GREEN}Error Message/Issue: {Colors.RESET}").strip()
+                        if not error_message:
+                            print(f"{Colors.YELLOW}⚠ Please describe the issue.{Colors.RESET}")
+                            time.sleep(1)
+                            continue
+                        
+                        # Get relevant files
+                        files = self.app_builder.get_project_files(project_id)
+                        relevant_context = self.app_builder.filter_relevant_context(error_message, files, max_context=3000)
+                        
+                        print(f"\n{Colors.BRIGHT_CYAN}Debugger analyzing issue...{Colors.RESET}")
+                        debug_result = self.app_builder.debugger.debug_issue(error_message, relevant_context)
+                        
+                        print(f"\n{Colors.CYAN}Debugger Analysis:{Colors.RESET}\n")
+                        print(f"{Colors.BRIGHT_WHITE}{debug_result}{Colors.RESET}\n")
+                        
+                        apply_fix = input(f"{Colors.BRIGHT_GREEN}Apply suggested fix? [y/N]: {Colors.RESET}").strip().lower()
+                        if apply_fix == 'y':
+                            print(f"{Colors.DIM}(Manual code editing required - check the project directory){Colors.RESET}")
+                    else:
+                        print(f"{Colors.YELLOW}⚠ Invalid selection.{Colors.RESET}")
+                        time.sleep(1)
+                except ValueError:
+                    print(f"{Colors.YELLOW}⚠ Invalid input.{Colors.RESET}")
+                    time.sleep(1)
+                
+                input(f"\n{Colors.DIM}Press Enter...{Colors.RESET}")
+            
+            elif c == "6":
+                # Generate documentation
+                if not projects:
+                    print(f"\n{Colors.YELLOW}⚠ No projects available.{Colors.RESET}")
+                    time.sleep(1.5)
+                    continue
+                
+                print(f"\n{Colors.CYAN}Select project:{Colors.RESET}\n")
+                for i, (pid, name, desc, status) in enumerate(projects, 1):
+                    print(f"  {Colors.CYAN}[{i}]{Colors.RESET} {Colors.BRIGHT_WHITE}{name}{Colors.RESET}")
+                
+                try:
+                    idx = int(input(f"\n{Colors.BRIGHT_GREEN}Select [1-{len(projects)}]: {Colors.RESET}").strip())
+                    if 1 <= idx <= len(projects):
+                        project_id, project_name, desc, status = projects[idx - 1]
+                        project = self.app_builder.get_project(project_id)
+                        
+                        print(f"\n{Colors.BRIGHT_CYAN}Technical Writer creating documentation...{Colors.RESET}")
+                        
+                        files = self.app_builder.get_project_files(project_id)
+                        codebase_summary = "\n".join([f"{fp}: {len(content)} lines" for fp, content in files])
+                        
+                        docs = self.app_builder.tech_writer.write_documentation(
+                            project_name, project[3] or desc, project[4] or "N/A", codebase_summary
+                        )
+                        
+                        # Save documentation
+                        self.app_builder.save_file(project_id, "README.md", docs)
+                        print(f"\n{Colors.BRIGHT_GREEN}✓ Documentation saved: README.md{Colors.RESET}")
+                    else:
+                        print(f"{Colors.YELLOW}⚠ Invalid selection.{Colors.RESET}")
+                        time.sleep(1)
+                except ValueError:
+                    print(f"{Colors.YELLOW}⚠ Invalid input.{Colors.RESET}")
+                    time.sleep(1)
+                
+                input(f"\n{Colors.DIM}Press Enter...{Colors.RESET}")
+            
+            elif c == "7":
                 break
 
     def handle_chat_command(self, cmd_line):
