@@ -37,7 +37,7 @@ Built for **privacy-first professionals**.
 - 📁 **Sight** camera enabled functionality  
 - 🌐 **Vision** image generation
 - 🔌 **API Gateway** 
-- 🧪 **GPU + CPU compatability** for custom workflows  
+- 🧪 **GPU + CPU compatability** for user performance  
 - 🎨 **You got any idea's??**
 
 ---
