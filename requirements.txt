@@ -1,0 +1,65 @@
+# AI Terminal Pro - Requirements
+# Python 3.8+ required
+
+# ==============================================================================
+# CORE DEPENDENCIES (Required for basic functionality)
+# ==============================================================================
+
+# HTTP requests and web scraping
+requests>=2.31.0
+beautifulsoup4>=4.12.0
+
+# AI/ML - HuggingFace Transformers and PyTorch
+# Note: PyTorch installation may vary by platform (CPU/GPU)
+# For CPU: pip install torch
+# For CUDA: pip install torch --index-url https://download.pytorch.org/whl/cu118
+transformers>=4.35.0
+torch>=2.1.0
+
+# Encryption (required for API encryption feature)
+cryptography>=41.0.0
+
+# API Server (required for API management feature)
+flask>=3.0.0
+flask-cors>=4.0.0
+
+# ==============================================================================
+# OPTIONAL DEPENDENCIES (Required for specific features)
+# ==============================================================================
+
+# YAML support (for YAML tool definitions)
+# Install if you want to create custom tools in YAML format
+pyyaml>=6.0.1
+
+# Model Training (for Fine-Tuning, LoRA, RLHF features)
+# Install if you want to train/fine-tune models
+peft>=0.7.0
+datasets>=2.14.0
+accelerate>=0.25.0
+
+# Reinforcement Learning (for RLHF/PPO training)
+# Install if you want to use Reinforcement Learning features
+trl>=0.7.0
+
+# ==============================================================================
+# NOTES
+# ==============================================================================
+# 
+# Standard library modules (no installation needed):
+# - sqlite3, json, os, sys, time, glob, subprocess, shutil, platform, re
+# - threading, hashlib, base64, datetime, ast
+#
+# Installation:
+#   pip install -r requirements.txt
+#
+# For minimal installation (core features only):
+#   pip install requests beautifulsoup4 transformers torch cryptography flask flask-cors
+#
+# For full installation (all features):
+#   pip install -r requirements.txt
+#
+# Platform-specific PyTorch installation:
+#   Visit https://pytorch.org/get-started/locally/ for GPU support
+#
+# ==============================================================================
+
