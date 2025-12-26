@@ -1,0 +1,3539 @@
+### AI Terminal Pro
+### Repacked Tools
+### Coded By Alistair
+### 12 Dec 2025
+### 14:00pm
+###
+#############################################################################
+
+import os
+import sys
+import json
+import time
+import sqlite3
+import glob
+import subprocess
+import requests
+import shutil
+import platform
+import re
+import threading
+import hashlib
+import base64
+from datetime import datetime
+from bs4 import BeautifulSoup
+from transformers import AutoTokenizer, AutoModelForCausalLM
+import torch
+
+# Encryption imports
+try:
+    from cryptography.fernet import Fernet
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+    ENCRYPTION_AVAILABLE = True
+except ImportError:
+    ENCRYPTION_AVAILABLE = False
+
+# Flask for API server
+try:
+    from flask import Flask, request, jsonify
+    from flask_cors import CORS
+    FLASK_AVAILABLE = True
+except ImportError:
+    FLASK_AVAILABLE = False
+
+# ANSI Color Codes for cross-platform terminal colors
+class Colors:
+    RESET = '\033[0m'
+    BOLD = '\033[1m'
+    DIM = '\033[2m'
+    
+    # Foreground colors
+    BLACK = '\033[30m'
+    RED = '\033[31m'
+    GREEN = '\033[32m'
+    YELLOW = '\033[33m'
+    BLUE = '\033[34m'
+    MAGENTA = '\033[35m'
+    CYAN = '\033[36m'
+    WHITE = '\033[37m'
+    
+    # Bright colors
+    BRIGHT_BLACK = '\033[90m'
+    BRIGHT_RED = '\033[91m'
+    BRIGHT_GREEN = '\033[92m'
+    BRIGHT_YELLOW = '\033[93m'
+    BRIGHT_BLUE = '\033[94m'
+    BRIGHT_MAGENTA = '\033[95m'
+    BRIGHT_CYAN = '\033[96m'
+    BRIGHT_WHITE = '\033[97m'
+    
+    # Background colors
+    BG_BLACK = '\033[40m'
+    BG_RED = '\033[41m'
+    BG_GREEN = '\033[42m'
+    BG_YELLOW = '\033[43m'
+    BG_BLUE = '\033[44m'
+    BG_MAGENTA = '\033[45m'
+    BG_CYAN = '\033[46m'
+    BG_WHITE = '\033[47m'
+
+# ==============================================================================
+#                           GLOBAL CONFIGURATION & CONSTANTS
+# ==============================================================================
+
+# Dynamic paths to ensure cross-platform compatibility
+BASE_DIR = os.getcwd()
+CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
+MCP_CONFIG_FILE = os.path.join(BASE_DIR, "mcp_servers.json")
+DB_PATH = os.path.join(BASE_DIR, "ai_memory.sqlite")
+SANDBOX_DIR = os.path.join(BASE_DIR, "ai_sandbox")
+DOCS_DIR = os.path.join(BASE_DIR, "documents")
+CUSTOM_TOOLS_DIR = os.path.join(BASE_DIR, "custom_tools")
+TRAINING_DIR = os.path.join(BASE_DIR, "training")
+TRAINING_DATA_DIR = os.path.join(TRAINING_DIR, "data")
+MODELS_DIR = os.path.join(TRAINING_DIR, "models")
+LORA_DIR = os.path.join(TRAINING_DIR, "lora")
+REINFORCEMENT_DIR = os.path.join(TRAINING_DIR, "reinforcement")
+API_DIR = os.path.join(BASE_DIR, "api")
+API_CONFIG_FILE = os.path.join(API_DIR, "api_config.json")
+API_KEYS_FILE = os.path.join(API_DIR, "api_keys.json")
+
+# Ensure all workspace directories exist
+for directory in [SANDBOX_DIR, DOCS_DIR, CUSTOM_TOOLS_DIR, TRAINING_DIR, TRAINING_DATA_DIR, MODELS_DIR, LORA_DIR, REINFORCEMENT_DIR, API_DIR]:
+    if not os.path.exists(directory):
+        os.makedirs(directory)
+
+DEFAULT_CONFIG = {
+    "first_run": True,
+    "backend": "huggingface",  # Options: "huggingface" or "ollama"
+    "model_name": "gpt2",      # Options: "gpt2", "gpt2-xl", "llama3", "mistral"
+    "system_prompt": "You are a helpful AI assistant. When asked to perform a task, use the available ACTION tools.",
+    "enable_dangerous_commands": False,  # Safety lock for file system/terminal
+    "max_context_window": 2048,
+    "max_response_tokens": 250,
+    "temperature": 0.7
+}
+
+# ==============================================================================
+#                           1. CONFIG MANAGER
+# ==============================================================================
+
+class ConfigManager:
+    """Manages persistent settings in config.json."""
+    def __init__(self):
+        self.config = self.load_config()
+
+    def load_config(self):
+        if not os.path.exists(CONFIG_FILE):
+            self.save_config_data(DEFAULT_CONFIG)
+            return DEFAULT_CONFIG.copy()
+        
+        try:
+            with open(CONFIG_FILE, 'r') as f:
+                data = json.load(f)
+                # Merge with defaults to prevent missing keys on updates
+                for key, val in DEFAULT_CONFIG.items():
+                    if key not in data:
+                        data[key] = val
+                return data
+        except Exception as e:
+            print(f"{Colors.BRIGHT_RED}[ERROR]{Colors.RESET} Config load failed: {e}. Using defaults.")
+            return DEFAULT_CONFIG.copy()
+
+    def save_config_data(self, data):
+        with open(CONFIG_FILE, 'w') as f:
+            json.dump(data, f, indent=4)
+
+    def update(self, key, value):
+        self.config[key] = value
+        self.save_config_data(self.config)
+
+    def get(self, key):
+        return self.config.get(key, DEFAULT_CONFIG.get(key))
+
+# ==============================================================================
+#                           2. DATABASE & MEMORY (RAG)
+# ==============================================================================
+
+class MemoryManager:
+    """Handles SQLite interaction for Chat History and Document RAG."""
+    def __init__(self, db_path):
+        self.conn = sqlite3.connect(db_path, check_same_thread=False)
+        self.cursor = self.conn.cursor()
+        self._init_db()
+
+    def _init_db(self):
+        # Sessions/Chats Table
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS sessions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT,
+                project_id INTEGER,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        # Projects Table
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS projects (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT,
+                description TEXT,
+                memory_bank TEXT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        # Chat History Table (with session_id)
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id INTEGER,
+            role TEXT,
+            content TEXT,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (session_id) REFERENCES sessions(id)
+            )
+        ''')
+        
+        # Document Store for RAG (with project_id)
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS documents (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id INTEGER,
+                source_file TEXT,
+                content_chunk TEXT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (project_id) REFERENCES projects(id)
+            )
+        ''')
+        
+        # Add session_id to history if it doesn't exist (migration)
+        try:
+            self.cursor.execute("SELECT session_id FROM history LIMIT 1")
+        except sqlite3.OperationalError:
+            self.cursor.execute("ALTER TABLE history ADD COLUMN session_id INTEGER")
+        
+        # Add project_id to documents if it doesn't exist (migration)
+        try:
+            self.cursor.execute("SELECT project_id FROM documents LIMIT 1")
+        except sqlite3.OperationalError:
+            self.cursor.execute("ALTER TABLE documents ADD COLUMN project_id INTEGER")
+        
+            self.conn.commit()
+
+    # Session Management
+    def create_session(self, name, project_id=None):
+        self.cursor.execute("INSERT INTO sessions (name, project_id) VALUES (?, ?)", (name, project_id))
+        self.conn.commit()
+        return self.cursor.lastrowid
+
+    def get_sessions(self, project_id=None):
+        if project_id:
+            self.cursor.execute("SELECT id, name FROM sessions WHERE project_id=? ORDER BY updated_at DESC", (project_id,))
+        else:
+            self.cursor.execute("SELECT id, name FROM sessions ORDER BY updated_at DESC")
+        return self.cursor.fetchall()
+
+    def get_session(self, session_id):
+        self.cursor.execute("SELECT id, name, project_id FROM sessions WHERE id=?", (session_id,))
+        return self.cursor.fetchone()
+    
+    def update_session(self, session_id):
+        self.cursor.execute("UPDATE sessions SET updated_at=CURRENT_TIMESTAMP WHERE id=?", (session_id,))
+        self.conn.commit()
+
+    def delete_session(self, session_id):
+        self.cursor.execute("DELETE FROM history WHERE session_id=?", (session_id,))
+        self.cursor.execute("DELETE FROM sessions WHERE id=?", (session_id,))
+        self.conn.commit()
+
+    def save_session_to_file(self, session_id, filepath):
+        """Export session to JSON file."""
+        history = self.get_recent_history(session_id, limit=1000)
+        session_info = self.get_session(session_id)
+        
+        data = {
+            "session": {
+                "id": session_info[0],
+                "name": session_info[1],
+                "project_id": session_info[2]
+            },
+            "history": [{"role": r, "content": c} for r, c in history]
+        }
+        
+        with open(filepath, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2)
+        return True
+    
+    def load_session_from_file(self, filepath):
+        """Import session from JSON file."""
+        with open(filepath, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        
+        session_data = data.get("session", {})
+        session_name = session_data.get("name", f"Imported {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+        project_id = session_data.get("project_id")
+        
+        session_id = self.create_session(session_name, project_id)
+        
+        for msg in data.get("history", []):
+            self.save_message(session_id, msg.get("role", "user"), msg.get("content", ""))
+        
+        return session_id
+    
+    # Project Management
+    def create_project(self, name, description=""):
+        self.cursor.execute("INSERT INTO projects (name, description, memory_bank) VALUES (?, ?, ?)", 
+                          (name, description, json.dumps({})))
+        self.conn.commit()
+        return self.cursor.lastrowid
+    
+    def get_projects(self):
+        self.cursor.execute("SELECT id, name, description FROM projects ORDER BY updated_at DESC")
+        return self.cursor.fetchall()
+    
+    def get_project(self, project_id):
+        self.cursor.execute("SELECT id, name, description, memory_bank FROM projects WHERE id=?", (project_id,))
+        return self.cursor.fetchone()
+    
+    def update_project_memory(self, project_id, memory_bank):
+        """Update project memory bank (dict)."""
+        self.cursor.execute("UPDATE projects SET memory_bank=?, updated_at=CURRENT_TIMESTAMP WHERE id=?", 
+                          (json.dumps(memory_bank), project_id))
+        self.conn.commit()
+    
+    def get_project_memory(self, project_id):
+        """Get project memory bank (dict)."""
+        row = self.get_project(project_id)
+        if row and row[3]:
+            return json.loads(row[3])
+        return {}
+    
+    def save_project_to_file(self, project_id, filepath):
+        """Export project to JSON file."""
+        project = self.get_project(project_id)
+        sessions = self.get_sessions(project_id)
+        memory_bank = self.get_project_memory(project_id)
+        
+        data = {
+            "project": {
+                "id": project[0],
+                "name": project[1],
+                "description": project[2],
+                "memory_bank": memory_bank
+            },
+            "sessions": []
+        }
+        
+        for sid, sname in sessions:
+            history = self.get_recent_history(sid, limit=1000)
+            data["sessions"].append({
+                "name": sname,
+                "history": [{"role": r, "content": c} for r, c in history]
+            })
+        
+        with open(filepath, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2)
+        return True
+    
+    def load_project_from_file(self, filepath):
+        """Import project from JSON file."""
+        with open(filepath, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        
+        project_data = data.get("project", {})
+        project_name = project_data.get("name", f"Imported {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+        project_desc = project_data.get("description", "")
+        memory_bank = project_data.get("memory_bank", {})
+        
+        project_id = self.create_project(project_name, project_desc)
+        self.update_project_memory(project_id, memory_bank)
+        
+        for session_data in data.get("sessions", []):
+            session_name = session_data.get("name", f"Session {datetime.now().strftime('%H:%M')}")
+            session_id = self.create_session(session_name, project_id)
+            for msg in session_data.get("history", []):
+                self.save_message(session_id, msg.get("role", "user"), msg.get("content", ""))
+        
+        return project_id
+    
+    def save_message(self, session_id, role, content):
+        self.cursor.execute("INSERT INTO history (session_id, role, content) VALUES (?, ?, ?)", 
+                          (session_id, role, content))
+        self.conn.commit()
+        if session_id:
+            self.update_session(session_id)
+
+    def get_recent_history(self, session_id=None, limit=10):
+        # Fetch last N messages for a session
+        if session_id:
+            self.cursor.execute("SELECT role, content FROM history WHERE session_id=? ORDER BY id DESC LIMIT ?", 
+                          (session_id, limit))
+        else:
+            self.cursor.execute("SELECT role, content FROM history ORDER BY id DESC LIMIT ?", (limit,))
+        rows = self.cursor.fetchall()
+        return rows[::-1]  # Reverse to chronological order
+
+    def ingest_file(self, filepath):
+        """Reads text files, chunks them, and stores in DB."""
+        filename = os.path.basename(filepath)
+        try:
+            with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+                text = f.read()
+            
+            # Split by double newline to approximate paragraphs
+            chunks = [c.strip() for c in text.split('\n\n') if c.strip()]
+            
+            count = 0
+            for chunk in chunks:
+                if len(chunk) > 20: # Ignore tiny fragments
+                    self.cursor.execute("INSERT INTO documents (source_file, content_chunk) VALUES (?, ?)", (filename, chunk))
+                count += 1
+            self.conn.commit()
+            return count
+        except Exception as e:
+            print(f"{Colors.BRIGHT_RED}[ERROR]{Colors.RESET} Ingesting {filename}: {e}")
+            return 0
+
+    def retrieve_context(self, query, project_id=None):
+        """Simple RAG: Keyword matching (SQLite LIKE) to find relevant chunks."""
+        # Extract significant words (len > 3)
+        keywords = [w for w in query.split() if len(w) > 3]
+        if not keywords: 
+            return ""
+        
+        # Build query dynamically
+        conditions = []
+        params = []
+        for word in keywords:
+            conditions.append("content_chunk LIKE ?")
+            params.append(f"%{word}%")
+        
+        if not conditions: 
+            return ""
+        
+        # Add project filter if specified
+        if project_id:
+            sql = f"SELECT source_file, content_chunk FROM documents WHERE project_id=? AND ({' OR '.join(conditions)}) LIMIT 3"
+            params = [project_id] + params
+        else:
+            sql = f"SELECT source_file, content_chunk FROM documents WHERE {' OR '.join(conditions)} LIMIT 3"
+        
+        self.cursor.execute(sql, params)
+        results = self.cursor.fetchall()
+        
+        if not results: 
+            return ""
+        
+        context_str = "\n[RELEVANT DOCUMENTS]:\n"
+        for source, chunk in results:
+            context_str += f"Source ({source}): {chunk[:400]}...\n"
+        return context_str
+
+# ==============================================================================
+#                           3. MCP CLIENT (Model Context Protocol)
+# ==============================================================================
+
+class MCPClient:
+    """Implements JSON-RPC 2.0 Client over Stdio."""
+    def __init__(self, name, command):
+        self.name = name
+        self.command = command
+        self.process = None
+        self.request_id = 0
+        self.available_tools = []
+        self.running = False
+
+    def start(self):
+        try:
+            # Use shell=True to support system PATH resolution
+            self.process = subprocess.Popen(
+                self.command,
+                shell=True,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=0 
+            )
+            self.running = True
+            
+            if self._handshake():
+                self._refresh_tools()
+                return True
+            return False
+        except Exception as e:
+            print(f"[MCP] Failed to start {self.name}: {e}")
+            return False
+
+    def stop(self):
+        if self.process:
+            self.process.terminate()
+        self.running = False
+
+    def _next_id(self):
+        self.request_id += 1
+        return self.request_id
+
+    def _send_json(self, payload):
+        if not self.process or not self.running: return
+        try:
+            json_str = json.dumps(payload) + "\n"
+            self.process.stdin.write(json_str)
+            self.process.stdin.flush()
+        except (BrokenPipeError, OSError):
+            self.running = False
+
+    def _read_response(self, timeout=3.0):
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            line = self.process.stdout.readline()
+            if line:
+                try:
+                    return json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+        return None
+
+    def _handshake(self):
+        self._send_json({
+            "jsonrpc": "2.0", 
+            "method": "initialize", 
+            "params": {"protocolVersion": "0.1.0", "clientInfo": {"name": "AI_Term", "version": "1.0"}, "capabilities": {}}, 
+            "id": self._next_id()
+        })
+        resp = self._read_response()
+        if resp and "result" in resp:
+            self._send_json({"jsonrpc": "2.0", "method": "notifications/initialized"})
+            return True
+        return False
+
+    def _refresh_tools(self):
+        self._send_json({"jsonrpc": "2.0", "method": "tools/list", "params": {}, "id": self._next_id()})
+        resp = self._read_response()
+        if resp and "result" in resp and "tools" in resp["result"]:
+            self.available_tools = resp["result"]["tools"]
+
+    def call_tool(self, tool_name, args_dict):
+        self._send_json({
+            "jsonrpc": "2.0", 
+            "method": "tools/call", 
+            "params": {"name": tool_name, "arguments": args_dict}, 
+            "id": self._next_id()
+        })
+        resp = self._read_response(timeout=15.0) # Longer timeout for tool execution
+        
+        if not resp: return "Error: MCP Timeout."
+        if "error" in resp: return f"MCP Error: {resp['error'].get('message')}"
+        
+        # MCP Standard: result.content is a list of items
+        if "result" in resp:
+            content = resp["result"].get("content", [])
+            texts = [c.get("text", "") for c in content if c.get("type") == "text"]
+            return "\n".join(texts)
+        return "Empty Response"
+
+# ==============================================================================
+#                           4. CUSTOM TOOL MANAGER
+# ==============================================================================
+
+class CustomToolManager:
+    """Manages custom tools defined in Python, JSON, or YAML files."""
+    
+    def __init__(self):
+        self.tools_dir = CUSTOM_TOOLS_DIR
+        self.tools_metadata = {}
+        self.load_tools()
+    
+    def load_tools(self):
+        """Load all custom tools from the tools directory."""
+        self.tools_metadata = {}
+        
+        # Load Python scripts
+        for py_file in glob.glob(os.path.join(self.tools_dir, "*.py")):
+            tool_info = self._parse_python_tool(py_file)
+            if tool_info:
+                self.tools_metadata[os.path.basename(py_file)] = tool_info
+        
+        # Load JSON tool definitions
+        for json_file in glob.glob(os.path.join(self.tools_dir, "*.json")):
+            tool_info = self._parse_json_tool(json_file)
+            if tool_info:
+                self.tools_metadata[os.path.basename(json_file)] = tool_info
+        
+        # Load YAML tool definitions
+        try:
+            import yaml
+            for yaml_file in glob.glob(os.path.join(self.tools_dir, "*.yaml")) + glob.glob(os.path.join(self.tools_dir, "*.yml")):
+                tool_info = self._parse_yaml_tool(yaml_file)
+                if tool_info:
+                    self.tools_metadata[os.path.basename(yaml_file)] = tool_info
+        except ImportError:
+            pass  # YAML support optional
+    
+    def _parse_python_tool(self, filepath):
+        """Parse a Python script to extract tool metadata."""
+        try:
+            with open(filepath, 'r', encoding='utf-8') as f:
+                content = f.read()
+            
+            # Look for tool metadata in docstring or comments
+            tool_info = {
+                "name": os.path.basename(filepath),
+                "type": "python",
+                "file": filepath,
+                "description": "",
+                "parameters": []
+            }
+            
+            # Try to extract from docstring
+            import ast
+            try:
+                tree = ast.parse(content)
+                if tree.body and isinstance(tree.body[0], ast.Expr) and isinstance(tree.body[0].value, ast.Str):
+                    docstring = tree.body[0].value.s
+                    tool_info["description"] = docstring.split('\n')[0] if docstring else ""
+            except:
+                pass
+            
+            # Look for TOOL_METADATA dictionary
+            if "TOOL_METADATA" in content:
+                try:
+                    # Extract metadata dict
+                    start = content.find("TOOL_METADATA")
+                    end = content.find("}", start) + 1
+                    metadata_str = content[start:end]
+                    # Simple eval (safe in this context)
+                    metadata = eval(metadata_str.split("=", 1)[1].strip())
+                    tool_info.update(metadata)
+                except:
+                    pass
+            
+            return tool_info
+        except Exception as e:
+            return None
+    
+    def _parse_json_tool(self, filepath):
+        """Parse a JSON tool definition file."""
+        try:
+            with open(filepath, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            
+            tool_info = {
+                "name": data.get("name", os.path.basename(filepath)),
+                "type": "json",
+                "file": filepath,
+                "description": data.get("description", ""),
+                "parameters": data.get("parameters", []),
+                "command": data.get("command", ""),
+                "script": data.get("script", "")
+            }
+            return tool_info
+        except Exception as e:
+            return None
+    
+    def _parse_yaml_tool(self, filepath):
+        """Parse a YAML tool definition file."""
+        try:
+            import yaml
+            with open(filepath, 'r', encoding='utf-8') as f:
+                data = yaml.safe_load(f)
+            
+            tool_info = {
+                "name": data.get("name", os.path.basename(filepath)),
+                "type": "yaml",
+                "file": filepath,
+                "description": data.get("description", ""),
+                "parameters": data.get("parameters", []),
+                "command": data.get("command", ""),
+                "script": data.get("script", "")
+            }
+            return tool_info
+        except Exception as e:
+            return None
+    
+    def create_python_tool(self, name, description, code, parameters=None):
+        """Create a new Python tool."""
+        if not name.endswith('.py'):
+            name += '.py'
+        
+        filepath = os.path.join(self.tools_dir, name)
+        
+        # Create tool template
+        template = f'''"""
+{description}
+"""
+TOOL_METADATA = {{
+    "name": "{name}",
+    "description": "{description}",
+    "parameters": {parameters or []}
+}}
+
+import sys
+import json
+
+def main():
+    # Parse arguments
+    args = sys.argv[1:] if len(sys.argv) > 1 else []
+    
+    # Tool implementation
+{code}
+
+if __name__ == "__main__":
+    main()
+'''
+        try:
+            with open(filepath, 'w', encoding='utf-8') as f:
+                f.write(template)
+            self.load_tools()
+            return True
+        except Exception as e:
+            return False
+    
+    def create_json_tool(self, name, description, command_or_script, parameters=None, is_script=False):
+        """Create a new JSON tool definition."""
+        if not name.endswith('.json'):
+            name += '.json'
+        
+        filepath = os.path.join(self.tools_dir, name)
+        
+        tool_def = {
+            "name": name.replace('.json', ''),
+            "description": description,
+            "parameters": parameters or [],
+        }
+        
+        if is_script:
+            tool_def["script"] = command_or_script
+        else:
+            tool_def["command"] = command_or_script
+        
+        try:
+            with open(filepath, 'w', encoding='utf-8') as f:
+                json.dump(tool_def, f, indent=2)
+            self.load_tools()
+            return True
+        except Exception as e:
+            return False
+    
+    def create_yaml_tool(self, name, description, command_or_script, parameters=None, is_script=False):
+        """Create a new YAML tool definition."""
+        try:
+            import yaml
+        except ImportError:
+            return False
+        
+        if not name.endswith('.yaml') and not name.endswith('.yml'):
+            name += '.yaml'
+        
+        filepath = os.path.join(self.tools_dir, name)
+        
+        tool_def = {
+            "name": name.replace('.yaml', '').replace('.yml', ''),
+            "description": description,
+            "parameters": parameters or [],
+        }
+        
+        if is_script:
+            tool_def["script"] = command_or_script
+        else:
+            tool_def["command"] = command_or_script
+        
+        try:
+            with open(filepath, 'w', encoding='utf-8') as f:
+                yaml.dump(tool_def, f, default_flow_style=False)
+            self.load_tools()
+            return True
+        except Exception as e:
+            return False
+    
+    def delete_tool(self, tool_name):
+        """Delete a custom tool."""
+        filepath = os.path.join(self.tools_dir, tool_name)
+        if os.path.exists(filepath):
+            try:
+                os.remove(filepath)
+                self.load_tools()
+                return True
+            except Exception as e:
+                return False
+        return False
+    
+    def get_tool_info(self, tool_name):
+        """Get metadata for a specific tool."""
+        return self.tools_metadata.get(tool_name)
+    
+    def list_tools(self):
+        """List all available custom tools."""
+        return list(self.tools_metadata.keys())
+
+# ==============================================================================
+#                           4.5. API SERVER MANAGER
+# ==============================================================================
+
+class EncryptionManager:
+    """Handles encryption/decryption of API data."""
+    
+    def __init__(self, password=None):
+        if not ENCRYPTION_AVAILABLE:
+            raise ImportError("cryptography library required. Install with: pip install cryptography")
+        
+        if password is None:
+            # Generate or load master key
+            key_file = os.path.join(API_DIR, ".master_key")
+            if os.path.exists(key_file):
+                with open(key_file, 'rb') as f:
+                    self.key = f.read()
+            else:
+                self.key = Fernet.generate_key()
+                with open(key_file, 'wb') as f:
+                    f.write(self.key)
+        else:
+            # Derive key from password
+            kdf = PBKDF2HMAC(
+                algorithm=hashes.SHA256(),
+                length=32,
+                salt=b'ai_terminal_pro_salt',
+                iterations=100000,
+            )
+            key = base64.urlsafe_b64encode(kdf.derive(password.encode()))
+            self.key = key
+        
+        self.cipher = Fernet(self.key)
+    
+    def encrypt(self, data):
+        """Encrypt data."""
+        if isinstance(data, str):
+            data = data.encode()
+        return self.cipher.encrypt(data).decode()
+    
+    def decrypt(self, encrypted_data):
+        """Decrypt data."""
+        if isinstance(encrypted_data, str):
+            encrypted_data = encrypted_data.encode()
+        return self.cipher.decrypt(encrypted_data).decode()
+
+
+class APIServerManager:
+    """Manages multiple API servers with encryption, CORS, and IP whitelisting."""
+    
+    def __init__(self, app_instance):
+        self.app_instance = app_instance  # Reference to main App instance
+        self.servers = {}  # {api_name: {server_thread, flask_app, config}}
+        self.encryption_manager = None
+        self.load_config()
+        
+        if ENCRYPTION_AVAILABLE:
+            try:
+                self.encryption_manager = EncryptionManager()
+            except Exception as e:
+                print(f"{Colors.YELLOW}⚠ Encryption initialization failed: {e}{Colors.RESET}")
+    
+    def load_config(self):
+        """Load API configurations."""
+        if os.path.exists(API_CONFIG_FILE):
+            try:
+                with open(API_CONFIG_FILE, 'r') as f:
+                    self.config = json.load(f)
+            except Exception as e:
+                print(f"{Colors.BRIGHT_RED}[ERROR]{Colors.RESET} Failed to load API config: {e}")
+                self.config = {}
+        else:
+            self.config = {}
+    
+    def save_config(self):
+        """Save API configurations."""
+        try:
+            with open(API_CONFIG_FILE, 'w') as f:
+                json.dump(self.config, f, indent=2)
+        except Exception as e:
+            print(f"{Colors.BRIGHT_RED}[ERROR]{Colors.RESET} Failed to save API config: {e}")
+    
+    def create_api(self, name, port, enable_cors=True, cors_origins=None, ip_whitelist=None, require_auth=True):
+        """Create a new API server."""
+        if not FLASK_AVAILABLE:
+            return False, "Flask not available. Install with: pip install flask flask-cors"
+        
+        if name in self.servers:
+            return False, f"API '{name}' already exists"
+        
+        # Default values
+        if cors_origins is None:
+            cors_origins = ["*"] if enable_cors else []
+        if ip_whitelist is None:
+            ip_whitelist = []
+        
+        # Create Flask app
+        app = Flask(f"API_{name}")
+        app.config['JSONIFY_PRETTYPRINT_REGULAR'] = True
+        
+        # Configure CORS
+        if enable_cors:
+            CORS(app, origins=cors_origins)
+        
+        # Generate API key if auth required
+        api_key = None
+        if require_auth:
+            api_key = base64.urlsafe_b64encode(os.urandom(32)).decode()
+            # Save API key
+            keys = {}
+            if os.path.exists(API_KEYS_FILE):
+                try:
+                    with open(API_KEYS_FILE, 'r') as f:
+                        keys = json.load(f)
+                except:
+                    pass
+            keys[name] = api_key
+            with open(API_KEYS_FILE, 'w') as f:
+                json.dump(keys, f, indent=2)
+        
+        # IP whitelist middleware
+        def check_ip_whitelist():
+            if ip_whitelist:
+                client_ip = request.remote_addr
+                if client_ip not in ip_whitelist:
+                    return jsonify({"error": "IP address not whitelisted"}), 403
+            return None
+        
+        # Auth middleware
+        def check_auth():
+            if require_auth:
+                provided_key = request.headers.get('X-API-Key') or request.args.get('api_key')
+                if not provided_key or provided_key != api_key:
+                    return jsonify({"error": "Invalid or missing API key"}), 401
+            return None
+        
+        # Chat endpoint
+        @app.route('/chat', methods=['POST'])
+        def chat_endpoint():
+            # Check IP whitelist
+            ip_check = check_ip_whitelist()
+            if ip_check:
+                return ip_check
+            
+            # Check auth
+            auth_check = check_auth()
+            if auth_check:
+                return auth_check
+            
+            try:
+                data = request.get_json()
+                if not data:
+                    return jsonify({"error": "No JSON data provided"}), 400
+                
+                # Decrypt if encrypted
+                message = data.get('message', '')
+                if data.get('encrypted', False) and self.encryption_manager:
+                    try:
+                        message = self.encryption_manager.decrypt(message)
+                    except Exception as e:
+                        return jsonify({"error": f"Decryption failed: {str(e)}"}), 400
+                
+                if not message:
+                    return jsonify({"error": "Message is required"}), 400
+                
+                # Get session ID if provided
+                session_id = data.get('session_id')
+                if session_id:
+                    self.app_instance.current_session_id = session_id
+                
+                # Process message through AI
+                if not self.app_instance.engine or not self.app_instance.context_mgr:
+                    return jsonify({"error": "AI engine not initialized"}), 500
+                
+                # Build context
+                history = []
+                if session_id:
+                    history = self.app_instance.memory.get_recent_history(session_id, limit=10)
+                
+                context = self.app_instance.context_mgr.build_context(
+                    message,
+                    history,
+                    self.app_instance.registry.get_tool_prompt() if self.app_instance.registry else ""
+                )
+                
+                # Generate response
+                response = self.app_instance.engine.generate(context)
+                
+                # Save to history
+                if session_id:
+                    self.app_instance.memory.save_message(session_id, "user", message)
+                    self.app_instance.memory.save_message(session_id, "assistant", response)
+                
+                # Encrypt response if requested
+                encrypted_response = None
+                if data.get('encrypt_response', False) and self.encryption_manager:
+                    encrypted_response = self.encryption_manager.encrypt(response)
+                
+                result = {
+                    "response": response,
+                    "session_id": session_id,
+                    "timestamp": datetime.now().isoformat()
+                }
+                
+                if encrypted_response:
+                    result["encrypted_response"] = encrypted_response
+                    result["encrypted"] = True
+                
+                return jsonify(result)
+                
+            except Exception as e:
+                return jsonify({"error": str(e)}), 500
+        
+        # Health check endpoint
+        @app.route('/health', methods=['GET'])
+        def health_endpoint():
+            return jsonify({
+                "status": "healthy",
+                "api_name": name,
+                "timestamp": datetime.now().isoformat()
+            })
+        
+        # Get API info endpoint
+        @app.route('/info', methods=['GET'])
+        def info_endpoint():
+            auth_check = check_auth()
+            if auth_check:
+                return auth_check
+            
+            return jsonify({
+                "name": name,
+                "port": port,
+                "cors_enabled": enable_cors,
+                "ip_whitelist_enabled": len(ip_whitelist) > 0,
+                "encryption_available": self.encryption_manager is not None
+            })
+        
+        # Start server in separate thread
+        def run_server():
+            app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
+        
+        server_thread = threading.Thread(target=run_server, daemon=True)
+        server_thread.start()
+        
+        # Store configuration
+        config = {
+            "name": name,
+            "port": port,
+            "enable_cors": enable_cors,
+            "cors_origins": cors_origins,
+            "ip_whitelist": ip_whitelist,
+            "require_auth": require_auth,
+            "api_key": api_key,
+            "flask_app": app,
+            "server_thread": server_thread
+        }
+        
+        self.servers[name] = config
+        self.config[name] = {
+            "port": port,
+            "enable_cors": enable_cors,
+            "cors_origins": cors_origins,
+            "ip_whitelist": ip_whitelist,
+            "require_auth": require_auth
+        }
+        self.save_config()
+        
+        return True, f"API '{name}' started on port {port}"
+    
+    def stop_api(self, name):
+        """Stop an API server."""
+        if name not in self.servers:
+            return False, f"API '{name}' not found"
+        
+        # Flask doesn't have a clean shutdown, but we can mark it
+        del self.servers[name]
+        if name in self.config:
+            del self.config[name]
+        self.save_config()
+        
+        return True, f"API '{name}' stopped"
+    
+    def delete_api(self, name):
+        """Delete an API configuration."""
+        # Stop if running
+        if name in self.servers:
+            self.stop_api(name)
+        
+        # Remove API key
+        if os.path.exists(API_KEYS_FILE):
+            try:
+                with open(API_KEYS_FILE, 'r') as f:
+                    keys = json.load(f)
+                if name in keys:
+                    del keys[name]
+                    with open(API_KEYS_FILE, 'w') as f:
+                        json.dump(keys, f, indent=2)
+            except:
+                pass
+        
+        return True, f"API '{name}' deleted"
+    
+    def get_api_key(self, name):
+        """Get API key for an API."""
+        if not os.path.exists(API_KEYS_FILE):
+            return None
+        
+        try:
+            with open(API_KEYS_FILE, 'r') as f:
+                keys = json.load(f)
+            return keys.get(name)
+        except:
+            return None
+    
+    def list_apis(self):
+        """List all configured APIs."""
+        return list(self.config.keys())
+    
+    def get_api_info(self, name):
+        """Get information about an API."""
+        if name not in self.config:
+            return None
+        
+        info = self.config[name].copy()
+        info["running"] = name in self.servers
+        info["api_key"] = self.get_api_key(name) if info.get("require_auth") else None
+        return info
+
+# ==============================================================================
+#                           5. TOOL REGISTRY & PATH RESOLVER
+# ==============================================================================
+
+class ToolRegistry:
+    """Manages Native Tools, Custom Scripts, and MCP Clients."""
+    def __init__(self, config):
+        self.config = config
+        self.mcp_clients = {}
+        self.custom_tool_manager = CustomToolManager()
+        self.load_mcp_servers()
+
+    def load_mcp_servers(self):
+        if os.path.exists(MCP_CONFIG_FILE):
+            try:
+                with open(MCP_CONFIG_FILE, 'r') as f:
+                    data = json.load(f)
+                    for name, cmd in data.items():
+                        print(f"{Colors.BRIGHT_CYAN}[SYSTEM]{Colors.RESET} Initializing MCP: {Colors.BRIGHT_WHITE}{name}{Colors.RESET}...")
+                        client = MCPClient(name, cmd)
+                        if client.start():
+                            self.mcp_clients[name] = client
+            except Exception as e:
+                print(f"{Colors.BRIGHT_RED}[ERROR]{Colors.RESET} MCP Config: {e}")
+
+    def get_tool_prompt(self):
+        """Returns the help text injected into the System Prompt."""
+        p = "\n\n### AVAILABLE TOOLS ###\n"
+        p += "SYNTAX: Response must start with 'ACTION: [Tool_Name] [Arguments]'\n"
+        p += "IMPORTANT: Do NOT wrap file paths in brackets []. Use: FILE_READ ~/Desktop/file.txt\n\n"
+        
+        p += "1. NATIVE TOOLS:\n"
+        p += "   - ACTION: CMD [command] (Terminal)\n"
+        p += "   - ACTION: BROWSE [url]\n"
+        p += "   - ACTION: FILE_READ [path]\n"
+        p += "   - ACTION: FILE_WRITE [path] | [content]\n"
+        p += "   - ACTION: FILE_LIST [path]\n"
+        
+        # Custom tools
+        custom_tools = self.custom_tool_manager.list_tools()
+        if custom_tools:
+            p += "2. CUSTOM TOOLS:\n"
+            for tool_name in custom_tools:
+                tool_info = self.custom_tool_manager.get_tool_info(tool_name)
+                desc = tool_info.get("description", "") if tool_info else ""
+                if desc:
+                    p += f"   - ACTION: CUSTOM {tool_name} [args] {Colors.DIM}# {desc}{Colors.RESET}\n"
+                else:
+                    p += f"   - ACTION: CUSTOM {tool_name} [args]\n"
+            
+        if self.mcp_clients:
+            p += "3. MCP EXTENSIONS:\n"
+            for srv, client in self.mcp_clients.items():
+                for t in client.available_tools:
+                    p += f"   - ACTION: MCP {srv} {t['name']} {{json_args}}\n"
+        return p
+
+    def resolve_path(self, raw_path):
+        """
+        Sanitizes and resolves paths.
+        1. Strips quotes/brackets (AI hallucinations).
+        2. Expands ~ to user home.
+        3. Enforces Sandbox if 'enable_dangerous_commands' is False.
+        """
+        # Cleanup AI hallucinations like [path] or "path"
+        clean = raw_path.strip().replace('[', '').replace(']', '').replace('"', '').replace("'", "")
+        
+        # Expand user (~ -> /home/user or C:\Users\user)
+        full_path = os.path.expanduser(clean)
+        full_path = os.path.normpath(full_path)
+
+        if not self.config.get("enable_dangerous_commands"):
+            # SAFE MODE: Force filename into sandbox
+            filename = os.path.basename(full_path)
+            return os.path.join(SANDBOX_DIR, filename)
+        
+        # DANGEROUS MODE: Allow absolute paths
+        if os.path.isabs(full_path):
+            return full_path
+        
+        # Relative path -> anchor to sandbox
+        return os.path.join(SANDBOX_DIR, full_path)
+
+    def execute_native(self, tool_cmd):
+        parts = tool_cmd.strip().split(" ", 1)
+        action = parts[0]
+        args = parts[1] if len(parts) > 1 else ""
+
+        if action == "CMD":
+            if not self.config.get("enable_dangerous_commands"):
+                return "PERMISSION DENIED: Enable 'Dangerous Commands' in settings."
+            try:
+                return subprocess.check_output(args, shell=True, text=True, stderr=subprocess.STDOUT).strip()
+            except subprocess.CalledProcessError as e:
+                return f"CMD Error: {e.output}"
+        
+        elif action == "BROWSE":
+            return self._browse(args.strip())
+
+        elif action == "FILE_LIST":
+            target = self.resolve_path(args) if args else SANDBOX_DIR
+            if os.path.exists(target):
+                return str(os.listdir(target))
+            return "Directory not found."
+
+        elif action == "FILE_READ":
+            target = self.resolve_path(args)
+            if os.path.exists(target):
+                with open(target, 'r', encoding='utf-8', errors='replace') as f:
+                    return f.read()
+            return f"File not found: {target}"
+
+        elif action == "FILE_WRITE":
+            if "|" not in args:
+                return "Error: Use format 'FILE_WRITE path | content'"
+            raw_path, content = args.split("|", 1)
+            target = self.resolve_path(raw_path)
+            
+            try:
+                # Ensure directory exists
+                os.makedirs(os.path.dirname(target), exist_ok=True)
+                with open(target, 'w', encoding='utf-8') as f:
+                    f.write(content.strip())
+                return f"Successfully wrote to {target}"
+            except Exception as e:
+                return f"Write Error: {e}"
+
+        return "Unknown Action."
+
+    def _browse(self, url):
+        # Sanitize URL
+        url = url.replace('[', '').replace(']', '')
+        if not url.startswith("http"): url = "http://" + url
+        try:
+            headers = {'User-Agent': 'Mozilla/5.0'}
+            res = requests.get(url, headers=headers, timeout=5)
+            soup = BeautifulSoup(res.text, 'html.parser')
+            # Clean script/style
+            for s in soup(["script", "style"]): s.extract()
+            text = soup.get_text()
+            # Compress lines
+            lines = [line.strip() for line in text.splitlines() if line.strip()]
+            return '\n'.join(lines)[:2500] + "... [Truncated]"
+        except Exception as e:
+            return f"Web Error: {e}"
+
+    def execute_custom(self, tool_name, args):
+        """Execute a custom tool (Python, JSON, YAML, or script)."""
+        tool_info = self.custom_tool_manager.get_tool_info(tool_name)
+        
+        if not tool_info:
+            # Fallback to old behavior for scripts without metadata
+            path = os.path.join(CUSTOM_TOOLS_DIR, tool_name)
+            if not os.path.exists(path):
+                return "Tool not found."
+        else:
+            path = tool_info["file"]
+            tool_type = tool_info.get("type", "python")
+            
+            # Handle JSON/YAML tool definitions
+            if tool_type in ["json", "yaml"]:
+                if "script" in tool_info:
+                    # Execute script file
+                    script_path = tool_info["script"]
+                    if not os.path.isabs(script_path):
+                        script_path = os.path.join(CUSTOM_TOOLS_DIR, script_path)
+                    return self._execute_script(script_path, args)
+                elif "command" in tool_info:
+                    # Execute command with args
+                    cmd = tool_info["command"] + " " + args if args else tool_info["command"]
+                    try:
+                        return subprocess.check_output(cmd, shell=True, text=True, stderr=subprocess.STDOUT).strip()
+                    except Exception as e:
+                        return f"Command Error: {e}"
+        
+        # Execute Python script or other file
+        return self._execute_script(path, args)
+    
+    def _execute_script(self, script_path, args):
+        """Execute a script file with arguments."""
+        if not os.path.exists(script_path):
+            return "Script not found."
+        
+        # Determine execution method based on OS and extension
+        runner = "bash"
+        if script_path.endswith(".py"):
+            runner = sys.executable  # Current python interpreter
+        elif platform.system() == "Windows" and script_path.endswith(".sh"):
+            runner = "git-bash"  # Attempt git-bash on Windows
+        elif script_path.endswith(".bat") or script_path.endswith(".cmd"):
+            runner = "cmd"  # Windows batch file
+        
+        cmd = f'"{runner}" "{script_path}" {args}'
+        try:
+            return subprocess.check_output(cmd, shell=True, text=True, stderr=subprocess.STDOUT).strip()
+        except Exception as e:
+            return f"Script Error: {e}"
+
+    def execute_mcp(self, server, tool, json_args):
+        if server not in self.mcp_clients: return "Server not found."
+        try:
+            # Flexible JSON parsing (handles single quotes or no quotes if simple)
+            clean_json = json_args.strip()
+            # Ensure brackets
+            if not clean_json.startswith("{"): clean_json = "{" + clean_json
+            if not clean_json.endswith("}"): clean_json = clean_json + "}"
+            
+            args = json.loads(clean_json)
+            return self.mcp_clients[server].call_tool(tool, args)
+        except json.JSONDecodeError:
+            return "Error: MCP arguments must be valid JSON."
+
+# ==============================================================================
+#                           5. AI ENGINE & CONTEXT
+# ==============================================================================
+
+class ContextManager:
+    def __init__(self, tokenizer, max_tokens):
+        self.tokenizer = tokenizer
+        self.max_tokens = max_tokens
+
+    def count_tokens(self, text):
+        if self.tokenizer:
+            return len(self.tokenizer.encode(text))
+        return len(text) // 4 # Rough approx for Ollama
+
+    def build_prompt(self, system, history, rag, user_input):
+        base = f"{system}\n{rag}\n"
+        footer = f"\nYou: {user_input}\nAI:"
+        
+        # Calculate remaining space
+        base_cost = self.count_tokens(base + footer)
+        remaining = self.max_tokens - base_cost
+        
+        # Add history newest -> oldest until limit
+        selected_history = []
+        current_cost = 0
+        
+        for role, msg in reversed(history):
+            line = f"{role}: {msg}\n"
+            cost = self.count_tokens(line)
+            if current_cost + cost < remaining:
+                selected_history.insert(0, line)
+                current_cost += cost
+            else:
+                break
+                
+        return base + "".join(selected_history) + footer
+
+class AIEngine:
+    def __init__(self, config):
+        self.config = config
+        self.backend = config.get("backend")
+        self.model_name = config.get("model_name")
+        self.tokenizer = None
+        self.model = None
+        self.device = "cpu"
+        self._load()
+
+    def _load(self):
+        print(f"{Colors.BRIGHT_CYAN}[SYSTEM]{Colors.RESET} Loading Backend: {Colors.BRIGHT_WHITE}{self.backend}{Colors.RESET} ({Colors.BRIGHT_WHITE}{self.model_name}{Colors.RESET})...")
+        if self.backend == "huggingface":
+            try:
+                self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
+                if not self.tokenizer.pad_token:
+                    self.tokenizer.pad_token = self.tokenizer.eos_token
+            
+                if torch.cuda.is_available(): 
+                    self.device = "cuda"
+                elif torch.backends.mps.is_available(): 
+                    self.device = "mps"
+                
+                self.model = AutoModelForCausalLM.from_pretrained(self.model_name)
+                self.model.to(self.device)
+                print(f"{Colors.BRIGHT_GREEN}[SYSTEM]{Colors.RESET} Model loaded on {Colors.BRIGHT_WHITE}{self.device}{Colors.RESET}.")
+            except Exception as e:
+                print(f"{Colors.BRIGHT_RED}[CRITICAL]{Colors.RESET} Model Load Failed: {e}")
+                sys.exit(1)
+        elif self.backend == "ollama":
+            try:
+                requests.get("http://localhost:11434")
+                print(f"{Colors.BRIGHT_GREEN}[SYSTEM]{Colors.RESET} Ollama connection established.")
+            except:
+                print(f"{Colors.YELLOW}[WARNING]{Colors.RESET} Ollama is not running on localhost:11434.")
+
+    def generate(self, prompt):
+        if self.backend == "huggingface":
+            inputs = self.tokenizer(prompt, return_tensors="pt", truncation=True, max_length=2048).to(self.device)
+            with torch.no_grad():
+                out = self.model.generate(
+                    **inputs, 
+                    max_new_tokens=self.config.get("max_response_tokens"),
+                    do_sample=True,
+                    temperature=self.config.get("temperature"),
+                    pad_token_id=self.tokenizer.eos_token_id
+                )
+            full = self.tokenizer.decode(out[0], skip_special_tokens=True)
+            # Remove prompt from output
+            response = full[len(prompt):].strip()
+            # Stop sequence trimming
+            if "You:" in response: response = response.split("You:")[0]
+            return response.strip()
+            
+        elif self.backend == "ollama":
+            try:
+                res = requests.post("http://localhost:11434/api/generate", json={
+                    "model": self.model_name,
+                    "prompt": prompt,
+                    "stream": False,
+                    "options": {
+                        "temperature": self.config.get("temperature"),
+                        "num_predict": self.config.get("max_response_tokens")
+                    }
+                })
+                if res.status_code == 200:
+                    return res.json()['response'].strip()
+                return f"Ollama Error: {res.text}"
+            except Exception as e:
+                return f"Connection Error: {e}"
+
+# ==============================================================================
+#                           6. MODEL DISCOVERY & DOWNLOAD
+# ==============================================================================
+
+def get_ollama_models():
+    """Get list of available Ollama models."""
+    try:
+        response = requests.get("http://localhost:11434/api/tags", timeout=3)
+        if response.status_code == 200:
+            data = response.json()
+            return [model['name'] for model in data.get('models', [])]
+    except:
+        pass
+    return []
+
+def check_ollama_running():
+    """Check if Ollama is running."""
+    try:
+        response = requests.get("http://localhost:11434/api/tags", timeout=2)
+        return response.status_code == 200
+    except:
+        return False
+
+def pull_ollama_model(model_name):
+    """Pull/download an Ollama model."""
+    try:
+        print(f"\n{Colors.BRIGHT_CYAN}Pulling model '{model_name}'...{Colors.RESET}")
+        print(f"{Colors.DIM}This may take several minutes depending on model size...{Colors.RESET}\n")
+        
+        # Use subprocess to run ollama pull
+        process = subprocess.Popen(
+            ["ollama", "pull", model_name],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
+        )
+        
+        # Show progress
+        while True:
+            output = process.stdout.readline()
+            if output == '' and process.poll() is not None:
+                break
+            if output:
+                print(f"{Colors.DIM}{output.strip()}{Colors.RESET}")
+        
+        if process.returncode == 0:
+            print(f"\n{Colors.BRIGHT_GREEN}✓ Model '{model_name}' pulled successfully!{Colors.RESET}")
+            return True
+        else:
+            stderr = process.stderr.read()
+            print(f"\n{Colors.BRIGHT_RED}✗ Failed to pull model: {stderr}{Colors.RESET}")
+            return False
+    except FileNotFoundError:
+        print(f"{Colors.BRIGHT_RED}✗ Ollama command not found. Make sure Ollama is installed.{Colors.RESET}")
+        return False
+    except Exception as e:
+        print(f"{Colors.BRIGHT_RED}✗ Error: {e}{Colors.RESET}")
+        return False
+
+def search_huggingface_models(query="", limit=20):
+    """Search for HuggingFace models."""
+    try:
+        url = f"https://huggingface.co/api/models"
+        params = {"search": query, "limit": limit, "sort": "downloads", "direction": -1}
+        response = requests.get(url, params=params, timeout=10)
+        if response.status_code == 200:
+            models = response.json()
+            return [(m.get('id', ''), m.get('downloads', 0)) for m in models if m.get('id')]
+    except Exception as e:
+        print(f"{Colors.BRIGHT_RED}Error searching models: {e}{Colors.RESET}")
+    return []
+
+def download_huggingface_model(model_id):
+    """Download a HuggingFace model (preview - actual download happens on first use)."""
+    try:
+        print(f"\n{Colors.BRIGHT_CYAN}Model '{model_id}' will be downloaded automatically on first use.{Colors.RESET}")
+        print(f"{Colors.DIM}This may take several minutes depending on model size...{Colors.RESET}\n")
+        return True
+    except Exception as e:
+        print(f"{Colors.BRIGHT_RED}Error: {e}{Colors.RESET}")
+        return False
+
+# ==============================================================================
+#                           6. MODEL TRAINING CLASSES
+# ==============================================================================
+
+class FineTuningManager:
+    """Manages full fine-tuning of language models."""
+    
+    def __init__(self, config):
+        self.config = config
+        self.training_data_dir = TRAINING_DATA_DIR
+        self.models_dir = MODELS_DIR
+    
+    def prepare_dataset(self, data_file, output_dir=None):
+        """Prepare dataset for fine-tuning from JSON/JSONL file."""
+        if output_dir is None:
+            output_dir = self.training_data_dir
+        
+        print(f"{Colors.BRIGHT_CYAN}[FINE-TUNING]{Colors.RESET} Preparing dataset...")
+        
+        try:
+            if not os.path.exists(data_file):
+                print(f"{Colors.BRIGHT_RED}✗ Data file not found: {data_file}{Colors.RESET}")
+                return None
+            
+            # Read and validate data
+            with open(data_file, 'r', encoding='utf-8') as f:
+                if data_file.endswith('.jsonl'):
+                    data = [json.loads(line) for line in f]
+                else:
+                    data = json.load(f)
+            
+            if not isinstance(data, list):
+                data = [data]
+            
+            # Validate format (expects {"instruction": "", "input": "", "output": ""} or {"text": ""})
+            validated = []
+            for item in data:
+                if "text" in item:
+                    validated.append({"text": item["text"]})
+                elif "instruction" in item and "output" in item:
+                    validated.append(item)
+                else:
+                    print(f"{Colors.YELLOW}⚠ Skipping invalid item: {item}{Colors.RESET}")
+            
+            output_file = os.path.join(output_dir, "training_data.json")
+            with open(output_file, 'w', encoding='utf-8') as f:
+                json.dump(validated, f, indent=2, ensure_ascii=False)
+            
+            print(f"{Colors.BRIGHT_GREEN}✓ Dataset prepared: {len(validated)} samples{Colors.RESET}")
+            return output_file
+            
+        except Exception as e:
+            print(f"{Colors.BRIGHT_RED}✗ Error preparing dataset: {e}{Colors.RESET}")
+            return None
+    
+    def train(self, base_model, dataset_file, output_model_name, epochs=3, batch_size=4, learning_rate=5e-5):
+        """Fine-tune a model using the prepared dataset."""
+        print(f"\n{Colors.BRIGHT_CYAN}{Colors.BOLD}{'='*79}{Colors.RESET}")
+        print(f"{Colors.BRIGHT_YELLOW}{Colors.BOLD}  FINE-TUNING MODEL{Colors.RESET}")
+        print(f"{Colors.BRIGHT_CYAN}{Colors.BOLD}{'='*79}{Colors.RESET}\n")
+        
+        print(f"{Colors.CYAN}Base Model:{Colors.RESET} {Colors.BRIGHT_WHITE}{base_model}{Colors.RESET}")
+        print(f"{Colors.CYAN}Dataset:{Colors.RESET} {Colors.BRIGHT_WHITE}{dataset_file}{Colors.RESET}")
+        print(f"{Colors.CYAN}Epochs:{Colors.RESET} {Colors.BRIGHT_WHITE}{epochs}{Colors.RESET}")
+        print(f"{Colors.CYAN}Batch Size:{Colors.RESET} {Colors.BRIGHT_WHITE}{batch_size}{Colors.RESET}")
+        print(f"{Colors.CYAN}Learning Rate:{Colors.RESET} {Colors.BRIGHT_WHITE}{learning_rate}{Colors.RESET}\n")
+        
+        try:
+            # Check if transformers training is available
+            try:
+                from transformers import TrainingArguments, Trainer, DataCollatorForLanguageModeling
+                from datasets import load_dataset
+            except ImportError:
+                print(f"{Colors.BRIGHT_RED}✗ Required packages not installed.{Colors.RESET}")
+                print(f"{Colors.YELLOW}Install with: pip install transformers datasets accelerate{Colors.RESET}")
+                return False
+            
+            print(f"{Colors.BRIGHT_CYAN}Loading model and tokenizer...{Colors.RESET}")
+            tokenizer = AutoTokenizer.from_pretrained(base_model)
+            if not tokenizer.pad_token:
+                tokenizer.pad_token = tokenizer.eos_token
+            
+            model = AutoModelForCausalLM.from_pretrained(base_model)
+            
+            # Load dataset
+            print(f"{Colors.BRIGHT_CYAN}Loading dataset...{Colors.RESET}")
+            dataset = load_dataset('json', data_files=dataset_file, split='train')
+            
+            # Tokenize dataset
+            def tokenize_function(examples):
+                if "text" in examples:
+                    return tokenizer(examples["text"], truncation=True, max_length=512, padding="max_length")
+                else:
+                    # Format: instruction + input -> output
+                    prompt = f"Instruction: {examples.get('instruction', '')}\nInput: {examples.get('input', '')}\nOutput: "
+                    full_text = prompt + examples.get('output', '')
+                    return tokenizer(full_text, truncation=True, max_length=512, padding="max_length")
+            
+            tokenized_dataset = dataset.map(tokenize_function, batched=True)
+            
+            # Training arguments
+            output_path = os.path.join(self.models_dir, output_model_name)
+            training_args = TrainingArguments(
+                output_dir=output_path,
+                num_train_epochs=epochs,
+                per_device_train_batch_size=batch_size,
+                learning_rate=learning_rate,
+                save_strategy="epoch",
+                logging_steps=10,
+                report_to=None,
+            )
+            
+            data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
+            
+            trainer = Trainer(
+                model=model,
+                args=training_args,
+                train_dataset=tokenized_dataset,
+                data_collator=data_collator,
+            )
+            
+            print(f"\n{Colors.BRIGHT_GREEN}Starting training...{Colors.RESET}")
+            print(f"{Colors.DIM}This may take a while depending on model size and dataset...{Colors.RESET}\n")
+            
+            trainer.train()
+            
+            print(f"\n{Colors.BRIGHT_GREEN}Saving fine-tuned model...{Colors.RESET}")
+            trainer.save_model()
+            tokenizer.save_pretrained(output_path)
+            
+            print(f"\n{Colors.BRIGHT_GREEN}{Colors.BOLD}✓ Fine-tuning complete!{Colors.RESET}")
+            print(f"{Colors.CYAN}Model saved to: {Colors.BRIGHT_WHITE}{output_path}{Colors.RESET}")
+            return True
+            
+        except Exception as e:
+            print(f"\n{Colors.BRIGHT_RED}✗ Training failed: {e}{Colors.RESET}")
+            import traceback
+            traceback.print_exc()
+            return False
+
+
+class LoRAManager:
+    """Manages LoRA (Low-Rank Adaptation) training for efficient fine-tuning."""
+    
+    def __init__(self, config):
+        self.config = config
+        self.training_data_dir = TRAINING_DATA_DIR
+        self.lora_dir = LORA_DIR
+    
+    def prepare_dataset(self, data_file, output_dir=None):
+        """Prepare dataset for LoRA training (same as fine-tuning)."""
+        if output_dir is None:
+            output_dir = self.training_data_dir
+        
+        print(f"{Colors.BRIGHT_CYAN}[LoRA]{Colors.RESET} Preparing dataset...")
+        
+        try:
+            if not os.path.exists(data_file):
+                print(f"{Colors.BRIGHT_RED}✗ Data file not found: {data_file}{Colors.RESET}")
+                return None
+            
+            with open(data_file, 'r', encoding='utf-8') as f:
+                if data_file.endswith('.jsonl'):
+                    data = [json.loads(line) for line in f]
+                else:
+                    data = json.load(f)
+            
+            if not isinstance(data, list):
+                data = [data]
+            
+            validated = []
+            for item in data:
+                if "text" in item:
+                    validated.append({"text": item["text"]})
+                elif "instruction" in item and "output" in item:
+                    validated.append(item)
+            
+            output_file = os.path.join(output_dir, "lora_training_data.json")
+            with open(output_file, 'w', encoding='utf-8') as f:
+                json.dump(validated, f, indent=2, ensure_ascii=False)
+            
+            print(f"{Colors.BRIGHT_GREEN}✓ Dataset prepared: {len(validated)} samples{Colors.RESET}")
+            return output_file
+            
+        except Exception as e:
+            print(f"{Colors.BRIGHT_RED}✗ Error preparing dataset: {e}{Colors.RESET}")
+            return None
+    
+    def train(self, base_model, dataset_file, output_lora_name, rank=8, alpha=16, epochs=3, batch_size=4, learning_rate=1e-4):
+        """Train a LoRA adapter for the model."""
+        print(f"\n{Colors.BRIGHT_CYAN}{Colors.BOLD}{'='*79}{Colors.RESET}")
+        print(f"{Colors.BRIGHT_YELLOW}{Colors.BOLD}  LoRA TRAINING{Colors.RESET}")
+        print(f"{Colors.BRIGHT_CYAN}{Colors.BOLD}{'='*79}{Colors.RESET}\n")
+        
+        print(f"{Colors.CYAN}Base Model:{Colors.RESET} {Colors.BRIGHT_WHITE}{base_model}{Colors.RESET}")
+        print(f"{Colors.CYAN}Dataset:{Colors.RESET} {Colors.BRIGHT_WHITE}{dataset_file}{Colors.RESET}")
+        print(f"{Colors.CYAN}Rank:{Colors.RESET} {Colors.BRIGHT_WHITE}{rank}{Colors.RESET}")
+        print(f"{Colors.CYAN}Alpha:{Colors.RESET} {Colors.BRIGHT_WHITE}{alpha}{Colors.RESET}")
+        print(f"{Colors.CYAN}Epochs:{Colors.RESET} {Colors.BRIGHT_WHITE}{epochs}{Colors.RESET}\n")
+        
+        try:
+            # Check if PEFT is available
+            try:
+                from peft import LoraConfig, get_peft_model, TaskType
+                from transformers import TrainingArguments, Trainer, DataCollatorForLanguageModeling
+                from datasets import load_dataset
+            except ImportError:
+                print(f"{Colors.BRIGHT_RED}✗ Required packages not installed.{Colors.RESET}")
+                print(f"{Colors.YELLOW}Install with: pip install peft transformers datasets accelerate{Colors.RESET}")
+                return False
+            
+            print(f"{Colors.BRIGHT_CYAN}Loading model and tokenizer...{Colors.RESET}")
+            tokenizer = AutoTokenizer.from_pretrained(base_model)
+            if not tokenizer.pad_token:
+                tokenizer.pad_token = tokenizer.eos_token
+            
+            model = AutoModelForCausalLM.from_pretrained(base_model)
+            
+            # Configure LoRA
+            lora_config = LoraConfig(
+                task_type=TaskType.CAUSAL_LM,
+                r=rank,
+                lora_alpha=alpha,
+                lora_dropout=0.1,
+                target_modules=["q_proj", "v_proj", "k_proj", "out_proj"] if "llama" in base_model.lower() or "mistral" in base_model.lower() else None,
+            )
+            
+            model = get_peft_model(model, lora_config)
+            model.print_trainable_parameters()
+            
+            # Load and tokenize dataset
+            print(f"{Colors.BRIGHT_CYAN}Loading dataset...{Colors.RESET}")
+            dataset = load_dataset('json', data_files=dataset_file, split='train')
+            
+            def tokenize_function(examples):
+                if "text" in examples:
+                    return tokenizer(examples["text"], truncation=True, max_length=512, padding="max_length")
+                else:
+                    prompt = f"Instruction: {examples.get('instruction', '')}\nInput: {examples.get('input', '')}\nOutput: "
+                    full_text = prompt + examples.get('output', '')
+                    return tokenizer(full_text, truncation=True, max_length=512, padding="max_length")
+            
+            tokenized_dataset = dataset.map(tokenize_function, batched=True)
+            
+            # Training arguments
+            output_path = os.path.join(self.lora_dir, output_lora_name)
+            training_args = TrainingArguments(
+                output_dir=output_path,
+                num_train_epochs=epochs,
+                per_device_train_batch_size=batch_size,
+                learning_rate=learning_rate,
+                save_strategy="epoch",
+                logging_steps=10,
+                report_to=None,
+            )
+            
+            data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
+            
+            trainer = Trainer(
+                model=model,
+                args=training_args,
+                train_dataset=tokenized_dataset,
+                data_collator=data_collator,
+            )
+            
+            print(f"\n{Colors.BRIGHT_GREEN}Starting LoRA training...{Colors.RESET}")
+            print(f"{Colors.DIM}This is more efficient than full fine-tuning...{Colors.RESET}\n")
+            
+            trainer.train()
+            
+            print(f"\n{Colors.BRIGHT_GREEN}Saving LoRA adapter...{Colors.RESET}")
+            model.save_pretrained(output_path)
+            tokenizer.save_pretrained(output_path)
+            
+            print(f"\n{Colors.BRIGHT_GREEN}{Colors.BOLD}✓ LoRA training complete!{Colors.RESET}")
+            print(f"{Colors.CYAN}LoRA adapter saved to: {Colors.BRIGHT_WHITE}{output_path}{Colors.RESET}")
+            return True
+            
+        except Exception as e:
+            print(f"\n{Colors.BRIGHT_RED}✗ LoRA training failed: {e}{Colors.RESET}")
+            import traceback
+            traceback.print_exc()
+            return False
+
+
+class ReinforcementLearningManager:
+    """Manages Reinforcement Learning with Human Feedback (RLHF) and Behaviour Conditioning."""
+    
+    def __init__(self, config):
+        self.config = config
+        self.training_data_dir = TRAINING_DATA_DIR
+        self.reinforcement_dir = REINFORCEMENT_DIR
+    
+    def prepare_preference_data(self, data_file, output_dir=None):
+        """Prepare preference data for RLHF (chosen vs rejected responses)."""
+        if output_dir is None:
+            output_dir = self.training_data_dir
+        
+        print(f"{Colors.BRIGHT_CYAN}[RLHF]{Colors.RESET} Preparing preference dataset...")
+        
+        try:
+            if not os.path.exists(data_file):
+                print(f"{Colors.BRIGHT_RED}✗ Data file not found: {data_file}{Colors.RESET}")
+                return None
+            
+            with open(data_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            
+            if not isinstance(data, list):
+                data = [data]
+            
+            # Validate format: {"prompt": "", "chosen": "", "rejected": ""}
+            validated = []
+            for item in data:
+                if "prompt" in item and "chosen" in item and "rejected" in item:
+                    validated.append(item)
+                else:
+                    print(f"{Colors.YELLOW}⚠ Skipping invalid item (need 'prompt', 'chosen', 'rejected'): {item}{Colors.RESET}")
+            
+            output_file = os.path.join(output_dir, "rlhf_preferences.json")
+            with open(output_file, 'w', encoding='utf-8') as f:
+                json.dump(validated, f, indent=2, ensure_ascii=False)
+            
+            print(f"{Colors.BRIGHT_GREEN}✓ Preference dataset prepared: {len(validated)} pairs{Colors.RESET}")
+            return output_file
+            
+        except Exception as e:
+            print(f"{Colors.BRIGHT_RED}✗ Error preparing preference data: {e}{Colors.RESET}")
+            return None
+    
+    def train_reward_model(self, base_model, preference_file, output_model_name, epochs=3, batch_size=4):
+        """Train a reward model for RLHF."""
+        print(f"\n{Colors.BRIGHT_CYAN}{Colors.BOLD}{'='*79}{Colors.RESET}")
+        print(f"{Colors.BRIGHT_YELLOW}{Colors.BOLD}  REWARD MODEL TRAINING{Colors.RESET}")
+        print(f"{Colors.BRIGHT_CYAN}{Colors.BOLD}{'='*79}{Colors.RESET}\n")
+        
+        print(f"{Colors.CYAN}Base Model:{Colors.RESET} {Colors.BRIGHT_WHITE}{base_model}{Colors.RESET}")
+        print(f"{Colors.CYAN}Preference Data:{Colors.RESET} {Colors.BRIGHT_WHITE}{preference_file}{Colors.RESET}\n")
+        
+        try:
+            print(f"{Colors.BRIGHT_YELLOW}⚠ Reward model training requires specialized setup.{Colors.RESET}")
+            print(f"{Colors.DIM}This is a simplified implementation. For production RLHF, consider using TRL library.{Colors.RESET}\n")
+            
+            # Load preference data
+            with open(preference_file, 'r', encoding='utf-8') as f:
+                preferences = json.load(f)
+            
+            print(f"{Colors.BRIGHT_CYAN}Loaded {len(preferences)} preference pairs{Colors.RESET}")
+            print(f"{Colors.BRIGHT_GREEN}✓ Reward model training framework initialized{Colors.RESET}")
+            print(f"{Colors.DIM}For full RLHF, use: pip install trl{Colors.RESET}")
+            
+            # Save configuration
+            config_file = os.path.join(self.reinforcement_dir, f"{output_model_name}_config.json")
+            config = {
+                "base_model": base_model,
+                "preference_file": preference_file,
+                "epochs": epochs,
+                "batch_size": batch_size,
+                "type": "reward_model"
+            }
+            with open(config_file, 'w') as f:
+                json.dump(config, f, indent=2)
+            
+            print(f"\n{Colors.BRIGHT_GREEN}✓ Configuration saved: {config_file}{Colors.RESET}")
+            return True
+            
+        except Exception as e:
+            print(f"\n{Colors.BRIGHT_RED}✗ Reward model setup failed: {e}{Colors.RESET}")
+            return False
+    
+    def train_with_ppo(self, base_model, reward_model_path, dataset_file, output_model_name, epochs=3):
+        """Train model using PPO (Proximal Policy Optimization)."""
+        print(f"\n{Colors.BRIGHT_CYAN}{Colors.BOLD}{'='*79}{Colors.RESET}")
+        print(f"{Colors.BRIGHT_YELLOW}{Colors.BOLD}  PPO TRAINING (RLHF){Colors.RESET}")
+        print(f"{Colors.BRIGHT_CYAN}{Colors.BOLD}{'='*79}{Colors.RESET}\n")
+        
+        print(f"{Colors.CYAN}Base Model:{Colors.RESET} {Colors.BRIGHT_WHITE}{base_model}{Colors.RESET}")
+        print(f"{Colors.CYAN}Reward Model:{Colors.RESET} {Colors.BRIGHT_WHITE}{reward_model_path}{Colors.RESET}\n")
+        
+        try:
+            print(f"{Colors.BRIGHT_YELLOW}⚠ PPO training requires TRL library.{Colors.RESET}")
+            print(f"{Colors.DIM}Install with: pip install trl{Colors.RESET}\n")
+            
+            # Save PPO configuration
+            config_file = os.path.join(self.reinforcement_dir, f"{output_model_name}_ppo_config.json")
+            config = {
+                "base_model": base_model,
+                "reward_model": reward_model_path,
+                "dataset": dataset_file,
+                "epochs": epochs,
+                "type": "ppo"
+            }
+            with open(config_file, 'w') as f:
+                json.dump(config, f, indent=2)
+            
+            print(f"{Colors.BRIGHT_GREEN}✓ PPO configuration saved: {config_file}{Colors.RESET}")
+            print(f"{Colors.DIM}To run PPO training, use TRL library with this configuration.{Colors.RESET}")
+            return True
+            
+        except Exception as e:
+            print(f"\n{Colors.BRIGHT_RED}✗ PPO setup failed: {e}{Colors.RESET}")
+            return False
+    
+    def apply_behaviour_conditioning(self, model_path, behaviour_rules_file, output_model_name):
+        """Apply behaviour conditioning rules to a model."""
+        print(f"\n{Colors.BRIGHT_CYAN}{Colors.BOLD}{'='*79}{Colors.RESET}")
+        print(f"{Colors.BRIGHT_YELLOW}{Colors.BOLD}  BEHAVIOUR CONDITIONING{Colors.RESET}")
+        print(f"{Colors.BRIGHT_CYAN}{Colors.BOLD}{'='*79}{Colors.RESET}\n")
+        
+        try:
+            # Load behaviour rules
+            with open(behaviour_rules_file, 'r', encoding='utf-8') as f:
+                rules = json.load(f)
+            
+            print(f"{Colors.CYAN}Model:{Colors.RESET} {Colors.BRIGHT_WHITE}{model_path}{Colors.RESET}")
+            print(f"{Colors.CYAN}Rules:{Colors.RESET} {Colors.BRIGHT_WHITE}{len(rules)} behaviour rules{Colors.RESET}\n")
+            
+            # Create conditioning dataset from rules
+            conditioning_data = []
+            for rule in rules:
+                if "trigger" in rule and "response" in rule:
+                    conditioning_data.append({
+                        "instruction": rule.get("trigger", ""),
+                        "output": rule.get("response", ""),
+                        "priority": rule.get("priority", 1)
+                    })
+            
+            # Save conditioning dataset
+            output_file = os.path.join(self.reinforcement_dir, f"{output_model_name}_conditioning.json")
+            with open(output_file, 'w', encoding='utf-8') as f:
+                json.dump(conditioning_data, f, indent=2, ensure_ascii=False)
+            
+            print(f"{Colors.BRIGHT_GREEN}✓ Behaviour conditioning dataset created: {len(conditioning_data)} rules{Colors.RESET}")
+            print(f"{Colors.CYAN}Dataset saved to: {Colors.BRIGHT_WHITE}{output_file}{Colors.RESET}")
+            print(f"{Colors.DIM}Use fine-tuning or LoRA to apply these rules to the model.{Colors.RESET}")
+            
+            return output_file
+            
+        except Exception as e:
+            print(f"\n{Colors.BRIGHT_RED}✗ Behaviour conditioning failed: {e}{Colors.RESET}")
+            return None
+
+
+# ==============================================================================
+#                           7. SPLASH SCREEN & LOADING
+# ==============================================================================
+
+def show_splash_screen():
+    """Display the startup splash screen with colors."""
+    splash = """
+    
+   ))         ))     oo_       .-.   \\\  ///       W  W                oo_    oo_   wW  Ww oo_   (o)__(o)    \\\  ///(o)__(o) 
+  (o0)-. wWw (Oo)-. /  _)-<  c(O_O)c ((O)(O))   /) (O)(O)         /)   /  _)-</  _)-<(O)(O)/  _)-<(__  __)/)  ((O)(O))(__  __) 
+   | (_))(O)_ | (_))\__ `.  ,'.---.`, | \ ||  (o)(O) ||         (o)(O) \__ `. \__ `.  (..) \__ `.   (  )(o)(O) | \ ||   (  )   
+   | .-'.' __)|  .'    `. |/ /|_|_|\ \||\\||   //\\  | \         //\\     `. |   `. |  ||     `. |   )(  //\\  ||\\||    )(    
+   |(  (  _)  )|\\     _| || \_____/ ||| \ |  |(__)| |  `.      |(__)|    _| |   _| | _||_    _| |  (  )|(__)| || \ |   (  )   
+    \)  `.__)(/  \) ,-'   |'. `---' .`||  ||  /,-. |(.-.__)     /,-. | ,-'   |,-'   |(_/\_),-'   |   )/ /,-. | ||  ||    )/    
+    (         )    (_..--'   `-...-' (_/  \_)-'   '' `-'       -'   ''(_..--'(_..--'      (_..--'   (  -'   ''(_/  \_)  (      
+
+ """
+    
+    # Clear screen and print colored splash
+    os.system('cls' if os.name == 'nt' else 'clear')
+    
+    # Print with gradient effect
+    lines = splash.split('\n')
+    colors = [Colors.BRIGHT_CYAN, Colors.CYAN, Colors.BRIGHT_BLUE, Colors.BLUE, Colors.BRIGHT_MAGENTA]
+    
+    for i, line in enumerate(lines):
+        if line.strip():
+            color_idx = (i // 3) % len(colors)
+            print(f"{colors[color_idx]}{Colors.BOLD}{line}{Colors.RESET}")
+        else:
+            print(line)
+    
+    print(f"\n{Colors.BRIGHT_GREEN}{Colors.BOLD}{'='*79}{Colors.RESET}")
+    print(f"{Colors.BRIGHT_YELLOW}{Colors.BOLD}  AI Terminal Pro - Advanced AI Assistant with RAG & Tool Integration{Colors.RESET}")
+    print(f"{Colors.BRIGHT_GREEN}{Colors.BOLD}{'='*79}{Colors.RESET}\n")
+    time.sleep(1.5)
+
+
+def show_loading_screen(message="Loading", duration=2):
+    """Display animated loading screen."""
+    frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
+    colors = [Colors.BRIGHT_CYAN, Colors.CYAN, Colors.BRIGHT_BLUE, Colors.BLUE]
+    
+    start_time = time.time()
+    frame_idx = 0
+    color_idx = 0
+    
+    while time.time() - start_time < duration:
+        frame = frames[frame_idx % len(frames)]
+        color = colors[color_idx % len(colors)]
+        
+        # Clear line and print loading animation
+        print(f"\r{color}{Colors.BOLD}{frame} {message}...{Colors.RESET}", end='', flush=True)
+        
+        frame_idx += 1
+        if frame_idx % 3 == 0:
+            color_idx += 1
+        
+        time.sleep(0.1)
+    
+    print(f"\r{Colors.BRIGHT_GREEN}{Colors.BOLD}✓ {message} complete!{Colors.RESET}" + " " * 50)
+    time.sleep(0.3)
+
+
+def show_progress_bar(message, current, total, bar_length=40):
+    """Display a progress bar."""
+    percent = current / total if total > 0 else 0
+    filled = int(bar_length * percent)
+    bar = '█' * filled + '░' * (bar_length - filled)
+    
+    print(f"\r{Colors.BRIGHT_CYAN}{message}: [{bar}] {int(percent * 100)}%{Colors.RESET}", end='', flush=True)
+    
+    if current >= total:
+        print(f"\r{Colors.BRIGHT_GREEN}✓ {message}: Complete!{Colors.RESET}" + " " * 60)
+
+
+# ==============================================================================
+#                           7. MAIN APP CONTROLLER
+# ==============================================================================
+
+class App:
+    def __init__(self):
+        self.cfg_mgr = ConfigManager()
+        self.config = self.cfg_mgr.config
+        self.memory = MemoryManager(DB_PATH)
+        self.registry = None
+        self.engine = None
+        self.context_mgr = None
+        self.current_session_id = None
+        self.api_manager = None
+        self.current_project_id = None
+
+    def clear(self):
+        os.system('cls' if os.name == 'nt' else 'clear')
+
+    def run(self):
+        # 0. Show startup splash
+        show_splash_screen()
+        
+        # 1. Onboarding
+        if self.config.get("first_run"):
+            self.onboarding()
+        
+        # 2. Initialization with loading screens
+        show_loading_screen("Initializing Tool Registry", 1.0)
+        self.registry = ToolRegistry(self.config)
+        
+        show_loading_screen("Initializing AI Engine", 1.0)
+        self.engine = AIEngine(self.config)
+        
+        show_loading_screen("Setting up Context Manager", 0.8)
+        self.context_mgr = ContextManager(self.engine.tokenizer, self.config.get("max_context_window"))
+        
+        show_loading_screen("Initializing API Manager", 0.5)
+        try:
+            self.api_manager = APIServerManager(self)
+        except Exception as e:
+            print(f"{Colors.YELLOW}⚠ API Manager initialization failed: {e}{Colors.RESET}")
+            self.api_manager = None
+        
+        print(f"\n{Colors.BRIGHT_GREEN}{Colors.BOLD}✓ System Ready!{Colors.RESET}\n")
+        time.sleep(0.5)
+        
+        # 3. Main Menu
+        self.main_menu()
+
+    def onboarding(self):
+        self.clear()
+        print(f"\n{Colors.BRIGHT_CYAN}{Colors.BOLD}{'='*79}{Colors.RESET}")
+        print(f"{Colors.BRIGHT_YELLOW}{Colors.BOLD}{' '*25}AI TERMINAL - INITIAL SETUP{Colors.RESET}")
+        print(f"{Colors.BRIGHT_CYAN}{Colors.BOLD}{'='*79}{Colors.RESET}\n")
+        print(f"{Colors.BRIGHT_WHITE}Welcome! Let's set up your AI backend:{Colors.RESET}\n")
+        
+        # Backend selection
+        print(f"{Colors.CYAN}  [1]{Colors.RESET} Hugging Face {Colors.DIM}(Local Python, High RAM){Colors.RESET}")
+        print(f"{Colors.CYAN}  [2]{Colors.RESET} Ollama {Colors.DIM}(External App, Fast){Colors.RESET}\n")
+        
+        choice = input(f"{Colors.BRIGHT_GREEN}Select Backend [1/2]: {Colors.RESET}").strip()
+        
+        if choice == "2":
+            # Ollama setup
+            self.cfg_mgr.update("backend", "ollama")
+            
+            # Check if Ollama is running
+            print(f"\n{Colors.BRIGHT_CYAN}Checking Ollama connection...{Colors.RESET}")
+            if not check_ollama_running():
+                print(f"{Colors.BRIGHT_RED}⚠ Ollama is not running!{Colors.RESET}")
+                print(f"{Colors.YELLOW}Please start Ollama first, then run this setup again.{Colors.RESET}")
+                print(f"{Colors.DIM}Download Ollama from: https://ollama.ai{Colors.RESET}\n")
+                input(f"{Colors.DIM}Press Enter to continue anyway...{Colors.RESET}")
+            
+            # List available models
+            print(f"\n{Colors.BRIGHT_CYAN}Fetching available Ollama models...{Colors.RESET}")
+            models = get_ollama_models()
+            
+            if models:
+                print(f"\n{Colors.BRIGHT_GREEN}Available Ollama Models:{Colors.RESET}\n")
+                for i, model in enumerate(models[:15], 1):  # Show first 15
+                    # Highlight popular models
+                    popular = ["llama3", "mistral", "codellama", "phi", "gemma"]
+                    marker = " ⭐" if any(p in model.lower() for p in popular) else ""
+                    print(f"  {Colors.CYAN}[{i}]{Colors.RESET} {model}{Colors.BRIGHT_YELLOW}{marker}{Colors.RESET}")
+                
+                print(f"\n{Colors.CYAN}  [0]{Colors.RESET} Enter custom model name")
+                print(f"{Colors.CYAN}  [p]{Colors.RESET} Pull/download a new model")
+                print(f"{Colors.DIM}Popular models: llama3, mistral, codellama, phi, gemma{Colors.RESET}")
+                model_choice = input(f"\n{Colors.BRIGHT_GREEN}Select model [1-{min(len(models), 15)}], 0 for custom, or 'p' to pull: {Colors.RESET}").strip().lower()
+                
+                if model_choice == "p":
+                    # Pull new model
+                    model_to_pull = input(f"{Colors.BRIGHT_GREEN}Enter model name to pull (e.g., llama3, mistral): {Colors.RESET}").strip()
+                    if model_to_pull:
+                        if pull_ollama_model(model_to_pull):
+                            selected_model = model_to_pull
+                        else:
+                            print(f"{Colors.YELLOW}Using default model: llama3{Colors.RESET}")
+                            selected_model = "llama3"
+                    else:
+                        selected_model = "llama3"
+                else:
+                    try:
+                        idx = int(model_choice)
+                        if 1 <= idx <= min(len(models), 15):
+                            selected_model = models[idx - 1]
+                        elif idx == 0:
+                            selected_model = input(f"{Colors.BRIGHT_GREEN}Enter model name: {Colors.RESET}").strip()
+                        else:
+                            selected_model = models[0] if models else "llama3"
+                    except:
+                        selected_model = input(f"{Colors.BRIGHT_GREEN}Enter model name: {Colors.RESET}").strip()
+                    
+                    if not selected_model:
+                        selected_model = "llama3"
+            else:
+                print(f"{Colors.YELLOW}No models found locally.{Colors.RESET}\n")
+                print(f"{Colors.CYAN}  [1]{Colors.RESET} Pull/download a model now")
+                print(f"{Colors.CYAN}  [2]{Colors.RESET} Enter model name (will be pulled on first use)")
+                
+                pull_choice = input(f"\n{Colors.BRIGHT_GREEN}Select option [1/2]: {Colors.RESET}").strip()
+                
+                if pull_choice == "1":
+                    model_to_pull = input(f"{Colors.BRIGHT_GREEN}Enter model name to pull (e.g., llama3, mistral): {Colors.RESET}").strip()
+                    if model_to_pull:
+                        if pull_ollama_model(model_to_pull):
+                            selected_model = model_to_pull
+                        else:
+                            print(f"{Colors.YELLOW}Using default model: llama3{Colors.RESET}")
+                            selected_model = "llama3"
+                    else:
+                        selected_model = "llama3"
+                else:
+                    selected_model = input(f"{Colors.BRIGHT_GREEN}Enter model name (default: llama3): {Colors.RESET}").strip()
+                    if not selected_model:
+                        selected_model = "llama3"
+            
+            self.cfg_mgr.update("model_name", selected_model)
+            print(f"\n{Colors.BRIGHT_GREEN}✓ Selected Ollama model: {selected_model}{Colors.RESET}")
+            
+        else:
+            # HuggingFace setup
+            self.cfg_mgr.update("backend", "huggingface")
+            
+            print(f"\n{Colors.BRIGHT_CYAN}HuggingFace Model Selection{Colors.RESET}\n")
+            print(f"{Colors.CYAN}  [1]{Colors.RESET} Quick select popular model")
+            print(f"{Colors.CYAN}  [2]{Colors.RESET} Search HuggingFace models")
+            print(f"{Colors.CYAN}  [3]{Colors.RESET} Enter model ID manually\n")
+            
+            hf_choice = input(f"{Colors.BRIGHT_GREEN}Select option [1/2/3]: {Colors.RESET}").strip()
+            
+            if hf_choice == "1":
+                # Quick select popular models
+                popular_models = [
+                    ("gpt2", "GPT-2 Small (124M) - Fast, good for testing"),
+                    ("gpt2-medium", "GPT-2 Medium (355M) - Better quality"),
+                    ("gpt2-large", "GPT-2 Large (774M) - High quality"),
+                    ("gpt2-xl", "GPT-2 XL (1.5B) - Best quality, slower"),
+                    ("distilgpt2", "DistilGPT-2 (82M) - Fastest, lightweight"),
+                ]
+                
+                print(f"\n{Colors.BRIGHT_GREEN}Popular Models:{Colors.RESET}\n")
+                for i, (model_id, desc) in enumerate(popular_models, 1):
+                    print(f"  {Colors.CYAN}[{i}]{Colors.RESET} {Colors.BRIGHT_WHITE}{model_id}{Colors.RESET}")
+                    print(f"      {Colors.DIM}{desc}{Colors.RESET}")
+                
+                model_choice = input(f"\n{Colors.BRIGHT_GREEN}Select model [1-{len(popular_models)}]: {Colors.RESET}").strip()
+                try:
+                    idx = int(model_choice)
+                    if 1 <= idx <= len(popular_models):
+                        selected_model = popular_models[idx - 1][0]
+                    else:
+                        selected_model = "gpt2"
+                except:
+                    selected_model = "gpt2"
+            
+            elif hf_choice == "2":
+                # Search models
+                search_term = input(f"{Colors.BRIGHT_GREEN}Search for models (e.g., 'gpt', 'llama', 'mistral'): {Colors.RESET}").strip()
+                if not search_term:
+                    search_term = "gpt"
+                
+                print(f"\n{Colors.BRIGHT_CYAN}Searching HuggingFace...{Colors.RESET}")
+                models = search_huggingface_models(search_term, limit=15)
+                
+                if models:
+                    print(f"\n{Colors.BRIGHT_GREEN}Found Models:{Colors.RESET}\n")
+                    for i, (model_id, downloads) in enumerate(models, 1):
+                        downloads_str = f"{downloads:,}" if downloads else "N/A"
+                        print(f"  {Colors.CYAN}[{i}]{Colors.RESET} {Colors.BRIGHT_WHITE}{model_id}{Colors.RESET} {Colors.DIM}({downloads_str} downloads){Colors.RESET}")
+                    
+                    print(f"\n{Colors.CYAN}  [0]{Colors.RESET} Enter custom model ID")
+                    model_choice = input(f"\n{Colors.BRIGHT_GREEN}Select model [1-{len(models)}] or 0 for custom: {Colors.RESET}").strip()
+                    
+                    try:
+                        idx = int(model_choice)
+                        if 1 <= idx <= len(models):
+                            selected_model = models[idx - 1][0]
+                        elif idx == 0:
+                            selected_model = input(f"{Colors.BRIGHT_GREEN}Enter model ID: {Colors.RESET}").strip()
+                        else:
+                            selected_model = "gpt2"
+                    except:
+                        selected_model = input(f"{Colors.BRIGHT_GREEN}Enter model ID: {Colors.RESET}").strip()
+                    
+                    if not selected_model:
+                        selected_model = "gpt2"
+                else:
+                    print(f"{Colors.YELLOW}No models found. Using default: gpt2{Colors.RESET}")
+                    selected_model = "gpt2"
+                
+            elif hf_choice == "3":
+                selected_model = input(f"{Colors.BRIGHT_GREEN}Enter HuggingFace model ID: {Colors.RESET}").strip()
+                if not selected_model:
+                    selected_model = "gpt2"
+            else:
+                selected_model = "gpt2"
+            
+            self.cfg_mgr.update("model_name", selected_model)
+            print(f"\n{Colors.BRIGHT_GREEN}✓ Selected HuggingFace model: {selected_model}{Colors.RESET}")
+            print(f"{Colors.DIM}Note: Model will be downloaded automatically on first use.{Colors.RESET}")
+            
+        self.cfg_mgr.update("first_run", False)
+        print(f"\n{Colors.BRIGHT_GREEN}{Colors.BOLD}✓ Setup Complete!{Colors.RESET}")
+        show_loading_screen("Preparing system", 1.5)
+
+    def main_menu(self):
+        while True:
+            self.clear()
+            print(f"\n{Colors.BRIGHT_CYAN}{Colors.BOLD}{'='*79}{Colors.RESET}")
+            print(f"{Colors.BRIGHT_YELLOW}{Colors.BOLD}  MAIN MENU{Colors.RESET}")
+            print(f"{Colors.BRIGHT_CYAN}{Colors.BOLD}{'='*79}{Colors.RESET}")
+            backend = self.config.get('backend', 'unknown')
+            model = self.config.get('model_name', 'unknown')
+            print(f"{Colors.CYAN}Backend:{Colors.RESET} {Colors.BRIGHT_WHITE}{backend}{Colors.RESET} | {Colors.CYAN}Model:{Colors.RESET} {Colors.BRIGHT_WHITE}{model}{Colors.RESET}\n")
+            
+            print(f"{Colors.BRIGHT_GREEN}  [1]{Colors.RESET} Start Chat")
+            print(f"{Colors.BRIGHT_GREEN}  [2]{Colors.RESET} Document Loader (RAG)")
+            print(f"{Colors.BRIGHT_GREEN}  [3]{Colors.RESET} Tool Management")
+            print(f"{Colors.BRIGHT_GREEN}  [4]{Colors.RESET} MCP Server Management")
+            print(f"{Colors.BRIGHT_GREEN}  [5]{Colors.RESET} Model Training")
+            print(f"{Colors.BRIGHT_GREEN}  [6]{Colors.RESET} API Management")
+            print(f"{Colors.BRIGHT_GREEN}  [7]{Colors.RESET} Settings")
+            print(f"{Colors.BRIGHT_RED}  [8]{Colors.RESET} Exit\n")
+            
+            c = input(f"{Colors.BRIGHT_GREEN}Select: {Colors.RESET}")
+            if c == "1": self.chat_loop()
+            elif c == "2": self.document_menu()
+            elif c == "3": self.tool_menu()
+            elif c == "4": self.mcp_server_menu()
+            elif c == "5": self.model_training_menu()
+            elif c == "6": self.api_management_menu()
+            elif c == "7": self.settings_menu()
+            elif c == "8":
+                print(f"\n{Colors.BRIGHT_YELLOW}Shutting down...{Colors.RESET}")
+                if self.registry:
+                    for c in self.registry.mcp_clients.values(): c.stop()
+                if self.api_manager:
+                    # Stop all API servers
+                    for api_name in list(self.api_manager.servers.keys()):
+                        self.api_manager.stop_api(api_name)
+                print(f"{Colors.BRIGHT_GREEN}✓ Goodbye!{Colors.RESET}\n")
+                sys.exit()
+
+    def settings_menu(self):
+        self.clear()
+        print(f"\n{Colors.BRIGHT_CYAN}{Colors.BOLD}{'='*79}{Colors.RESET}")
+        print(f"{Colors.BRIGHT_YELLOW}{Colors.BOLD}  SETTINGS{Colors.RESET}")
+        print(f"{Colors.BRIGHT_CYAN}{Colors.BOLD}{'='*79}{Colors.RESET}\n")
+        
+        danger_status = "ON" if self.config.get('enable_dangerous_commands') else "OFF"
+        danger_color = Colors.BRIGHT_RED if self.config.get('enable_dangerous_commands') else Colors.BRIGHT_GREEN
+        print(f"{Colors.CYAN}Dangerous Commands:{Colors.RESET} {danger_color}{danger_status}{Colors.RESET}\n")
+        
+        print(f"{Colors.BRIGHT_GREEN}  [1]{Colors.RESET} Toggle Dangerous Commands {Colors.DIM}(Allow writing outside sandbox){Colors.RESET}")
+        print(f"{Colors.BRIGHT_GREEN}  [2]{Colors.RESET} Edit System Prompt")
+        print(f"{Colors.BRIGHT_GREEN}  [3]{Colors.RESET} Back\n")
+        
+        c = input(f"{Colors.BRIGHT_GREEN}Choice: {Colors.RESET}")
+        if c == "1":
+            new_val = not self.config.get("enable_dangerous_commands")
+            self.cfg_mgr.update("enable_dangerous_commands", new_val)
+            # Must reload registry to update permissions
+            self.registry.config = self.cfg_mgr.config
+            status = "ENABLED" if new_val else "DISABLED"
+            color = Colors.BRIGHT_RED if new_val else Colors.BRIGHT_GREEN
+            print(f"\n{color}✓ Dangerous Commands {status}{Colors.RESET}")
+            time.sleep(1.5)
+        elif c == "2":
+            print(f"\n{Colors.CYAN}Current:{Colors.RESET} {Colors.DIM}{self.config.get('system_prompt')[:60]}...{Colors.RESET}")
+            new_p = input(f"{Colors.BRIGHT_GREEN}New Prompt: {Colors.RESET}")
+            if new_p: 
+                self.cfg_mgr.update("system_prompt", new_p)
+                print(f"{Colors.BRIGHT_GREEN}✓ System prompt updated{Colors.RESET}")
+                time.sleep(1)
+
+    def document_menu(self):
+        self.clear()
+        print(f"\n{Colors.BRIGHT_CYAN}{Colors.BOLD}{'='*79}{Colors.RESET}")
+        print(f"{Colors.BRIGHT_YELLOW}{Colors.BOLD}  RAG DOCUMENT LOADER{Colors.RESET}")
+        print(f"{Colors.BRIGHT_CYAN}{Colors.BOLD}{'='*79}{Colors.RESET}\n")
+        print(f"{Colors.CYAN}Document Directory:{Colors.RESET} {Colors.BRIGHT_WHITE}{DOCS_DIR}{Colors.RESET}")
+        print(f"{Colors.DIM}Place .txt/.md files in the directory above{Colors.RESET}\n")
+        
+        print(f"{Colors.BRIGHT_GREEN}  [1]{Colors.RESET} Ingest All Files")
+        print(f"{Colors.BRIGHT_GREEN}  [2]{Colors.RESET} Back\n")
+        
+        if input(f"{Colors.BRIGHT_GREEN}Choice: {Colors.RESET}") == "1":
+            files = glob.glob(os.path.join(DOCS_DIR, "*.*"))
+            if not files:
+                print(f"\n{Colors.YELLOW}⚠ No files found in {DOCS_DIR}{Colors.RESET}")
+                input(f"\n{Colors.DIM}Press Enter...{Colors.RESET}")
+            return
+
+            total = 0
+            print(f"\n{Colors.BRIGHT_CYAN}Processing files...{Colors.RESET}\n")
+            for f in files:
+                print(f"{Colors.CYAN}  📄{Colors.RESET} Ingesting {Colors.BRIGHT_WHITE}{os.path.basename(f)}{Colors.RESET}...", end='', flush=True)
+                count = self.memory.ingest_file(f)
+                total += count
+                print(f" {Colors.BRIGHT_GREEN}✓ {count} chunks{Colors.RESET}")
+            
+            print(f"\n{Colors.BRIGHT_GREEN}{Colors.BOLD}✓ Done! Added {total} total chunks.{Colors.RESET}")
+            input(f"\n{Colors.DIM}Press Enter...{Colors.RESET}")
+
+    def tool_menu(self):
+        """Main tool management menu - separates Custom Tools and MCP Servers."""
+        while True:
+            self.clear()
+            print(f"\n{Colors.BRIGHT_CYAN}{Colors.BOLD}{'='*79}{Colors.RESET}")
+            print(f"{Colors.BRIGHT_YELLOW}{Colors.BOLD}  TOOL MANAGEMENT{Colors.RESET}")
+            print(f"{Colors.BRIGHT_CYAN}{Colors.BOLD}{'='*79}{Colors.RESET}\n")
+            
+            print(f"{Colors.BRIGHT_GREEN}  [1]{Colors.RESET} Custom Tools {Colors.DIM}(Python, JSON, YAML scripts){Colors.RESET}")
+            print(f"{Colors.BRIGHT_GREEN}  [2]{Colors.RESET} MCP Server Management")
+            print(f"{Colors.BRIGHT_GREEN}  [3]{Colors.RESET} Back\n")
+            
+            c = input(f"{Colors.BRIGHT_GREEN}Choice: {Colors.RESET}")
+            if c == "1":
+                self.custom_tools_menu()
+            elif c == "2":
+                self.mcp_server_menu()
+            elif c == "3":
+                break
+
+    def custom_tools_menu(self):
+        """Custom Tools Management menu."""
+        while True:
+            self.clear()
+            print(f"\n{Colors.BRIGHT_CYAN}{Colors.BOLD}{'='*79}{Colors.RESET}")
+            print(f"{Colors.BRIGHT_YELLOW}{Colors.BOLD}  CUSTOM TOOLS MANAGEMENT{Colors.RESET}")
+            print(f"{Colors.BRIGHT_CYAN}{Colors.BOLD}{'='*79}{Colors.RESET}\n")
+            
+            print(f"{Colors.CYAN}Tools Directory:{Colors.RESET} {Colors.BRIGHT_WHITE}{CUSTOM_TOOLS_DIR}{Colors.RESET}\n")
+            
+            # List current tools
+            tools = self.registry.custom_tool_manager.list_tools() if self.registry else []
+            if tools:
+                print(f"{Colors.CYAN}Available Tools:{Colors.RESET}\n")
+                for i, tool_name in enumerate(tools, 1):
+                    tool_info = self.registry.custom_tool_manager.get_tool_info(tool_name) if self.registry else None
+                    tool_type = tool_info.get("type", "unknown") if tool_info else "unknown"
+                    desc = tool_info.get("description", "") if tool_info else ""
+                    type_color = Colors.BRIGHT_CYAN if tool_type == "python" else Colors.BRIGHT_YELLOW if tool_type in ["json", "yaml"] else Colors.CYAN
+                    print(f"  {Colors.CYAN}[{i}]{Colors.RESET} {Colors.BRIGHT_WHITE}{tool_name}{Colors.RESET} {type_color}({tool_type}){Colors.RESET}")
+                    if desc:
+                        print(f"      {Colors.DIM}{desc[:60]}...{Colors.RESET}\n")
+                    else:
+                        print()
+            else:
+                print(f"{Colors.YELLOW}No custom tools found.{Colors.RESET}\n")
+            
+            print(f"{Colors.BRIGHT_GREEN}  [1]{Colors.RESET} Create Python Tool")
+            print(f"{Colors.BRIGHT_GREEN}  [2]{Colors.RESET} Create JSON Tool")
+            print(f"{Colors.BRIGHT_GREEN}  [3]{Colors.RESET} Create YAML Tool")
+            print(f"{Colors.BRIGHT_GREEN}  [4]{Colors.RESET} Add Existing File")
+            print(f"{Colors.BRIGHT_GREEN}  [5]{Colors.RESET} View Tool Details")
+            print(f"{Colors.BRIGHT_GREEN}  [6]{Colors.RESET} Delete Tool")
+            print(f"{Colors.BRIGHT_GREEN}  [7]{Colors.RESET} Back\n")
+            
+            c = input(f"{Colors.BRIGHT_GREEN}Choice: {Colors.RESET}")
+            
+            if c == "1":
+                # Create Python tool
+                name = input(f"\n{Colors.BRIGHT_GREEN}Tool Name (e.g., 'calculator'): {Colors.RESET}").strip()
+                if not name:
+                    print(f"{Colors.YELLOW}⚠ Name cannot be empty{Colors.RESET}")
+                    time.sleep(1)
+                    continue
+                
+                description = input(f"{Colors.BRIGHT_GREEN}Description: {Colors.RESET}").strip()
+                print(f"\n{Colors.CYAN}Enter Python code (end with 'END' on a new line):{Colors.RESET}")
+                print(f"{Colors.DIM}Example: result = sum([int(x) for x in args])\nprint(result){Colors.RESET}\n")
+                
+                code_lines = []
+                while True:
+                    line = input()
+                    if line.strip() == "END":
+                        break
+                    code_lines.append(line)
+                
+                code = "\n".join(code_lines)
+                if not code.strip():
+                    code = "    # Your tool code here\n    print('Tool executed')"
+                
+                # Indent code
+                indented_code = "\n".join("    " + line if line.strip() else line for line in code.split("\n"))
+                
+                if self.registry.custom_tool_manager.create_python_tool(name, description, indented_code):
+                    print(f"\n{Colors.BRIGHT_GREEN}✓ Python tool '{name}' created!{Colors.RESET}")
+                else:
+                    print(f"\n{Colors.BRIGHT_RED}✗ Failed to create tool.{Colors.RESET}")
+                time.sleep(2)
+            
+            elif c == "2":
+                # Create JSON tool
+                name = input(f"\n{Colors.BRIGHT_GREEN}Tool Name: {Colors.RESET}").strip()
+                if not name:
+                    print(f"{Colors.YELLOW}⚠ Name cannot be empty{Colors.RESET}")
+                    time.sleep(1)
+                    continue
+                
+                description = input(f"{Colors.BRIGHT_GREEN}Description: {Colors.RESET}").strip()
+                print(f"\n{Colors.CYAN}Tool Type:{Colors.RESET}")
+                print(f"  {Colors.CYAN}[1]{Colors.RESET} Command (shell command)")
+                print(f"  {Colors.CYAN}[2]{Colors.RESET} Script (script file path)")
+                tool_type = input(f"{Colors.BRIGHT_GREEN}Select [1/2]: {Colors.RESET}").strip()
+                
+                if tool_type == "1":
+                    command = input(f"{Colors.BRIGHT_GREEN}Command: {Colors.RESET}").strip()
+                    if self.registry.custom_tool_manager.create_json_tool(name, description, command, is_script=False):
+                        print(f"\n{Colors.BRIGHT_GREEN}✓ JSON tool '{name}' created!{Colors.RESET}")
+                    else:
+                        print(f"\n{Colors.BRIGHT_RED}✗ Failed to create tool.{Colors.RESET}")
+                else:
+                    script_path = input(f"{Colors.BRIGHT_GREEN}Script File Path: {Colors.RESET}").strip()
+                    if self.registry.custom_tool_manager.create_json_tool(name, description, script_path, is_script=True):
+                        print(f"\n{Colors.BRIGHT_GREEN}✓ JSON tool '{name}' created!{Colors.RESET}")
+                    else:
+                        print(f"\n{Colors.BRIGHT_RED}✗ Failed to create tool.{Colors.RESET}")
+                time.sleep(2)
+            
+            elif c == "3":
+                # Create YAML tool
+                try:
+                    import yaml
+                except ImportError:
+                    print(f"\n{Colors.YELLOW}⚠ YAML support requires 'pyyaml' package.{Colors.RESET}")
+                    print(f"{Colors.DIM}Install with: pip install pyyaml{Colors.RESET}")
+                    time.sleep(2)
+                    continue
+                
+                name = input(f"\n{Colors.BRIGHT_GREEN}Tool Name: {Colors.RESET}").strip()
+                if not name:
+                    print(f"{Colors.YELLOW}⚠ Name cannot be empty{Colors.RESET}")
+                    time.sleep(1)
+                    continue
+                
+                description = input(f"{Colors.BRIGHT_GREEN}Description: {Colors.RESET}").strip()
+                print(f"\n{Colors.CYAN}Tool Type:{Colors.RESET}")
+                print(f"  {Colors.CYAN}[1]{Colors.RESET} Command (shell command)")
+                print(f"  {Colors.CYAN}[2]{Colors.RESET} Script (script file path)")
+                tool_type = input(f"{Colors.BRIGHT_GREEN}Select [1/2]: {Colors.RESET}").strip()
+                
+                if tool_type == "1":
+                    command = input(f"{Colors.BRIGHT_GREEN}Command: {Colors.RESET}").strip()
+                    if self.registry.custom_tool_manager.create_yaml_tool(name, description, command, is_script=False):
+                        print(f"\n{Colors.BRIGHT_GREEN}✓ YAML tool '{name}' created!{Colors.RESET}")
+                    else:
+                        print(f"\n{Colors.BRIGHT_RED}✗ Failed to create tool.{Colors.RESET}")
+                else:
+                    script_path = input(f"{Colors.BRIGHT_GREEN}Script File Path: {Colors.RESET}").strip()
+                    if self.registry.custom_tool_manager.create_yaml_tool(name, description, script_path, is_script=True):
+                        print(f"\n{Colors.BRIGHT_GREEN}✓ YAML tool '{name}' created!{Colors.RESET}")
+                    else:
+                        print(f"\n{Colors.BRIGHT_RED}✗ Failed to create tool.{Colors.RESET}")
+                time.sleep(2)
+            
+            elif c == "4":
+                # Add existing file
+                file_path = input(f"\n{Colors.BRIGHT_GREEN}File Path: {Colors.RESET}").strip()
+                if not file_path or not os.path.exists(file_path):
+                    print(f"{Colors.YELLOW}⚠ File not found.{Colors.RESET}")
+                    time.sleep(1.5)
+                    continue
+                
+                filename = os.path.basename(file_path)
+                dest_path = os.path.join(CUSTOM_TOOLS_DIR, filename)
+                
+                try:
+                    shutil.copy2(file_path, dest_path)
+                    self.registry.custom_tool_manager.load_tools()
+                    print(f"\n{Colors.BRIGHT_GREEN}✓ File added as tool: {filename}{Colors.RESET}")
+                except Exception as e:
+                    print(f"\n{Colors.BRIGHT_RED}✗ Failed to add file: {e}{Colors.RESET}")
+                time.sleep(2)
+            
+            elif c == "5":
+                # View tool details
+                if not tools:
+                    print(f"\n{Colors.YELLOW}⚠ No tools available.{Colors.RESET}")
+                    time.sleep(1.5)
+                    continue
+                
+                print(f"\n{Colors.CYAN}Select tool to view:{Colors.RESET}\n")
+                for i, tool_name in enumerate(tools, 1):
+                    print(f"  {Colors.CYAN}[{i}]{Colors.RESET} {Colors.BRIGHT_WHITE}{tool_name}{Colors.RESET}")
+                
+                try:
+                    idx = int(input(f"\n{Colors.BRIGHT_GREEN}Select [1-{len(tools)}]: {Colors.RESET}").strip())
+                    if 1 <= idx <= len(tools):
+                        tool_name = tools[idx - 1]
+                        tool_info = self.registry.custom_tool_manager.get_tool_info(tool_name)
+                        
+                        self.clear()
+                        print(f"\n{Colors.BRIGHT_CYAN}{Colors.BOLD}{'='*79}{Colors.RESET}")
+                        print(f"{Colors.BRIGHT_YELLOW}{Colors.BOLD}  TOOL DETAILS: {tool_name}{Colors.RESET}")
+                        print(f"{Colors.BRIGHT_CYAN}{Colors.BOLD}{'='*79}{Colors.RESET}\n")
+                        
+                        if tool_info:
+                            print(f"{Colors.CYAN}Name:{Colors.RESET} {Colors.BRIGHT_WHITE}{tool_info.get('name', 'N/A')}{Colors.RESET}")
+                            print(f"{Colors.CYAN}Type:{Colors.RESET} {Colors.BRIGHT_WHITE}{tool_info.get('type', 'N/A')}{Colors.RESET}")
+                            print(f"{Colors.CYAN}Description:{Colors.RESET} {Colors.BRIGHT_WHITE}{tool_info.get('description', 'N/A')}{Colors.RESET}")
+                            print(f"{Colors.CYAN}File:{Colors.RESET} {Colors.BRIGHT_WHITE}{tool_info.get('file', 'N/A')}{Colors.RESET}")
+                            if tool_info.get('parameters'):
+                                print(f"{Colors.CYAN}Parameters:{Colors.RESET}")
+                                for param in tool_info['parameters']:
+                                    print(f"  {Colors.DIM}- {param}{Colors.RESET}")
+                        else:
+                            print(f"{Colors.YELLOW}No metadata available.{Colors.RESET}")
+                        
+                        input(f"\n{Colors.DIM}Press Enter...{Colors.RESET}")
+                except (ValueError, IndexError):
+                    print(f"{Colors.YELLOW}⚠ Invalid selection.{Colors.RESET}")
+                    time.sleep(1)
+            
+            elif c == "6":
+                # Delete tool
+                if not tools:
+                    print(f"\n{Colors.YELLOW}⚠ No tools available.{Colors.RESET}")
+                    time.sleep(1.5)
+                    continue
+                
+                print(f"\n{Colors.CYAN}Select tool to delete:{Colors.RESET}\n")
+                for i, tool_name in enumerate(tools, 1):
+                    print(f"  {Colors.CYAN}[{i}]{Colors.RESET} {Colors.BRIGHT_WHITE}{tool_name}{Colors.RESET}")
+                
+                try:
+                    idx = int(input(f"\n{Colors.BRIGHT_GREEN}Select [1-{len(tools)}]: {Colors.RESET}").strip())
+                    if 1 <= idx <= len(tools):
+                        tool_name = tools[idx - 1]
+                        confirm = input(f"{Colors.BRIGHT_RED}Delete '{tool_name}'? [y/N]: {Colors.RESET}").strip().lower()
+                        if confirm == 'y':
+                            if self.registry.custom_tool_manager.delete_tool(tool_name):
+                                print(f"\n{Colors.BRIGHT_GREEN}✓ Tool deleted.{Colors.RESET}")
+                            else:
+                                print(f"\n{Colors.BRIGHT_RED}✗ Failed to delete tool.{Colors.RESET}")
+                        else:
+                            print(f"{Colors.DIM}Cancelled.{Colors.RESET}")
+                        time.sleep(1.5)
+                except (ValueError, IndexError):
+                    print(f"{Colors.YELLOW}⚠ Invalid selection.{Colors.RESET}")
+                    time.sleep(1)
+            
+            elif c == "7":
+                break
+
+    def mcp_server_menu(self):
+        """Dedicated MCP Server Management menu with create/stop/delete."""
+        while True:
+            self.clear()
+            print(f"\n{Colors.BRIGHT_CYAN}{Colors.BOLD}{'='*79}{Colors.RESET}")
+            print(f"{Colors.BRIGHT_YELLOW}{Colors.BOLD}  MCP SERVER MANAGEMENT{Colors.RESET}")
+            print(f"{Colors.BRIGHT_CYAN}{Colors.BOLD}{'='*79}{Colors.RESET}\n")
+            
+            # List current MCP servers
+            servers = {}
+            if os.path.exists(MCP_CONFIG_FILE):
+                with open(MCP_CONFIG_FILE, 'r') as f:
+                    servers = json.load(f)
+            
+            if servers:
+                print(f"{Colors.CYAN}Configured Servers:{Colors.RESET}\n")
+                for i, (name, cmd) in enumerate(servers.items(), 1):
+                    is_running = name in (self.registry.mcp_clients if self.registry else {})
+                    status = "✓ Running" if is_running else "○ Stopped"
+                    status_color = Colors.BRIGHT_GREEN if is_running else Colors.DIM
+                    print(f"  {Colors.CYAN}[{i}]{Colors.RESET} {Colors.BRIGHT_WHITE}{name}{Colors.RESET} {status_color}{status}{Colors.RESET}")
+                    print(f"      {Colors.DIM}Command: {cmd}{Colors.RESET}\n")
+            else:
+                print(f"{Colors.YELLOW}No MCP servers configured.{Colors.RESET}\n")
+            
+            print(f"{Colors.BRIGHT_GREEN}  [1]{Colors.RESET} Add/Create MCP Server")
+            print(f"{Colors.BRIGHT_GREEN}  [2]{Colors.RESET} Stop MCP Server")
+            print(f"{Colors.BRIGHT_GREEN}  [3]{Colors.RESET} Delete MCP Server")
+            print(f"{Colors.BRIGHT_GREEN}  [4]{Colors.RESET} Test MCP Server Connection")
+            print(f"{Colors.BRIGHT_GREEN}  [5]{Colors.RESET} View MCP Server Tools")
+            print(f"{Colors.BRIGHT_GREEN}  [6]{Colors.RESET} Back\n")
+            
+            c = input(f"{Colors.BRIGHT_GREEN}Choice: {Colors.RESET}")
+            
+            if c == "1":
+                # Add/Create MCP Server
+                print(f"\n{Colors.CYAN}MCP Server Setup:{Colors.RESET}")
+                print(f"  {Colors.CYAN}[1]{Colors.RESET} Quick Create (common servers)")
+                print(f"  {Colors.CYAN}[2]{Colors.RESET} Custom Command")
+                setup_choice = input(f"{Colors.BRIGHT_GREEN}Select [1/2]: {Colors.RESET}").strip()
+                
+                if setup_choice == "1":
+                    # Quick create
+                    print(f"\n{Colors.CYAN}Common MCP Servers:{Colors.RESET}\n")
+                    common_servers = [
+                        ("filesystem", "uvx mcp-server-filesystem", "File system operations"),
+                        ("brave-search", "uvx mcp-server-brave-search", "Brave Search API"),
+                        ("github", "uvx mcp-server-github", "GitHub integration"),
+                        ("postgres", "uvx mcp-server-postgres", "PostgreSQL database"),
+                    ]
+                    
+                    for i, (name, cmd, desc) in enumerate(common_servers, 1):
+                        print(f"  {Colors.CYAN}[{i}]{Colors.RESET} {Colors.BRIGHT_WHITE}{name}{Colors.RESET} {Colors.DIM}- {desc}{Colors.RESET}")
+                    
+                    try:
+                        idx = int(input(f"\n{Colors.BRIGHT_GREEN}Select [1-{len(common_servers)}]: {Colors.RESET}").strip())
+                        if 1 <= idx <= len(common_servers):
+                            name, base_cmd, _ = common_servers[idx - 1]
+                            server_name = input(f"{Colors.BRIGHT_GREEN}Server Name (default: {name}): {Colors.RESET}").strip() or name
+                            additional_args = input(f"{Colors.BRIGHT_GREEN}Additional Arguments {Colors.DIM}(optional, e.g., path or API key): {Colors.RESET}").strip()
+                            cmd = f"{base_cmd} {additional_args}".strip()
+                        else:
+                            print(f"{Colors.YELLOW}⚠ Invalid selection.{Colors.RESET}")
+                            time.sleep(1)
+                            continue
+                    except ValueError:
+                        print(f"{Colors.YELLOW}⚠ Invalid input.{Colors.RESET}")
+                        time.sleep(1)
+                        continue
+                else:
+                    # Custom command
+                    server_name = input(f"\n{Colors.BRIGHT_GREEN}Server Name: {Colors.RESET}").strip()
+                    if not server_name:
+                        print(f"{Colors.YELLOW}⚠ Name cannot be empty{Colors.RESET}")
+                        time.sleep(1)
+                        continue
+                    
+                    cmd = input(f"{Colors.BRIGHT_GREEN}Command {Colors.DIM}(e.g., 'uvx mcp-server-filesystem ./'): {Colors.RESET}").strip()
+                    if not cmd:
+                        print(f"{Colors.YELLOW}⚠ Command cannot be empty{Colors.RESET}")
+                        time.sleep(1)
+                        continue
+                
+                # Save to config
+                if os.path.exists(MCP_CONFIG_FILE):
+                    with open(MCP_CONFIG_FILE, 'r') as f:
+                        d = json.load(f)
+                else:
+                    d = {}
+                
+                d[server_name] = cmd
+                with open(MCP_CONFIG_FILE, 'w') as f:
+                    json.dump(d, f, indent=4)
+                
+                # Try to start immediately if registry is available
+                if self.registry:
+                    print(f"\n{Colors.BRIGHT_CYAN}Attempting to start server...{Colors.RESET}")
+                    client = MCPClient(server_name, cmd)
+                    if client.start():
+                        self.registry.mcp_clients[server_name] = client
+                        print(f"{Colors.BRIGHT_GREEN}✓ Server '{server_name}' started successfully!{Colors.RESET}")
+                    else:
+                        print(f"{Colors.YELLOW}⚠ Server '{server_name}' added but failed to start.{Colors.RESET}")
+                        print(f"{Colors.DIM}It will be retried on next application restart.{Colors.RESET}")
+                else:
+                    print(f"\n{Colors.BRIGHT_GREEN}✓ Server '{server_name}' added.{Colors.RESET}")
+                    print(f"{Colors.DIM}Server will be started on next application restart.{Colors.RESET}")
+                
+                time.sleep(2)
+            
+            elif c == "2":
+                # Stop MCP Server
+                if not self.registry or not self.registry.mcp_clients:
+                    print(f"\n{Colors.YELLOW}⚠ No running MCP servers.{Colors.RESET}")
+                    time.sleep(1.5)
+                    continue
+                
+                running_servers = list(self.registry.mcp_clients.keys())
+                print(f"\n{Colors.CYAN}Running Servers:{Colors.RESET}\n")
+                for i, name in enumerate(running_servers, 1):
+                    print(f"  {Colors.CYAN}[{i}]{Colors.RESET} {Colors.BRIGHT_WHITE}{name}{Colors.RESET}")
+                
+                try:
+                    idx = int(input(f"\n{Colors.BRIGHT_GREEN}Select server to stop [1-{len(running_servers)}]: {Colors.RESET}").strip())
+                    if 1 <= idx <= len(running_servers):
+                        server_name = running_servers[idx - 1]
+                        client = self.registry.mcp_clients[server_name]
+                        client.stop()
+                        del self.registry.mcp_clients[server_name]
+                        print(f"\n{Colors.BRIGHT_GREEN}✓ Server '{server_name}' stopped.{Colors.RESET}")
+                    else:
+                        print(f"{Colors.YELLOW}⚠ Invalid selection.{Colors.RESET}")
+                except ValueError:
+                    print(f"{Colors.YELLOW}⚠ Invalid input.{Colors.RESET}")
+                time.sleep(1.5)
+            
+            elif c == "3":
+                # Delete MCP Server
+                if not servers:
+                    print(f"\n{Colors.YELLOW}⚠ No MCP servers configured.{Colors.RESET}")
+                    time.sleep(1.5)
+                    continue
+                
+                print(f"\n{Colors.CYAN}Available servers:{Colors.RESET}\n")
+                server_list = list(servers.keys())
+                for i, name in enumerate(server_list, 1):
+                    is_running = name in (self.registry.mcp_clients if self.registry else {})
+                    status = " (Running)" if is_running else ""
+                    print(f"  {Colors.CYAN}[{i}]{Colors.RESET} {Colors.BRIGHT_WHITE}{name}{Colors.RESET}{status}")
+                
+                try:
+                    idx = int(input(f"\n{Colors.BRIGHT_GREEN}Select server to delete [1-{len(server_list)}]: {Colors.RESET}").strip())
+                    if 1 <= idx <= len(server_list):
+                        server_name = server_list[idx - 1]
+                        confirm = input(f"{Colors.BRIGHT_RED}Delete '{server_name}'? [y/N]: {Colors.RESET}").strip().lower()
+                        if confirm == 'y':
+                            # Stop if running
+                            if self.registry and server_name in self.registry.mcp_clients:
+                                self.registry.mcp_clients[server_name].stop()
+                                del self.registry.mcp_clients[server_name]
+                            
+                            # Remove from config
+                            del servers[server_name]
+                            with open(MCP_CONFIG_FILE, 'w') as f:
+                                json.dump(servers, f, indent=4)
+                            
+                            print(f"\n{Colors.BRIGHT_GREEN}✓ Server '{server_name}' deleted.{Colors.RESET}")
+                        else:
+                            print(f"{Colors.DIM}Cancelled.{Colors.RESET}")
+                    else:
+                        print(f"{Colors.YELLOW}⚠ Invalid selection.{Colors.RESET}")
+                except (ValueError, KeyError):
+                    print(f"{Colors.YELLOW}⚠ Invalid input.{Colors.RESET}")
+                time.sleep(1.5)
+            
+            elif c == "4":
+                # Test connection
+                if not self.registry:
+                    print(f"\n{Colors.YELLOW}⚠ Tool registry not initialized.{Colors.RESET}")
+                    time.sleep(1.5)
+                    continue
+                
+                if not self.registry.mcp_clients:
+                    print(f"\n{Colors.YELLOW}⚠ No MCP servers running.{Colors.RESET}")
+                    time.sleep(1.5)
+                    continue
+                
+                print(f"\n{Colors.CYAN}Testing MCP server connections...{Colors.RESET}\n")
+                for name, client in self.registry.mcp_clients.items():
+                    status = "✓ Connected" if client.is_running else "✗ Disconnected"
+                    color = Colors.BRIGHT_GREEN if client.is_running else Colors.BRIGHT_RED
+                    print(f"  {color}{status}{Colors.RESET} {Colors.BRIGHT_WHITE}{name}{Colors.RESET}")
+                
+                input(f"\n{Colors.DIM}Press Enter...{Colors.RESET}")
+            
+            elif c == "5":
+                # View tools
+                if not self.registry:
+                    print(f"\n{Colors.YELLOW}⚠ Tool registry not initialized.{Colors.RESET}")
+                    time.sleep(1.5)
+                    continue
+                
+                if not self.registry.mcp_clients:
+                    print(f"\n{Colors.YELLOW}⚠ No MCP servers running.{Colors.RESET}")
+                    time.sleep(1.5)
+                    continue
+                
+                print(f"\n{Colors.CYAN}Available MCP Tools:{Colors.RESET}\n")
+                for name, client in self.registry.mcp_clients.items():
+                    print(f"{Colors.BRIGHT_WHITE}{name}:{Colors.RESET}")
+                    if client.available_tools:
+                        for tool in client.available_tools:
+                            print(f"  {Colors.CYAN}-{Colors.RESET} {tool.get('name', 'Unknown')}: {tool.get('description', 'No description')}")
+                    else:
+                        print(f"  {Colors.DIM}No tools available{Colors.RESET}")
+                    print()
+                
+                input(f"{Colors.DIM}Press Enter...{Colors.RESET}")
+            
+            elif c == "6":
+                break
+
+    def model_training_menu(self):
+        """Model Training menu with Fine-Tuning, LoRA, and RLHF options."""
+        # Initialize training managers
+        fine_tuner = FineTuningManager(self.config)
+        lora_manager = LoRAManager(self.config)
+        rl_manager = ReinforcementLearningManager(self.config)
+        
+        while True:
+            self.clear()
+            print(f"\n{Colors.BRIGHT_CYAN}{Colors.BOLD}{'='*79}{Colors.RESET}")
+            print(f"{Colors.BRIGHT_YELLOW}{Colors.BOLD}  MODEL TRAINING{Colors.RESET}")
+            print(f"{Colors.BRIGHT_CYAN}{Colors.BOLD}{'='*79}{Colors.RESET}\n")
+            
+            print(f"{Colors.CYAN}Training Data Directory:{Colors.RESET} {Colors.BRIGHT_WHITE}{TRAINING_DATA_DIR}{Colors.RESET}")
+            print(f"{Colors.CYAN}Models Directory:{Colors.RESET} {Colors.BRIGHT_WHITE}{MODELS_DIR}{Colors.RESET}\n")
+            
+            print(f"{Colors.BRIGHT_GREEN}  [1]{Colors.RESET} Fine-Tuning {Colors.DIM}(Full model training){Colors.RESET}")
+            print(f"{Colors.BRIGHT_GREEN}  [2]{Colors.RESET} LoRA Training {Colors.DIM}(Efficient fine-tuning){Colors.RESET}")
+            print(f"{Colors.BRIGHT_GREEN}  [3]{Colors.RESET} Reinforcement Learning + Behaviour Conditioning")
+            print(f"{Colors.BRIGHT_GREEN}  [4]{Colors.RESET} Prepare Training Dataset")
+            print(f"{Colors.BRIGHT_GREEN}  [5]{Colors.RESET} Back\n")
+            
+            c = input(f"{Colors.BRIGHT_GREEN}Choice: {Colors.RESET}")
+            
+            if c == "1":
+                # Fine-Tuning
+                self.clear()
+                print(f"\n{Colors.BRIGHT_CYAN}{Colors.BOLD}{'='*79}{Colors.RESET}")
+                print(f"{Colors.BRIGHT_YELLOW}{Colors.BOLD}  FINE-TUNING{Colors.RESET}")
+                print(f"{Colors.BRIGHT_CYAN}{Colors.BOLD}{'='*79}{Colors.RESET}\n")
+                
+                base_model = input(f"{Colors.BRIGHT_GREEN}Base Model ID {Colors.DIM}(e.g., gpt2, microsoft/DialoGPT-medium): {Colors.RESET}").strip()
+                if not base_model:
+                    base_model = self.config.get('model_name', 'gpt2')
+                
+                dataset_file = input(f"{Colors.BRIGHT_GREEN}Dataset File Path {Colors.DIM}(JSON/JSONL): {Colors.RESET}").strip()
+                if not dataset_file or not os.path.exists(dataset_file):
+                    print(f"{Colors.YELLOW}⚠ Dataset file not found. Use option 4 to prepare one.{Colors.RESET}")
+                    input(f"\n{Colors.DIM}Press Enter...{Colors.RESET}")
+                    continue
+                
+                output_name = input(f"{Colors.BRIGHT_GREEN}Output Model Name: {Colors.RESET}").strip()
+                if not output_name:
+                    output_name = f"finetuned_{base_model.replace('/', '_')}"
+                
+                try:
+                    epochs = int(input(f"{Colors.BRIGHT_GREEN}Epochs {Colors.DIM}(default 3): {Colors.RESET}").strip() or "3")
+                    batch_size = int(input(f"{Colors.BRIGHT_GREEN}Batch Size {Colors.DIM}(default 4): {Colors.RESET}").strip() or "4")
+                    lr = float(input(f"{Colors.BRIGHT_GREEN}Learning Rate {Colors.DIM}(default 5e-5): {Colors.RESET}").strip() or "5e-5")
+                except ValueError:
+                    print(f"{Colors.YELLOW}⚠ Invalid input, using defaults{Colors.RESET}")
+                    epochs, batch_size, lr = 3, 4, 5e-5
+                
+                fine_tuner.train(base_model, dataset_file, output_name, epochs, batch_size, lr)
+                input(f"\n{Colors.DIM}Press Enter...{Colors.RESET}")
+            
+            elif c == "2":
+                # LoRA Training
+                self.clear()
+                print(f"\n{Colors.BRIGHT_CYAN}{Colors.BOLD}{'='*79}{Colors.RESET}")
+                print(f"{Colors.BRIGHT_YELLOW}{Colors.BOLD}  LoRA TRAINING{Colors.RESET}")
+                print(f"{Colors.BRIGHT_CYAN}{Colors.BOLD}{'='*79}{Colors.RESET}\n")
+                
+                base_model = input(f"{Colors.BRIGHT_GREEN}Base Model ID {Colors.DIM}(e.g., gpt2, microsoft/DialoGPT-medium): {Colors.RESET}").strip()
+                if not base_model:
+                    base_model = self.config.get('model_name', 'gpt2')
+                
+                dataset_file = input(f"{Colors.BRIGHT_GREEN}Dataset File Path {Colors.DIM}(JSON/JSONL): {Colors.RESET}").strip()
+                if not dataset_file or not os.path.exists(dataset_file):
+                    print(f"{Colors.YELLOW}⚠ Dataset file not found. Use option 4 to prepare one.{Colors.RESET}")
+                    input(f"\n{Colors.DIM}Press Enter...{Colors.RESET}")
+                    continue
+                
+                output_name = input(f"{Colors.BRIGHT_GREEN}Output LoRA Name: {Colors.RESET}").strip()
+                if not output_name:
+                    output_name = f"lora_{base_model.replace('/', '_')}"
+                
+                try:
+                    rank = int(input(f"{Colors.BRIGHT_GREEN}LoRA Rank {Colors.DIM}(default 8): {Colors.RESET}").strip() or "8")
+                    alpha = int(input(f"{Colors.BRIGHT_GREEN}LoRA Alpha {Colors.DIM}(default 16): {Colors.RESET}").strip() or "16")
+                    epochs = int(input(f"{Colors.BRIGHT_GREEN}Epochs {Colors.DIM}(default 3): {Colors.RESET}").strip() or "3")
+                    batch_size = int(input(f"{Colors.BRIGHT_GREEN}Batch Size {Colors.DIM}(default 4): {Colors.RESET}").strip() or "4")
+                    lr = float(input(f"{Colors.BRIGHT_GREEN}Learning Rate {Colors.DIM}(default 1e-4): {Colors.RESET}").strip() or "1e-4")
+                except ValueError:
+                    print(f"{Colors.YELLOW}⚠ Invalid input, using defaults{Colors.RESET}")
+                    rank, alpha, epochs, batch_size, lr = 8, 16, 3, 4, 1e-4
+                
+                lora_manager.train(base_model, dataset_file, output_name, rank, alpha, epochs, batch_size, lr)
+                input(f"\n{Colors.DIM}Press Enter...{Colors.RESET}")
+            
+            elif c == "3":
+                # Reinforcement Learning + Behaviour Conditioning
+                self.clear()
+                print(f"\n{Colors.BRIGHT_CYAN}{Colors.BOLD}{'='*79}{Colors.RESET}")
+                print(f"{Colors.BRIGHT_YELLOW}{Colors.BOLD}  REINFORCEMENT LEARNING & BEHAVIOUR CONDITIONING{Colors.RESET}")
+                print(f"{Colors.BRIGHT_CYAN}{Colors.BOLD}{'='*79}{Colors.RESET}\n")
+                
+                print(f"{Colors.BRIGHT_GREEN}  [1]{Colors.RESET} Train Reward Model (RLHF)")
+                print(f"{Colors.BRIGHT_GREEN}  [2]{Colors.RESET} PPO Training")
+                print(f"{Colors.BRIGHT_GREEN}  [3]{Colors.RESET} Apply Behaviour Conditioning")
+                print(f"{Colors.BRIGHT_GREEN}  [4]{Colors.RESET} Back\n")
+                
+                rl_choice = input(f"{Colors.BRIGHT_GREEN}Choice: {Colors.RESET}")
+                
+                if rl_choice == "1":
+                    base_model = input(f"\n{Colors.BRIGHT_GREEN}Base Model ID: {Colors.RESET}").strip() or self.config.get('model_name', 'gpt2')
+                    preference_file = input(f"{Colors.BRIGHT_GREEN}Preference Data File {Colors.DIM}(JSON with 'prompt', 'chosen', 'rejected'): {Colors.RESET}").strip()
+                    
+                    if not preference_file or not os.path.exists(preference_file):
+                        print(f"{Colors.YELLOW}⚠ Preference file not found.{Colors.RESET}")
+                        input(f"\n{Colors.DIM}Press Enter...{Colors.RESET}")
+                        continue
+                    
+                    output_name = input(f"{Colors.BRIGHT_GREEN}Reward Model Name: {Colors.RESET}").strip() or "reward_model"
+                    
+                    try:
+                        epochs = int(input(f"{Colors.BRIGHT_GREEN}Epochs {Colors.DIM}(default 3): {Colors.RESET}").strip() or "3")
+                        batch_size = int(input(f"{Colors.BRIGHT_GREEN}Batch Size {Colors.DIM}(default 4): {Colors.RESET}").strip() or "4")
+                    except ValueError:
+                        epochs, batch_size = 3, 4
+                    
+                    rl_manager.train_reward_model(base_model, preference_file, output_name, epochs, batch_size)
+                    input(f"\n{Colors.DIM}Press Enter...{Colors.RESET}")
+                
+                elif rl_choice == "2":
+                    base_model = input(f"\n{Colors.BRIGHT_GREEN}Base Model ID: {Colors.RESET}").strip() or self.config.get('model_name', 'gpt2')
+                    reward_model = input(f"{Colors.BRIGHT_GREEN}Reward Model Path: {Colors.RESET}").strip()
+                    dataset_file = input(f"{Colors.BRIGHT_GREEN}Training Dataset File: {Colors.RESET}").strip()
+                    output_name = input(f"{Colors.BRIGHT_GREEN}Output Model Name: {Colors.RESET}").strip() or "ppo_model"
+                    
+                    try:
+                        epochs = int(input(f"{Colors.BRIGHT_GREEN}Epochs {Colors.DIM}(default 3): {Colors.RESET}").strip() or "3")
+                    except ValueError:
+                        epochs = 3
+                    
+                    rl_manager.train_with_ppo(base_model, reward_model, dataset_file, output_name, epochs)
+                    input(f"\n{Colors.DIM}Press Enter...{Colors.RESET}")
+                
+                elif rl_choice == "3":
+                    model_path = input(f"\n{Colors.BRIGHT_GREEN}Model Path: {Colors.RESET}").strip()
+                    rules_file = input(f"{Colors.BRIGHT_GREEN}Behaviour Rules File {Colors.DIM}(JSON with 'trigger', 'response', 'priority'): {Colors.RESET}").strip()
+                    
+                    if not rules_file or not os.path.exists(rules_file):
+                        print(f"{Colors.YELLOW}⚠ Rules file not found.{Colors.RESET}")
+                        input(f"\n{Colors.DIM}Press Enter...{Colors.RESET}")
+                        continue
+                    
+                    output_name = input(f"{Colors.BRIGHT_GREEN}Output Name: {Colors.RESET}").strip() or "conditioned_model"
+                    
+                    result = rl_manager.apply_behaviour_conditioning(model_path, rules_file, output_name)
+                    if result:
+                        print(f"\n{Colors.BRIGHT_GREEN}✓ Use the generated dataset with Fine-Tuning or LoRA to apply conditioning.{Colors.RESET}")
+                    input(f"\n{Colors.DIM}Press Enter...{Colors.RESET}")
+            
+            elif c == "4":
+                # Prepare Training Dataset
+                self.clear()
+                print(f"\n{Colors.BRIGHT_CYAN}{Colors.BOLD}{'='*79}{Colors.RESET}")
+                print(f"{Colors.BRIGHT_YELLOW}{Colors.BOLD}  PREPARE TRAINING DATASET{Colors.RESET}")
+                print(f"{Colors.BRIGHT_CYAN}{Colors.BOLD}{'='*79}{Colors.RESET}\n")
+                
+                data_file = input(f"{Colors.BRIGHT_GREEN}Input Data File {Colors.DIM}(JSON/JSONL): {Colors.RESET}").strip()
+                if not data_file or not os.path.exists(data_file):
+                    print(f"{Colors.YELLOW}⚠ File not found.{Colors.RESET}")
+                    input(f"\n{Colors.DIM}Press Enter...{Colors.RESET}")
+                    continue
+                
+                print(f"\n{Colors.CYAN}Preparing dataset...{Colors.RESET}")
+                result = fine_tuner.prepare_dataset(data_file)
+                if result:
+                    print(f"\n{Colors.BRIGHT_GREEN}✓ Dataset prepared successfully!{Colors.RESET}")
+                input(f"\n{Colors.DIM}Press Enter...{Colors.RESET}")
+            
+            elif c == "5":
+                break
+
+    def api_management_menu(self):
+        """API Management menu for creating and managing API endpoints."""
+        if not self.api_manager:
+            print(f"\n{Colors.BRIGHT_RED}✗ API Manager not initialized.{Colors.RESET}")
+            if not FLASK_AVAILABLE:
+                print(f"{Colors.YELLOW}Install Flask: pip install flask flask-cors{Colors.RESET}")
+            if not ENCRYPTION_AVAILABLE:
+                print(f"{Colors.YELLOW}Install cryptography: pip install cryptography{Colors.RESET}")
+            input(f"\n{Colors.DIM}Press Enter...{Colors.RESET}")
+            return
+        
+        while True:
+            self.clear()
+            print(f"\n{Colors.BRIGHT_CYAN}{Colors.BOLD}{'='*79}{Colors.RESET}")
+            print(f"{Colors.BRIGHT_YELLOW}{Colors.BOLD}  API MANAGEMENT{Colors.RESET}")
+            print(f"{Colors.BRIGHT_CYAN}{Colors.BOLD}{'='*79}{Colors.RESET}\n")
+            
+            # List current APIs
+            apis = self.api_manager.list_apis()
+            if apis:
+                print(f"{Colors.CYAN}Configured APIs:{Colors.RESET}\n")
+                for i, api_name in enumerate(apis, 1):
+                    info = self.api_manager.get_api_info(api_name)
+                    status = "✓ Running" if info.get("running") else "○ Stopped"
+                    status_color = Colors.BRIGHT_GREEN if info.get("running") else Colors.DIM
+                    print(f"  {Colors.CYAN}[{i}]{Colors.RESET} {Colors.BRIGHT_WHITE}{api_name}{Colors.RESET} {status_color}{status}{Colors.RESET}")
+                    print(f"      {Colors.DIM}Port: {info.get('port', 'N/A')} | CORS: {'ON' if info.get('enable_cors') else 'OFF'} | IP Whitelist: {'ON' if info.get('ip_whitelist') else 'OFF'}{Colors.RESET}\n")
+            else:
+                print(f"{Colors.YELLOW}No APIs configured.{Colors.RESET}\n")
+            
+            print(f"{Colors.BRIGHT_GREEN}  [1]{Colors.RESET} Create New API")
+            print(f"{Colors.BRIGHT_GREEN}  [2]{Colors.RESET} Stop API")
+            print(f"{Colors.BRIGHT_GREEN}  [3]{Colors.RESET} Delete API")
+            print(f"{Colors.BRIGHT_GREEN}  [4]{Colors.RESET} View API Details")
+            print(f"{Colors.BRIGHT_GREEN}  [5]{Colors.RESET} Test API Endpoint")
+            print(f"{Colors.BRIGHT_GREEN}  [6]{Colors.RESET} Back\n")
+            
+            c = input(f"{Colors.BRIGHT_GREEN}Choice: {Colors.RESET}")
+            
+            if c == "1":
+                # Create new API
+                self.clear()
+                print(f"\n{Colors.BRIGHT_CYAN}{Colors.BOLD}{'='*79}{Colors.RESET}")
+                print(f"{Colors.BRIGHT_YELLOW}{Colors.BOLD}  CREATE NEW API{Colors.RESET}")
+                print(f"{Colors.BRIGHT_CYAN}{Colors.BOLD}{'='*79}{Colors.RESET}\n")
+                
+                name = input(f"{Colors.BRIGHT_GREEN}API Name: {Colors.RESET}").strip()
+                if not name:
+                    print(f"{Colors.YELLOW}⚠ Name cannot be empty{Colors.RESET}")
+                    time.sleep(1)
+                    continue
+                
+                try:
+                    port = int(input(f"{Colors.BRIGHT_GREEN}Port {Colors.DIM}(default 5000): {Colors.RESET}").strip() or "5000")
+                except ValueError:
+                    port = 5000
+                
+                # CORS configuration
+                enable_cors = input(f"{Colors.BRIGHT_GREEN}Enable CORS? [Y/n]: {Colors.RESET}").strip().lower()
+                enable_cors = enable_cors != 'n'
+                
+                cors_origins = []
+                if enable_cors:
+                    origins_input = input(f"{Colors.BRIGHT_GREEN}CORS Origins {Colors.DIM}(comma-separated, * for all): {Colors.RESET}").strip()
+                    if origins_input:
+                        cors_origins = [o.strip() for o in origins_input.split(',')]
+                    else:
+                        cors_origins = ["*"]
+                
+                # IP Whitelist
+                ip_whitelist_input = input(f"{Colors.BRIGHT_GREEN}IP Whitelist {Colors.DIM}(comma-separated, empty for none): {Colors.RESET}").strip()
+                ip_whitelist = []
+                if ip_whitelist_input:
+                    ip_whitelist = [ip.strip() for ip in ip_whitelist_input.split(',')]
+                
+                # Authentication
+                require_auth = input(f"{Colors.BRIGHT_GREEN}Require API Key? [Y/n]: {Colors.RESET}").strip().lower()
+                require_auth = require_auth != 'n'
+                
+                print(f"\n{Colors.BRIGHT_CYAN}Creating API...{Colors.RESET}")
+                success, message = self.api_manager.create_api(
+                    name, port, enable_cors, cors_origins, ip_whitelist, require_auth
+                )
+                
+                if success:
+                    print(f"\n{Colors.BRIGHT_GREEN}✓ {message}{Colors.RESET}")
+                    if require_auth:
+                        api_key = self.api_manager.get_api_key(name)
+                        print(f"\n{Colors.BRIGHT_YELLOW}⚠ IMPORTANT: Save your API key:{Colors.RESET}")
+                        print(f"{Colors.BRIGHT_WHITE}{api_key}{Colors.RESET}")
+                        print(f"{Colors.DIM}This key will not be shown again!{Colors.RESET}")
+                else:
+                    print(f"\n{Colors.BRIGHT_RED}✗ {message}{Colors.RESET}")
+                
+                input(f"\n{Colors.DIM}Press Enter...{Colors.RESET}")
+            
+            elif c == "2":
+                # Stop API
+                if not apis:
+                    print(f"\n{Colors.YELLOW}⚠ No APIs configured.{Colors.RESET}")
+                    time.sleep(1.5)
+                    continue
+                
+                print(f"\n{Colors.CYAN}Select API to stop:{Colors.RESET}\n")
+                for i, api_name in enumerate(apis, 1):
+                    info = self.api_manager.get_api_info(api_name)
+                    if info.get("running"):
+                        print(f"  {Colors.CYAN}[{i}]{Colors.RESET} {Colors.BRIGHT_WHITE}{api_name}{Colors.RESET}")
+                
+                try:
+                    idx = int(input(f"\n{Colors.BRIGHT_GREEN}Select [1-{len(apis)}]: {Colors.RESET}").strip())
+                    if 1 <= idx <= len(apis):
+                        api_name = apis[idx - 1]
+                        success, message = self.api_manager.stop_api(api_name)
+                        if success:
+                            print(f"\n{Colors.BRIGHT_GREEN}✓ {message}{Colors.RESET}")
+                        else:
+                            print(f"\n{Colors.BRIGHT_RED}✗ {message}{Colors.RESET}")
+                    else:
+                        print(f"{Colors.YELLOW}⚠ Invalid selection.{Colors.RESET}")
+                except ValueError:
+                    print(f"{Colors.YELLOW}⚠ Invalid input.{Colors.RESET}")
+                time.sleep(1.5)
+            
+            elif c == "3":
+                # Delete API
+                if not apis:
+                    print(f"\n{Colors.YELLOW}⚠ No APIs configured.{Colors.RESET}")
+                    time.sleep(1.5)
+                    continue
+                
+                print(f"\n{Colors.CYAN}Select API to delete:{Colors.RESET}\n")
+                for i, api_name in enumerate(apis, 1):
+                    print(f"  {Colors.CYAN}[{i}]{Colors.RESET} {Colors.BRIGHT_WHITE}{api_name}{Colors.RESET}")
+                
+                try:
+                    idx = int(input(f"\n{Colors.BRIGHT_GREEN}Select [1-{len(apis)}]: {Colors.RESET}").strip())
+                    if 1 <= idx <= len(apis):
+                        api_name = apis[idx - 1]
+                        confirm = input(f"{Colors.BRIGHT_RED}Delete '{api_name}'? [y/N]: {Colors.RESET}").strip().lower()
+                        if confirm == 'y':
+                            success, message = self.api_manager.delete_api(api_name)
+                            if success:
+                                print(f"\n{Colors.BRIGHT_GREEN}✓ {message}{Colors.RESET}")
+                            else:
+                                print(f"\n{Colors.BRIGHT_RED}✗ {message}{Colors.RESET}")
+                        else:
+                            print(f"{Colors.DIM}Cancelled.{Colors.RESET}")
+                    else:
+                        print(f"{Colors.YELLOW}⚠ Invalid selection.{Colors.RESET}")
+                except ValueError:
+                    print(f"{Colors.YELLOW}⚠ Invalid input.{Colors.RESET}")
+                time.sleep(1.5)
+            
+            elif c == "4":
+                # View API details
+                if not apis:
+                    print(f"\n{Colors.YELLOW}⚠ No APIs configured.{Colors.RESET}")
+                    time.sleep(1.5)
+                    continue
+                
+                print(f"\n{Colors.CYAN}Select API to view:{Colors.RESET}\n")
+                for i, api_name in enumerate(apis, 1):
+                    print(f"  {Colors.CYAN}[{i}]{Colors.RESET} {Colors.BRIGHT_WHITE}{api_name}{Colors.RESET}")
+                
+                try:
+                    idx = int(input(f"\n{Colors.BRIGHT_GREEN}Select [1-{len(apis)}]: {Colors.RESET}").strip())
+                    if 1 <= idx <= len(apis):
+                        api_name = apis[idx - 1]
+                        info = self.api_manager.get_api_info(api_name)
+                        
+                        self.clear()
+                        print(f"\n{Colors.BRIGHT_CYAN}{Colors.BOLD}{'='*79}{Colors.RESET}")
+                        print(f"{Colors.BRIGHT_YELLOW}{Colors.BOLD}  API DETAILS: {api_name}{Colors.RESET}")
+                        print(f"{Colors.BRIGHT_CYAN}{Colors.BOLD}{'='*79}{Colors.RESET}\n")
+                        
+                        print(f"{Colors.CYAN}Name:{Colors.RESET} {Colors.BRIGHT_WHITE}{api_name}{Colors.RESET}")
+                        print(f"{Colors.CYAN}Port:{Colors.RESET} {Colors.BRIGHT_WHITE}{info.get('port', 'N/A')}{Colors.RESET}")
+                        print(f"{Colors.CYAN}Status:{Colors.RESET} {Colors.BRIGHT_GREEN if info.get('running') else Colors.DIM}{'Running' if info.get('running') else 'Stopped'}{Colors.RESET}")
+                        print(f"{Colors.CYAN}CORS Enabled:{Colors.RESET} {Colors.BRIGHT_WHITE}{'Yes' if info.get('enable_cors') else 'No'}{Colors.RESET}")
+                        if info.get('enable_cors') and info.get('cors_origins'):
+                            print(f"{Colors.CYAN}CORS Origins:{Colors.RESET} {Colors.BRIGHT_WHITE}{', '.join(info.get('cors_origins', []))}{Colors.RESET}")
+                        print(f"{Colors.CYAN}IP Whitelist:{Colors.RESET} {Colors.BRIGHT_WHITE}{'Yes' if info.get('ip_whitelist') else 'No'}{Colors.RESET}")
+                        if info.get('ip_whitelist'):
+                            print(f"{Colors.CYAN}Whitelisted IPs:{Colors.RESET} {Colors.BRIGHT_WHITE}{', '.join(info.get('ip_whitelist', []))}{Colors.RESET}")
+                        print(f"{Colors.CYAN}Authentication Required:{Colors.RESET} {Colors.BRIGHT_WHITE}{'Yes' if info.get('require_auth') else 'No'}{Colors.RESET}")
+                        if info.get('require_auth'):
+                            api_key = info.get('api_key')
+                            if api_key:
+                                print(f"{Colors.CYAN}API Key:{Colors.RESET} {Colors.BRIGHT_WHITE}{api_key}{Colors.RESET}")
+                            else:
+                                print(f"{Colors.YELLOW}⚠ API key not found{Colors.RESET}")
+                        print(f"{Colors.CYAN}Encryption Available:{Colors.RESET} {Colors.BRIGHT_WHITE}{'Yes' if self.api_manager.encryption_manager else 'No'}{Colors.RESET}")
+                        
+                        print(f"\n{Colors.CYAN}Endpoints:{Colors.RESET}")
+                        print(f"  {Colors.DIM}POST /chat{Colors.RESET} - Send chat messages")
+                        print(f"  {Colors.DIM}GET /health{Colors.RESET} - Health check")
+                        print(f"  {Colors.DIM}GET /info{Colors.RESET} - API information")
+                        
+                        input(f"\n{Colors.DIM}Press Enter...{Colors.RESET}")
+                    else:
+                        print(f"{Colors.YELLOW}⚠ Invalid selection.{Colors.RESET}")
+                        time.sleep(1)
+                except ValueError:
+                    print(f"{Colors.YELLOW}⚠ Invalid input.{Colors.RESET}")
+                    time.sleep(1)
+            
+            elif c == "5":
+                # Test API endpoint
+                if not apis:
+                    print(f"\n{Colors.YELLOW}⚠ No APIs configured.{Colors.RESET}")
+                    time.sleep(1.5)
+                    continue
+                
+                print(f"\n{Colors.CYAN}Select API to test:{Colors.RESET}\n")
+                for i, api_name in enumerate(apis, 1):
+                    info = self.api_manager.get_api_info(api_name)
+                    if info.get("running"):
+                        print(f"  {Colors.CYAN}[{i}]{Colors.RESET} {Colors.BRIGHT_WHITE}{api_name}{Colors.RESET} {Colors.DIM}(Port {info.get('port')}){Colors.RESET}")
+                
+                try:
+                    idx = int(input(f"\n{Colors.BRIGHT_GREEN}Select [1-{len(apis)}]: {Colors.RESET}").strip())
+                    if 1 <= idx <= len(apis):
+                        api_name = apis[idx - 1]
+                        info = self.api_manager.get_api_info(api_name)
+                        
+                        if not info.get("running"):
+                            print(f"\n{Colors.YELLOW}⚠ API is not running.{Colors.RESET}")
+                            time.sleep(1.5)
+                            continue
+                        
+                        port = info.get('port')
+                        api_key = info.get('api_key')
+                        
+                        print(f"\n{Colors.CYAN}Testing API endpoint...{Colors.RESET}\n")
+                        print(f"{Colors.DIM}Example curl command:{Colors.RESET}")
+                        
+                        test_message = "Hello, this is a test message"
+                        curl_cmd = f"curl -X POST http://localhost:{port}/chat"
+                        
+                        headers = []
+                        if api_key:
+                            headers.append(f"-H 'X-API-Key: {api_key}'")
+                        
+                        data = f"-d '{{\"message\": \"{test_message}\", \"encrypt_response\": false}}'"
+                        headers_str = " ".join(headers)
+                        
+                        print(f"{Colors.BRIGHT_WHITE}{curl_cmd} {headers_str} {data}{Colors.RESET}")
+                        
+                        # Try to make actual request
+                        try:
+                            import requests
+                            url = f"http://localhost:{port}/health"
+                            response = requests.get(url, timeout=2)
+                            if response.status_code == 200:
+                                print(f"\n{Colors.BRIGHT_GREEN}✓ API is responding!{Colors.RESET}")
+                            else:
+                                print(f"\n{Colors.YELLOW}⚠ API responded with status {response.status_code}{Colors.RESET}")
+                        except Exception as e:
+                            print(f"\n{Colors.YELLOW}⚠ Could not connect to API: {e}{Colors.RESET}")
+                        
+                        input(f"\n{Colors.DIM}Press Enter...{Colors.RESET}")
+                    else:
+                        print(f"{Colors.YELLOW}⚠ Invalid selection.{Colors.RESET}")
+                        time.sleep(1)
+                except ValueError:
+                    print(f"{Colors.YELLOW}⚠ Invalid input.{Colors.RESET}")
+                    time.sleep(1)
+            
+            elif c == "6":
+                break
+
+    def handle_chat_command(self, cmd_line):
+        """Handle chat commands starting with /"""
+        parts = cmd_line.strip().split(" ", 1)
+        cmd = parts[0].lower()
+        args = parts[1] if len(parts) > 1 else ""
+        
+        if cmd == "/back" or cmd == "/exit":
+            return "EXIT"
+        
+        elif cmd == "/new":
+            # Create new chat session
+            session_name = args.strip() if args else f"Chat {datetime.now().strftime('%H:%M')}"
+            self.current_session_id = self.memory.create_session(session_name, self.current_project_id)
+            print(f"{Colors.BRIGHT_GREEN}✓ New chat session created: {Colors.BRIGHT_WHITE}{session_name}{Colors.RESET}")
+            return "COMMAND"
+        
+        elif cmd == "/save":
+            # Save current chat history
+            if not self.current_session_id:
+                print(f"{Colors.YELLOW}⚠ No active session to save{Colors.RESET}")
+                return "COMMAND"
+            
+            filename = args.strip() if args else f"chat_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+            if not filename.endswith('.json'):
+                filename += '.json'
+            
+            filepath = os.path.join(SANDBOX_DIR, filename)
+            try:
+                self.memory.save_session_to_file(self.current_session_id, filepath)
+                print(f"{Colors.BRIGHT_GREEN}✓ Chat saved to: {Colors.BRIGHT_WHITE}{filepath}{Colors.RESET}")
+            except Exception as e:
+                print(f"{Colors.BRIGHT_RED}✗ Save failed: {e}{Colors.RESET}")
+            return "COMMAND"
+        
+        elif cmd == "/load":
+            # Load a chat session
+            if not args:
+                # List available sessions
+                sessions = self.memory.get_sessions()
+                if not sessions:
+                    print(f"{Colors.YELLOW}No saved sessions found{Colors.RESET}")
+                    return "COMMAND"
+                
+                print(f"\n{Colors.BRIGHT_CYAN}Available sessions:{Colors.RESET}\n")
+                for sid, name in sessions[:10]:
+                    marker = f" {Colors.BRIGHT_GREEN}← current{Colors.RESET}" if sid == self.current_session_id else ""
+                    print(f"  {Colors.CYAN}[{sid}]{Colors.RESET} {Colors.BRIGHT_WHITE}{name}{Colors.RESET}{marker}")
+                return "COMMAND"
+            
+            # Load by ID or filename
+            try:
+                session_id = int(args)
+                session = self.memory.get_session(session_id)
+                if session:
+                    self.current_session_id = session_id
+                    self.current_project_id = session[2]
+                    print(f"{Colors.BRIGHT_GREEN}✓ Loaded session: {Colors.BRIGHT_WHITE}{session[1]}{Colors.RESET}")
+                else:
+                    print(f"{Colors.BRIGHT_RED}✗ Session {session_id} not found{Colors.RESET}")
+            except ValueError:
+                # Try as filename
+                filepath = args if os.path.isabs(args) else os.path.join(SANDBOX_DIR, args)
+                if os.path.exists(filepath):
+                    try:
+                        self.current_session_id = self.memory.load_session_from_file(filepath)
+                        print(f"{Colors.BRIGHT_GREEN}✓ Loaded session from: {Colors.BRIGHT_WHITE}{filepath}{Colors.RESET}")
+                    except Exception as e:
+                        print(f"{Colors.BRIGHT_RED}✗ Load failed: {e}{Colors.RESET}")
+                else:
+                    print(f"{Colors.BRIGHT_RED}✗ File not found: {filepath}{Colors.RESET}")
+            return "COMMAND"
+        
+        elif cmd == "/project":
+            # Begin/switch project
+            if not args:
+                # List projects
+                projects = self.memory.get_projects()
+                if not projects:
+                    print(f"{Colors.YELLOW}No projects found. Create one with: {Colors.BRIGHT_WHITE}/project <name>{Colors.RESET}")
+                    return "COMMAND"
+                
+                print(f"\n{Colors.BRIGHT_CYAN}Available projects:{Colors.RESET}\n")
+                for pid, name, desc in projects:
+                    marker = f" {Colors.BRIGHT_GREEN}← current{Colors.RESET}" if pid == self.current_project_id else ""
+                    print(f"  {Colors.CYAN}[{pid}]{Colors.RESET} {Colors.BRIGHT_WHITE}{name}{Colors.RESET} {Colors.DIM}- {desc}{Colors.RESET}{marker}")
+                return "COMMAND"
+            
+            # Create or switch to project
+            parts = args.split("|", 1)
+            project_name = parts[0].strip()
+            project_desc = parts[1].strip() if len(parts) > 1 else ""
+            
+            # Check if project exists
+            projects = self.memory.get_projects()
+            for pid, pname, pdesc in projects:
+                if pname.lower() == project_name.lower():
+                    self.current_project_id = pid
+                    print(f"{Colors.BRIGHT_GREEN}✓ Switched to project: {Colors.BRIGHT_WHITE}{pname}{Colors.RESET}")
+                    return "COMMAND"
+            
+            # Create new project
+            self.current_project_id = self.memory.create_project(project_name, project_desc)
+            print(f"{Colors.BRIGHT_GREEN}✓ Created new project: {Colors.BRIGHT_WHITE}{project_name}{Colors.RESET}")
+            if project_desc:
+                print(f"  {Colors.CYAN}Description:{Colors.RESET} {Colors.DIM}{project_desc}{Colors.RESET}")
+            return "COMMAND"
+        
+        elif cmd == "/project_save":
+            # Save current project
+            if not self.current_project_id:
+                print(f"{Colors.YELLOW}⚠ No active project to save{Colors.RESET}")
+                return "COMMAND"
+            
+            filename = args.strip() if args else f"project_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+            if not filename.endswith('.json'):
+                filename += '.json'
+            
+            filepath = os.path.join(SANDBOX_DIR, filename)
+            try:
+                self.memory.save_project_to_file(self.current_project_id, filepath)
+                print(f"{Colors.BRIGHT_GREEN}✓ Project saved to: {Colors.BRIGHT_WHITE}{filepath}{Colors.RESET}")
+            except Exception as e:
+                print(f"{Colors.BRIGHT_RED}✗ Save failed: {e}{Colors.RESET}")
+            return "COMMAND"
+        
+        elif cmd == "/project_load":
+            # Load a project
+            if not args:
+                projects = self.memory.get_projects()
+                if not projects:
+                    print(f"{Colors.YELLOW}No projects found{Colors.RESET}")
+                    return "COMMAND"
+                
+                print(f"\n{Colors.BRIGHT_CYAN}Available projects:{Colors.RESET}\n")
+                for pid, name, desc in projects:
+                    marker = f" {Colors.BRIGHT_GREEN}← current{Colors.RESET}" if pid == self.current_project_id else ""
+                    print(f"  {Colors.CYAN}[{pid}]{Colors.RESET} {Colors.BRIGHT_WHITE}{name}{Colors.RESET} {Colors.DIM}- {desc}{Colors.RESET}{marker}")
+                return "COMMAND"
+            
+            # Load by ID or filename
+            try:
+                project_id = int(args)
+                project = self.memory.get_project(project_id)
+                if project:
+                    self.current_project_id = project_id
+                    print(f"{Colors.BRIGHT_GREEN}✓ Loaded project: {Colors.BRIGHT_WHITE}{project[1]}{Colors.RESET}")
+                else:
+                    print(f"{Colors.BRIGHT_RED}✗ Project {project_id} not found{Colors.RESET}")
+            except ValueError:
+                # Try as filename
+                filepath = args if os.path.isabs(args) else os.path.join(SANDBOX_DIR, args)
+                if os.path.exists(filepath):
+                    try:
+                        self.current_project_id = self.memory.load_project_from_file(filepath)
+                        print(f"{Colors.BRIGHT_GREEN}✓ Loaded project from: {Colors.BRIGHT_WHITE}{filepath}{Colors.RESET}")
+                    except Exception as e:
+                        print(f"{Colors.BRIGHT_RED}✗ Load failed: {e}{Colors.RESET}")
+                else:
+                    print(f"{Colors.BRIGHT_RED}✗ File not found: {filepath}{Colors.RESET}")
+            return "COMMAND"
+        
+        elif cmd == "/help":
+            print(f"\n{Colors.BRIGHT_CYAN}{Colors.BOLD}Available Commands:{Colors.RESET}\n")
+            print(f"  {Colors.BRIGHT_GREEN}/new [name]{Colors.RESET}          - Create new chat session")
+            print(f"  {Colors.BRIGHT_GREEN}/save [filename]{Colors.RESET}     - Save current chat to file")
+            print(f"  {Colors.BRIGHT_GREEN}/load [id|filename]{Colors.RESET} - Load chat session (list if no args)")
+            print(f"  {Colors.BRIGHT_GREEN}/project [name|desc]{Colors.RESET} - Create/switch project (list if no args)")
+            print(f"  {Colors.BRIGHT_GREEN}/project_save [file]{Colors.RESET} - Save current project")
+            print(f"  {Colors.BRIGHT_GREEN}/project_load [id|file]{Colors.RESET} - Load project (list if no args)")
+            print(f"  {Colors.BRIGHT_RED}/back, /exit{Colors.RESET}        - Exit chat")
+            print(f"  {Colors.BRIGHT_GREEN}/help{Colors.RESET}               - Show this help")
+            return "COMMAND"
+        
+        else:
+            print(f"{Colors.YELLOW}⚠ Unknown command: {cmd}. Type {Colors.BRIGHT_WHITE}/help{Colors.YELLOW} for available commands.{Colors.RESET}")
+            return "COMMAND"
+    
+    def chat_loop(self):
+        self.clear()
+        # Create default session if none exists
+        if not self.current_session_id:
+            self.current_session_id = self.memory.create_session(f"Chat {datetime.now().strftime('%H:%M')}", 
+                                                                  self.current_project_id)
+        
+        print(f"\n{Colors.BRIGHT_CYAN}{Colors.BOLD}{'='*79}{Colors.RESET}")
+        print(f"{Colors.BRIGHT_YELLOW}{Colors.BOLD}  CHAT MODE ACTIVE{Colors.RESET}")
+        print(f"{Colors.BRIGHT_CYAN}{Colors.BOLD}{'='*79}{Colors.RESET}")
+        print(f"{Colors.CYAN}Session:{Colors.RESET} {Colors.BRIGHT_WHITE}{self.memory.get_session(self.current_session_id)[1]}{Colors.RESET}")
+        if self.current_project_id:
+            project = self.memory.get_project(self.current_project_id)
+            print(f"{Colors.CYAN}Project:{Colors.RESET} {Colors.BRIGHT_WHITE}{project[1]}{Colors.RESET}")
+        print(f"{Colors.DIM}Type '/help' for commands, '/back' to exit{Colors.RESET}\n")
+        
+        while True:
+            try:
+                user_input = input(f"\n{Colors.BRIGHT_GREEN}{Colors.BOLD}You:{Colors.RESET} ")
+                if not user_input.strip():
+                    continue
+                
+                # Check for commands
+                if user_input.startswith("/"):
+                    result = self.handle_chat_command(user_input)
+                    if result == "EXIT":
+                        break
+                    continue
+                
+                # 1. Retrieve RAG
+                rag_context = self.memory.retrieve_context(user_input, self.current_project_id)
+                
+                # 2. Get History
+                history = self.memory.get_recent_history(self.current_session_id)
+                
+                # 3. Build Prompt
+                sys_prompt = self.config.get("system_prompt") + self.registry.get_tool_prompt()
+                final_prompt = self.context_mgr.build_prompt(sys_prompt, history, rag_context, user_input)
+
+                # 4. Generate with animated loading
+                frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
+                
+                # Simple loading indicator
+                print(f"{Colors.BRIGHT_CYAN}⠋ Thinking...{Colors.RESET}", end='', flush=True)
+                response = self.engine.generate(final_prompt)
+                print(f"\r{Colors.BRIGHT_GREEN}✓ Response ready{Colors.RESET}" + " " * 30)
+                
+                # 5. Action Logic
+                if "ACTION:" in response:
+                    print(f"\n{Colors.BRIGHT_BLUE}{Colors.BOLD}AI:{Colors.RESET} {Colors.BRIGHT_WHITE}{response}{Colors.RESET}")
+                    
+                    # Robust Parsing
+                    try:
+                        cmd_part = response.split("ACTION:")[1].strip()
+                        # Handling "ACTION: TYPE ARG"
+                        parts = cmd_part.split(" ", 2)
+                        action_type = parts[0]
+                        
+                        output = "Error: Invalid Action Format"
+                        
+                        # Dispatch
+                        if action_type == "MCP" and len(parts) >= 3:
+                            # ACTION: MCP server tool {json}
+                            srv = parts[1]
+                            # Extract JSON part (find first {)
+                            rest = parts[2]
+                            if "{" in rest:
+                                tool = rest.split("{", 1)[0].strip()
+                                json_part = "{" + rest.split("{", 1)[1]
+                                output = self.registry.execute_mcp(srv, tool, json_part)
+                            else:
+                                output = "Error: JSON arguments required for MCP."
+                                
+                        elif action_type == "CUSTOM" and len(parts) >= 2:
+                            script = parts[1]
+                            args = parts[2] if len(parts) > 2 else ""
+                            output = self.registry.execute_custom(script, args)
+                            
+                        else:
+                            # Native Tools (CMD, FILE_READ, etc)
+                            output = self.registry.execute_native(cmd_part)
+                
+                    except Exception as e:
+                        output = f"Execution Error: {str(e)}"
+                    
+                    print(f"\n{Colors.BRIGHT_YELLOW}{Colors.BOLD}SYSTEM:{Colors.RESET} {Colors.BRIGHT_WHITE}{output}{Colors.RESET}")
+                    self.memory.save_message(self.current_session_id, "You", user_input)
+                    self.memory.save_message(self.current_session_id, "AI", response)
+                    self.memory.save_message(self.current_session_id, "System", str(output))
+                    
+                else:
+                    print(f"\n{Colors.BRIGHT_BLUE}{Colors.BOLD}AI:{Colors.RESET} {Colors.BRIGHT_WHITE}{response}{Colors.RESET}")
+                    self.memory.save_message(self.current_session_id, "You", user_input)
+                    self.memory.save_message(self.current_session_id, "AI", response)
+                    
+            except KeyboardInterrupt:
+                break
+
+if __name__ == "__main__":
+    app = App()
+    app.run()
