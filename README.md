@@ -28,6 +28,20 @@ Built for **privacy-first professionals**.
 
 ---
 
+## 🔑 To Do 🔑 (Not in order && mainly just noting idea's, want to add some? Let me know!)
+
+- 💻 **Multi purpose terminal GUI??**  
+- 🧠 **Full Automation**  
+- 🛠️ **Background Agent** 
+- 🔐 **TTS**  
+- 📁 **Sight** camera enabled functionality  
+- 🌐 **Vision** image generation
+- 🔌 **API Gateway** 
+- 🧪 **GPU + CPU compatability** for custom workflows  
+- 🎨 **You got any idea's??**
+
+---
+
 ## 👥 Contributing 👥
 
 We welcome contributions! Whether it's fixing bugs, improving documentation, or adding new features check out our [CONTRIBUTING.md](CONTRIBUTING.md) to get started.
