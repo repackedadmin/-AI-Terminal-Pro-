@@ -44,6 +44,7 @@ Built for **privacy-first professionals**.
 
 <img width="1296" height="576" alt="FMJ9J61" src="https://github.com/user-attachments/assets/fbbc5ea5-451d-40b9-942a-8d0af8986478" />
 <img width="1296" height="576" alt="czEIfdk" src="https://github.com/user-attachments/assets/85c417c3-64cf-4e9e-b088-4993ec9c86d1" />
+[(https://i.imgur.com/xjGMhsH.png)](https://i.imgur.com/xjGMhsH.png)
 
 ---
 
