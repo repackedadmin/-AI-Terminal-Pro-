@@ -44,8 +44,8 @@ Built for **privacy-first professionals**.
 
 <img width="1296" height="576" alt="FMJ9J61" src="https://github.com/user-attachments/assets/fbbc5ea5-451d-40b9-942a-8d0af8986478" />
 <img width="1296" height="576" alt="czEIfdk" src="https://github.com/user-attach<img width="1296" height="576" alt="xjGMhsH" src="https://github.com/user-attachments/assets/e07a061c-950c-4e51-b532-cb22e3f83c12" />
-ments/assets/85c417c3-64cf-4e9e-b088-4993ec9c86d1" />
-
+<img width="1296" height="576" alt="xjGMhsH" src="https://github.com/user-attachments/assets/8f42fc81-b09b-4ed4-b081-1e5881a09d0b" />
+<img width="1296" height="576" alt="xN0yKbW" src="https://github.com/user-attachments/assets/d3db41d6-d751-4f1f-a072-2aaab3e5af40" />
 
 ---
 
