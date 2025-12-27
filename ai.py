@@ -42,6 +42,13 @@ try:
 except ImportError:
     FLASK_AVAILABLE = False
 
+# Playwright for web browsing
+try:
+    from playwright.sync_api import sync_playwright
+    PLAYWRIGHT_AVAILABLE = True
+except ImportError:
+    PLAYWRIGHT_AVAILABLE = False
+
 # ANSI Color Codes for cross-platform terminal colors
 class Colors:
     RESET = '\033[0m'
@@ -110,10 +117,10 @@ DEFAULT_CONFIG = {
     "first_run": True,
     "backend": "huggingface",  # Options: "huggingface" or "ollama"
     "model_name": "gpt2",      # Options: "gpt2", "gpt2-xl", "llama3", "mistral"
-    "system_prompt": "You are a helpful AI assistant. When asked to perform a task, use the available ACTION tools.",
+    "system_prompt": "You are a helpful AI assistant with full OS awareness and extensive memory capabilities. You have access to a large context window (32K+ tokens) and can maintain context across long conversations and complex projects. You automatically detect the operating system and use platform-appropriate commands. When working on projects, you remember project context, previous decisions, and ongoing work. When asked to perform a task, use the available ACTION tools with OS-specific commands. CRITICAL: When generating scripts (batch, PowerShell, bash, Python, etc.), always write the COMPLETE, FULL script from start to finish - never truncate, cut off, or leave scripts incomplete.",
     "enable_dangerous_commands": False,  # Safety lock for file system/terminal
-    "max_context_window": 2048,
-    "max_response_tokens": 250,
+    "max_context_window": 32768,  # Large context window for project assistance and long conversations
+    "max_response_tokens": 2000,  # Increased for script generation and longer responses
     "temperature": 0.7
 }
 
@@ -370,8 +377,8 @@ class MemoryManager:
         if session_id:
             self.update_session(session_id)
 
-    def get_recent_history(self, session_id=None, limit=10):
-        # Fetch last N messages for a session
+    def get_recent_history(self, session_id=None, limit=100):
+        # Fetch last N messages for a session (increased default for better context)
         if session_id:
             self.cursor.execute("SELECT role, content FROM history WHERE session_id=? ORDER BY id DESC LIMIT ?", 
                           (session_id, limit))
@@ -379,6 +386,15 @@ class MemoryManager:
             self.cursor.execute("SELECT role, content FROM history ORDER BY id DESC LIMIT ?", (limit,))
         rows = self.cursor.fetchall()
         return rows[::-1]  # Reverse to chronological order
+    
+    def get_all_history(self, session_id=None):
+        """Get all history for a session (no limit)."""
+        if session_id:
+            self.cursor.execute("SELECT role, content FROM history WHERE session_id=? ORDER BY id ASC", 
+                          (session_id,))
+        else:
+            self.cursor.execute("SELECT role, content FROM history ORDER BY id ASC")
+        return self.cursor.fetchall()
 
     def ingest_file(self, filepath):
         """Reads text files, chunks them, and stores in DB."""
@@ -949,13 +965,19 @@ class APIServerManager:
                 
                 # Build context
                 history = []
+                project_memory = None
                 if session_id:
-                    history = self.app_instance.memory.get_recent_history(session_id, limit=10)
+                    history = self.app_instance.memory.get_recent_history(session_id, limit=100)
+                    # Get project memory if session has a project
+                    session_info = self.app_instance.memory.get_session(session_id)
+                    if session_info and session_info[2]:  # project_id
+                        project_memory = self.app_instance.memory.get_project_memory(session_info[2])
                 
                 context = self.app_instance.context_mgr.build_context(
                     message,
                     history,
-                    self.app_instance.registry.get_tool_prompt() if self.app_instance.registry else ""
+                    self.app_instance.registry.get_tool_prompt() if self.app_instance.registry else "",
+                    project_memory
                 )
                 
                 # Generate response
@@ -1111,7 +1133,10 @@ class ToolRegistry:
         self.config = config
         self.mcp_clients = {}
         self.custom_tool_manager = CustomToolManager()
+        self.playwright_browsers_installed = False
         self.load_mcp_servers()
+        # Check Playwright browsers in background to avoid blocking startup
+        threading.Thread(target=self._ensure_playwright_browsers, daemon=True).start()
 
     def load_mcp_servers(self):
         if os.path.exists(MCP_CONFIG_FILE):
@@ -1126,18 +1151,122 @@ class ToolRegistry:
             except Exception as e:
                 print(f"{Colors.BRIGHT_RED}[ERROR]{Colors.RESET} MCP Config: {e}")
 
+    def _ensure_playwright_browsers(self):
+        """Ensure Playwright browsers are installed."""
+        if not PLAYWRIGHT_AVAILABLE:
+            return
+        
+        if self.playwright_browsers_installed:
+            return
+        
+        try:
+            # Check if browsers are installed by trying to get browser path
+            from playwright.sync_api import sync_playwright
+            with sync_playwright() as p:
+                # Try to get chromium - if it fails, browsers aren't installed
+                try:
+                    browser = p.chromium.launch(headless=True)
+                    browser.close()
+                    self.playwright_browsers_installed = True
+                    return
+                except Exception:
+                    pass
+            
+            # Browsers not installed, install them
+            print(f"{Colors.BRIGHT_YELLOW}[SYSTEM]{Colors.RESET} Installing Playwright browsers...")
+            import subprocess
+            result = subprocess.run(
+                [sys.executable, "-m", "playwright", "install", "chromium"],
+                capture_output=True,
+                text=True,
+                timeout=300  # 5 minute timeout
+            )
+            if result.returncode == 0:
+                self.playwright_browsers_installed = True
+                print(f"{Colors.BRIGHT_GREEN}[SYSTEM]{Colors.RESET} Playwright browsers installed successfully!")
+            else:
+                print(f"{Colors.BRIGHT_RED}[SYSTEM]{Colors.RESET} Failed to install Playwright browsers: {result.stderr}")
+        except Exception as e:
+            print(f"{Colors.BRIGHT_YELLOW}[SYSTEM]{Colors.RESET} Playwright browser installation check failed: {e}")
+            print(f"{Colors.DIM}You can manually install browsers with: python -m playwright install chromium{Colors.RESET}")
+
     def get_tool_prompt(self):
         """Returns the help text injected into the System Prompt."""
-        p = "\n\n### AVAILABLE TOOLS ###\n"
+        os_name = platform.system()
+        os_version = platform.version()
+        is_windows = os_name == "Windows"
+        is_mac = os_name == "Darwin"
+        is_linux = os_name == "Linux"
+        
+        # Get desktop path
+        desktop_path = os.path.join(os.path.expanduser("~"), "Desktop")
+        if not os.path.exists(desktop_path):
+            # Try alternative desktop locations
+            if is_windows:
+                desktop_path = os.path.join(os.environ.get("USERPROFILE", ""), "Desktop")
+            elif is_mac:
+                desktop_path = os.path.join(os.path.expanduser("~"), "Desktop")
+            elif is_linux:
+                desktop_path = os.path.join(os.path.expanduser("~"), "Desktop")
+        
+        # Format OS info
+        os_info = f"{os_name} {os_version}" if os_version else os_name
+        os_note = "WINDOWS" if is_windows else ("macOS" if is_mac else "LINUX")
+        
+        p = "\n\n### SYSTEM INFORMATION ###\n"
+        p += f"OPERATING SYSTEM: {os_info} ({os_note})\n"
+        p += f"DESKTOP PATH: {desktop_path}\n"
+        p += f"HOME DIRECTORY: {os.path.expanduser('~')}\n"
+        p += "IMPORTANT: Always use OS-appropriate commands for the detected platform!\n"
+        
+        p += "\n### AVAILABLE TOOLS ###\n"
         p += "SYNTAX: Response must start with 'ACTION: [Tool_Name] [Arguments]'\n"
-        p += "IMPORTANT: Do NOT wrap file paths in brackets []. Use: FILE_READ ~/Desktop/file.txt\n\n"
+        p += "IMPORTANT: Do NOT wrap file paths in brackets []. Use: FILE_READ ~/Desktop/file.txt\n"
+        p += "CRITICAL FOR SCRIPTS: When writing scripts (batch, PowerShell, bash, Python, etc.), write the COMPLETE script!\n"
+        p += "                      Include ALL code from start to finish - never truncate or cut off mid-script!\n"
+        p += "                      The entire script must be in a single FILE_WRITE action.\n\n"
         
         p += "1. NATIVE TOOLS:\n"
-        p += "   - ACTION: CMD [command] (Terminal)\n"
-        p += "   - ACTION: BROWSE [url]\n"
-        p += "   - ACTION: FILE_READ [path]\n"
-        p += "   - ACTION: FILE_WRITE [path] | [content]\n"
-        p += "   - ACTION: FILE_LIST [path]\n"
+        if is_windows:
+            p += "   - ACTION: CMD [command] (Windows CMD/PowerShell - NO Unix commands!)\n"
+            p += "     Windows Commands: mkdir folder, rmdir folder, dir, type file.txt, del file.txt\n"
+            p += "     Desktop Access: Use ~/Desktop/ or CMD with full path\n"
+            p += "     NEVER use: touch, ls, rm, cat, grep (these are Unix-only)\n"
+        elif is_mac:
+            p += "   - ACTION: CMD [command] (macOS Terminal - Unix commands)\n"
+            p += "     macOS Commands: mkdir folder, touch file.txt, ls, rm, cat\n"
+            p += "     Desktop Access: Use ~/Desktop/ or /Users/username/Desktop/\n"
+        else:  # Linux
+            p += "   - ACTION: CMD [command] (Linux Terminal - Unix commands)\n"
+            p += "     Linux Commands: mkdir folder, touch file.txt, ls, rm, cat\n"
+            p += "     Desktop Access: Use ~/Desktop/ or /home/username/Desktop/\n"
+        
+        p += "   - ACTION: BROWSE [url] (Uses Playwright for full browser rendering with JavaScript support)\n"
+        if PLAYWRIGHT_AVAILABLE:
+            p += "     Playwright is available - can handle dynamic content, SPAs, and JavaScript-heavy sites\n"
+        else:
+            p += "     Note: Playwright not installed - using basic HTTP requests (install with: pip install playwright && python -m playwright install)\n"
+        p += "   - ACTION: FILE_READ [path] (Reads file content)\n"
+        p += "   - ACTION: FILE_WRITE [path] | [content] (CREATES file and parent dirs automatically)\n"
+        p += "     Example: ACTION: FILE_WRITE ~/Desktop/test.txt | Hello World\n"
+        p += "   - ACTION: FILE_LIST [path] (Lists directory contents)\n"
+        
+        p += "\n### DESKTOP INTERACTION EXAMPLES ###\n"
+        if is_windows:
+            p += "To create a folder on Desktop:\n"
+            p += "  ACTION: CMD mkdir ~/Desktop/folder_name\n"
+            p += "To create a file on Desktop:\n"
+            p += "  ACTION: FILE_WRITE ~/Desktop/file.txt | content here\n"
+            p += "To read a file from Desktop:\n"
+            p += "  ACTION: FILE_READ ~/Desktop/file.txt\n"
+            p += "Note: ~ expands to your user profile (e.g., C:\\Users\\YourName)\n"
+        else:
+            p += "To create a folder on Desktop:\n"
+            p += "  ACTION: CMD mkdir ~/Desktop/folder_name\n"
+            p += "To create a file on Desktop:\n"
+            p += "  ACTION: FILE_WRITE ~/Desktop/file.txt | content here\n"
+            p += "To read a file from Desktop:\n"
+            p += "  ACTION: FILE_READ ~/Desktop/file.txt\n"
         
         # Custom tools
         custom_tools = self.custom_tool_manager.list_tools()
@@ -1158,6 +1287,22 @@ class ToolRegistry:
                     p += f"   - ACTION: MCP {srv} {t['name']} {{json_args}}\n"
         return p
 
+    def expand_paths_in_command(self, command):
+        r"""
+        Expands ~ in paths within a command string.
+        Handles cases like: mkdir ~/Desktop/Test -> mkdir C:\Users\user\Desktop\Test
+        """
+        # Pattern to match ~/ or ~\ followed by path characters
+        pattern = r'~[/\\][^\s]*'
+        
+        def expand_match(match):
+            path_with_tilde = match.group(0)
+            expanded = os.path.expanduser(path_with_tilde)
+            # Normalize path separators for Windows
+            return os.path.normpath(expanded)
+        
+        return re.sub(pattern, expand_match, command)
+    
     def resolve_path(self, raw_path):
         """
         Sanitizes and resolves paths.
@@ -1193,7 +1338,24 @@ class ToolRegistry:
             if not self.config.get("enable_dangerous_commands"):
                 return "PERMISSION DENIED: Enable 'Dangerous Commands' in settings."
             try:
-                return subprocess.check_output(args, shell=True, text=True, stderr=subprocess.STDOUT).strip()
+                # Expand ~ in paths for cross-platform compatibility
+                expanded_args = self.expand_paths_in_command(args)
+                
+                # Convert common Unix commands to Windows equivalents
+                if platform.system() == "Windows":
+                    # Convert 'touch file.txt' to 'type nul > file.txt' or use Python to create empty file
+                    if expanded_args.strip().startswith("touch "):
+                        file_path = expanded_args.strip()[6:].strip()  # Remove "touch "
+                        # Use Python to create empty file (more reliable than type nul)
+                        try:
+                            os.makedirs(os.path.dirname(file_path) if os.path.dirname(file_path) else ".", exist_ok=True)
+                            with open(file_path, 'a'):
+                                os.utime(file_path, None)  # Touch the file
+                            return f"Created/updated file: {file_path}"
+                        except Exception as e:
+                            return f"Touch Error: {e}"
+                
+                return subprocess.check_output(expanded_args, shell=True, text=True, stderr=subprocess.STDOUT).strip()
             except subprocess.CalledProcessError as e:
                 return f"CMD Error: {e.output}"
         
@@ -1231,19 +1393,106 @@ class ToolRegistry:
         return "Unknown Action."
 
     def _browse(self, url):
+        """Browse web using Playwright for full browser rendering and JavaScript support."""
         # Sanitize URL
-        url = url.replace('[', '').replace(']', '')
-        if not url.startswith("http"): url = "http://" + url
+        url = url.replace('[', '').replace(']', '').replace('"', '').replace("'", "").strip()
+        if not url:
+            return "Error: No URL provided"
+        
+        if not url.startswith(("http://", "https://")):
+            url = "https://" + url
+        
+        # Use Playwright if available
+        if PLAYWRIGHT_AVAILABLE:
+            try:
+                # Ensure browsers are installed
+                if not self.playwright_browsers_installed:
+                    self._ensure_playwright_browsers()
+                
+                with sync_playwright() as p:
+                    # Launch browser in headless mode
+                    browser = p.chromium.launch(headless=True)
+                    context = browser.new_context(
+                        user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+                    )
+                    page = context.new_page()
+                    
+                    # Navigate to URL with timeout
+                    page.goto(url, wait_until="networkidle", timeout=30000)
+                    
+                    # Wait for page to load
+                    page.wait_for_timeout(2000)
+                    
+                    # Get page content
+                    # Try to get main content, fallback to body
+                    try:
+                        # Get visible text content
+                        content = page.evaluate("""
+                            () => {
+                                // Remove script and style elements
+                                const scripts = document.querySelectorAll('script, style, noscript');
+                                scripts.forEach(el => el.remove());
+                                
+                                // Get main content or body
+                                const main = document.querySelector('main, article, [role="main"]') || document.body;
+                                return main.innerText || main.textContent || '';
+                            }
+                        """)
+                    except:
+                        # Fallback to simple text extraction
+                        content = page.content()
+                        soup = BeautifulSoup(content, 'html.parser')
+                        for s in soup(["script", "style", "noscript"]):
+                            s.extract()
+                        content = soup.get_text()
+                    
+                    # Get page title
+                    try:
+                        title = page.title()
+                    except:
+                        title = "No title"
+                    
+                    browser.close()
+                    
+                    # Clean and format content
+                    lines = [line.strip() for line in content.splitlines() if line.strip()]
+                    text_content = '\n'.join(lines)
+                    
+                    # Limit to reasonable size
+                    if len(text_content) > 5000:
+                        text_content = text_content[:5000] + "... [Truncated]"
+                    
+                    result = f"Title: {title}\n\nContent:\n{text_content}"
+                    return result
+                    
+            except Exception as e:
+                # Fallback to requests if Playwright fails
+                return self._browse_fallback(url, str(e))
+        else:
+            # Fallback to requests if Playwright not available
+            return self._browse_fallback(url, "Playwright not installed")
+    
+    def _browse_fallback(self, url, error_msg=""):
+        """Fallback browsing method using requests and BeautifulSoup."""
         try:
-            headers = {'User-Agent': 'Mozilla/5.0'}
-            res = requests.get(url, headers=headers, timeout=5)
+            headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+            res = requests.get(url, headers=headers, timeout=10)
             soup = BeautifulSoup(res.text, 'html.parser')
             # Clean script/style
-            for s in soup(["script", "style"]): s.extract()
+            for s in soup(["script", "style", "noscript"]):
+                s.extract()
             text = soup.get_text()
             # Compress lines
             lines = [line.strip() for line in text.splitlines() if line.strip()]
-            return '\n'.join(lines)[:2500] + "... [Truncated]"
+            content = '\n'.join(lines)[:5000]
+            if len(content) >= 5000:
+                content += "... [Truncated]"
+            
+            title = soup.title.string if soup.title else "No title"
+            result = f"Title: {title}\n\nContent:\n{content}"
+            if error_msg:
+                result = f"[Note: Using fallback method - {error_msg}]\n\n{result}"
+            return result
         except Exception as e:
             return f"Web Error: {e}"
 
@@ -1327,18 +1576,37 @@ class ContextManager:
             return len(self.tokenizer.encode(text))
         return len(text) // 4 # Rough approx for Ollama
 
-    def build_prompt(self, system, history, rag, user_input):
-        base = f"{system}\n{rag}\n"
+    def build_prompt(self, system, history, rag, user_input, project_memory=None):
+        # Build base with system prompt and RAG
+        base = f"{system}\n"
+        
+        # Add project memory if available
+        if project_memory:
+            memory_str = "\n[PROJECT MEMORY & CONTEXT]:\n"
+            if isinstance(project_memory, dict):
+                for key, value in project_memory.items():
+                    if value:  # Only include non-empty values
+                        memory_str += f"{key}: {value}\n"
+            else:
+                memory_str += str(project_memory) + "\n"
+            base += memory_str
+        
+        base += f"{rag}\n"
         footer = f"\nYou: {user_input}\nAI:"
         
         # Calculate remaining space
         base_cost = self.count_tokens(base + footer)
         remaining = self.max_tokens - base_cost
         
+        # Reserve some tokens for response (10% of context window)
+        response_reserve = int(self.max_tokens * 0.1)
+        remaining = max(remaining - response_reserve, int(self.max_tokens * 0.5))  # Use at least 50% for history
+        
         # Add history newest -> oldest until limit
         selected_history = []
         current_cost = 0
         
+        # Process history in reverse (newest first)
         for role, msg in reversed(history):
             line = f"{role}: {msg}\n"
             cost = self.count_tokens(line)
@@ -1346,9 +1614,24 @@ class ContextManager:
                 selected_history.insert(0, line)
                 current_cost += cost
             else:
+                # If we can't fit the full message, try to fit a summary
+                if len(selected_history) == 0:
+                    # If no history fits, at least try to include a truncated version
+                    truncated = msg[:500] + "..." if len(msg) > 500 else msg
+                    line = f"{role}: {truncated}\n"
+                    cost = self.count_tokens(line)
+                    if current_cost + cost < remaining:
+                        selected_history.insert(0, line)
                 break
                 
         return base + "".join(selected_history) + footer
+    
+    def build_context(self, user_input, history, tool_prompt="", project_memory=None):
+        """Alias for build_prompt for API compatibility. Builds context with system prompt."""
+        # Build a minimal system prompt with tool info
+        system = "You are a helpful AI assistant with full OS awareness. Use available ACTION tools." + tool_prompt
+        rag = ""  # No RAG in API mode unless provided
+        return self.build_prompt(system, history, rag, user_input, project_memory)
 
 class AIEngine:
     def __init__(self, config):
@@ -4625,12 +4908,29 @@ class App:
                 # 1. Retrieve RAG
                 rag_context = self.memory.retrieve_context(user_input, self.current_project_id)
                 
-                # 2. Get History
-                history = self.memory.get_recent_history(self.current_session_id)
+                # 2. Get History (increased limit for better context)
+                # Use larger limit for project-based conversations
+                history_limit = 200 if self.current_project_id else 100
+                history = self.memory.get_recent_history(self.current_session_id, limit=history_limit)
                 
-                # 3. Build Prompt
+                # 2.5. Get Project Memory
+                project_memory = None
+                if self.current_project_id:
+                    project_memory = self.memory.get_project_memory(self.current_project_id)
+                
+                # 3. Build Prompt with project memory
                 sys_prompt = self.config.get("system_prompt") + self.registry.get_tool_prompt()
-                final_prompt = self.context_mgr.build_prompt(sys_prompt, history, rag_context, user_input)
+                final_prompt = self.context_mgr.build_prompt(sys_prompt, history, rag_context, user_input, project_memory)
+
+                # 3.5. Detect script generation and adjust token limit
+                script_keywords = ["script", "batch", "powershell", "ps1", "bat", "bash", "sh", "python", "py"]
+                is_script_request = any(keyword in user_input.lower() for keyword in script_keywords)
+                
+                original_max_tokens = self.config.get("max_response_tokens", 2000)
+                if is_script_request:
+                    # Temporarily increase token limit for script generation
+                    self.config["max_response_tokens"] = 4000
+                    self.engine.config["max_response_tokens"] = 4000
 
                 # 4. Generate with animated loading
                 frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
@@ -4638,6 +4938,11 @@ class App:
                 # Simple loading indicator
                 print(f"{Colors.BRIGHT_CYAN}⠋ Thinking...{Colors.RESET}", end='', flush=True)
                 response = self.engine.generate(final_prompt)
+                
+                # Restore original token limit
+                if is_script_request:
+                    self.config["max_response_tokens"] = original_max_tokens
+                    self.engine.config["max_response_tokens"] = original_max_tokens
                 print(f"\r{Colors.BRIGHT_GREEN}✓ Response ready{Colors.RESET}" + " " * 30)
                 
                 # 5. Action Logic
