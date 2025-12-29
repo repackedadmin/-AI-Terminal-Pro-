@@ -5823,7 +5823,7 @@ class App:
         
         # Create TTS script with full LLM integration
         tts_script_path = os.path.join(BASE_DIR, "_tts_mode.py")
-        config_json = json.dumps(self.config, indent=2)
+        config_repr = repr(self.config)
         tts_script = f'''"""
 TTS Mode - Voice-controlled AI Assistant with Full LLM Integration
 Run this in a separate terminal for voice interaction
@@ -5867,7 +5867,7 @@ SAMPLE_RATE = 16000
 DURATION = 5  # seconds per recording
 MODEL_SIZE = "base"  # Options: tiny, base, small, medium, large
 TEMP_AUDIO_FILE = os.path.join("{BASE_DIR}", "_temp_audio.wav")
-CONFIG = {config_json}
+CONFIG = {config_repr}
 
 # AI Engine Class - Full Implementation
 class AIEngine:
@@ -6133,7 +6133,7 @@ while True:
         
         # Create Sight script with full LLM integration
         sight_script_path = os.path.join(BASE_DIR, "_sight_mode.py")
-        config_json = json.dumps(self.config, indent=2)
+        config_repr = repr(self.config)
         sight_script = f'''"""
 Sight Mode - Camera Vision AI Assistant with Full LLM Integration
 Captures webcam frames and sends them to the LLM for visual analysis
@@ -6169,7 +6169,7 @@ CAPTURE_INTERVAL = 3  # seconds between frames
 FRAME_WIDTH = 640
 FRAME_HEIGHT = 480
 JPEG_QUALITY = 85
-CONFIG = {config_json}
+CONFIG = {config_repr}
 
 # AI Engine Class - Full Implementation
 class AIEngine:
