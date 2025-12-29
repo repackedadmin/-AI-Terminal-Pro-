@@ -3860,8 +3860,9 @@ class App:
             print(f"{Colors.BRIGHT_GREEN}  [5]{Colors.RESET} Model Training")
             print(f"{Colors.BRIGHT_GREEN}  [6]{Colors.RESET} API Management")
             print(f"{Colors.BRIGHT_GREEN}  [7]{Colors.RESET} App Builder {Colors.DIM}(Multi-Agent Development){Colors.RESET}")
-            print(f"{Colors.BRIGHT_GREEN}  [8]{Colors.RESET} Settings")
-            print(f"{Colors.BRIGHT_RED}  [9]{Colors.RESET} Exit\n")
+            print(f"{Colors.BRIGHT_GREEN}  [8]{Colors.RESET} Update from GitHub")
+            print(f"{Colors.BRIGHT_GREEN}  [9]{Colors.RESET} Settings")
+            print(f"{Colors.BRIGHT_RED}  [10]{Colors.RESET} Exit\n")
             
             c = input(f"{Colors.BRIGHT_GREEN}Select: {Colors.RESET}")
             if c == "1": self.chat_loop()
@@ -3871,8 +3872,9 @@ class App:
             elif c == "5": self.model_training_menu()
             elif c == "6": self.api_management_menu()
             elif c == "7": self.app_builder_menu()
-            elif c == "8": self.settings_menu()
-            elif c == "9":
+            elif c == "8": self.update_from_github()
+            elif c == "9": self.settings_menu()
+            elif c == "10":
                 print(f"\n{Colors.BRIGHT_YELLOW}Shutting down...{Colors.RESET}")
                 if self.registry:
                     for c in self.registry.mcp_clients.values(): c.stop()
@@ -3882,6 +3884,75 @@ class App:
                         self.api_manager.stop_api(api_name)
                 print(f"{Colors.BRIGHT_GREEN}✓ Goodbye!{Colors.RESET}\n")
                 sys.exit()
+
+    def update_from_github(self):
+        """Update ai.py from the latest GitHub commit."""
+        self.clear()
+        print(f"\n{Colors.BRIGHT_CYAN}{Colors.BOLD}{'='*79}{Colors.RESET}")
+        print(f"{Colors.BRIGHT_YELLOW}{Colors.BOLD}  UPDATE FROM GITHUB{Colors.RESET}")
+        print(f"{Colors.BRIGHT_CYAN}{Colors.BOLD}{'='*79}{Colors.RESET}\n")
+        
+        github_repo = "https://github.com/repackedadmin/-AI-Terminal-Pro-"
+        github_raw_url = "https://raw.githubusercontent.com/repackedadmin/-AI-Terminal-Pro-/main/ai.py"
+        current_file = os.path.abspath(__file__)
+        
+        print(f"{Colors.CYAN}Repository:{Colors.RESET} {Colors.BRIGHT_WHITE}{github_repo}{Colors.RESET}")
+        print(f"{Colors.CYAN}Current File:{Colors.RESET} {Colors.BRIGHT_WHITE}{current_file}{Colors.RESET}\n")
+        
+        # Confirm update
+        confirm = input(f"{Colors.BRIGHT_YELLOW}⚠ This will replace your current ai.py with the latest version from GitHub.\n{Colors.RESET}{Colors.DIM}A backup will be created automatically.{Colors.RESET}\n\n{Colors.BRIGHT_GREEN}Continue? [y/N]: {Colors.RESET}").strip().lower()
+        if confirm != 'y':
+            print(f"\n{Colors.DIM}Update cancelled.{Colors.RESET}")
+            time.sleep(1)
+            return
+        
+        try:
+            # Create backup
+            backup_dir = os.path.join(BASE_DIR, "backups")
+            os.makedirs(backup_dir, exist_ok=True)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            backup_file = os.path.join(backup_dir, f"ai_backup_{timestamp}.py")
+            
+            print(f"\n{Colors.BRIGHT_CYAN}Creating backup...{Colors.RESET}")
+            shutil.copy2(current_file, backup_file)
+            print(f"{Colors.BRIGHT_GREEN}✓ Backup created: {backup_file}{Colors.RESET}")
+            
+            # Download latest version
+            print(f"\n{Colors.BRIGHT_CYAN}Downloading latest version from GitHub...{Colors.RESET}")
+            response = requests.get(github_raw_url, timeout=30)
+            response.raise_for_status()
+            
+            new_content = response.text
+            if not new_content or len(new_content) < 1000:
+                raise Exception("Downloaded file appears to be invalid or too small")
+            
+            # Write new version
+            print(f"{Colors.BRIGHT_CYAN}Installing update...{Colors.RESET}")
+            with open(current_file, 'w', encoding='utf-8') as f:
+                f.write(new_content)
+            
+            # Verify file was written
+            if not os.path.exists(current_file) or os.path.getsize(current_file) < 1000:
+                raise Exception("Update file verification failed")
+            
+            print(f"\n{Colors.BRIGHT_GREEN}{Colors.BOLD}✓ Update successful!{Colors.RESET}")
+            print(f"{Colors.CYAN}Backup saved to:{Colors.RESET} {Colors.BRIGHT_WHITE}{backup_file}{Colors.RESET}")
+            print(f"\n{Colors.YELLOW}⚠ Please restart the application to use the updated version.{Colors.RESET}")
+            
+            input(f"\n{Colors.DIM}Press Enter to continue...{Colors.RESET}")
+            
+        except requests.exceptions.RequestException as e:
+            print(f"\n{Colors.BRIGHT_RED}✗ Network error: {e}{Colors.RESET}")
+            print(f"{Colors.YELLOW}Please check your internet connection and try again.{Colors.RESET}")
+            time.sleep(3)
+        except PermissionError:
+            print(f"\n{Colors.BRIGHT_RED}✗ Permission denied.{Colors.RESET}")
+            print(f"{Colors.YELLOW}Please ensure you have write permissions for: {current_file}{Colors.RESET}")
+            time.sleep(3)
+        except Exception as e:
+            print(f"\n{Colors.BRIGHT_RED}✗ Update failed: {e}{Colors.RESET}")
+            print(f"{Colors.YELLOW}Your original file is safe. Backup location: {backup_file if 'backup_file' in locals() else 'N/A'}{Colors.RESET}")
+            time.sleep(3)
 
     def settings_menu(self):
         self.clear()
