@@ -27,7 +27,33 @@ flask-cors>=4.0.0
 # OPTIONAL DEPENDENCIES (Required for specific features)
 # ==============================================================================
 
-# YAML support (for YAML tool definitions)
+# Web Browsing with Playwright (for visible browser automation)
+# Install if you want the LLM to interact with websites
+playwright>=1.40.0
+# After installing playwright, run: python -m playwright install chromium
+
+# Text-to-Speech / Speech Recognition (for /tts mode - BASIC)
+# Install if you want voice-controlled interaction (basic mode)
+openai-whisper>=20231117
+pyttsx3>=2.90
+sounddevice>=0.4.6
+soundfile>=0.12.1
+
+# Enhanced TTS Pro Mode (for /tts_pro command - ADVANCED)
+# Install if you want professional-grade voice interaction with RAG
+faster-whisper>=0.10.0  # Much faster and more accurate than openai-whisper
+kokoro>=0.1.0           # High-quality neural TTS
+pyaudio>=0.2.13         # Professional audio handling
+sentence-transformers>=2.2.0  # For RAG embeddings
+chromadb>=0.4.0         # Vector database for long-term memory
+tiktoken>=0.5.0         # Token counting for context management
+
+# Computer Vision (for /sight mode - camera interaction)
+# Install if you want the LLM to see through your webcam
+opencv-python>=4.8.0
+numpy>=1.24.0
+
+# YAML support (for YAML tool definitions and TTS Pro config)
 # Install if you want to create custom tools in YAML format
 pyyaml>=6.0.1
 
@@ -57,6 +83,19 @@ trl>=0.7.0
 #
 # For full installation (all features):
 #   pip install -r requirements.txt
+#
+# For Text-to-Speech mode (/tts command - BASIC):
+#   pip install openai-whisper pyttsx3 sounddevice soundfile
+#
+# For Enhanced TTS Pro mode (/tts_pro command - ADVANCED):
+#   pip install faster-whisper kokoro pyaudio sentence-transformers chromadb tiktoken pyyaml
+#
+# For Sight/Vision mode (/sight command):
+#   pip install opencv-python numpy
+#
+# For web browsing (BROWSE actions):
+#   pip install playwright
+#   python -m playwright install chromium
 #
 # Platform-specific PyTorch installation:
 #   Visit https://pytorch.org/get-started/locally/ for GPU support
