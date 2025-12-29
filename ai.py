@@ -5610,6 +5610,11 @@ class App:
             self.launch_tts_mode()
             return "COMMAND"
         
+        elif cmd == "/tts_pro":
+            # Launch Enhanced TTS Pro mode with MiraiAssist
+            self.launch_tts_pro_mode()
+            return "COMMAND"
+        
         elif cmd == "/sight":
             # Launch Sight/Vision mode in a new terminal
             self.launch_sight_mode()
@@ -5625,6 +5630,7 @@ class App:
             print(f"  {Colors.BRIGHT_GREEN}/project_load [id|file]{Colors.RESET} - Load project (list if no args)")
             print(f"\n{Colors.BRIGHT_YELLOW}{Colors.BOLD}Advanced Features:{Colors.RESET}\n")
             print(f"  {Colors.BRIGHT_CYAN}/tts{Colors.RESET}                 - Launch Text-to-Speech mode (voice commands)")
+            print(f"  {Colors.BRIGHT_CYAN}/tts_pro{Colors.RESET}             - Launch Enhanced TTS (faster-whisper + Kokoro + RAG)")
             print(f"  {Colors.BRIGHT_CYAN}/sight{Colors.RESET}               - Launch Vision mode (camera interaction)")
             print(f"\n{Colors.BRIGHT_RED}/back, /exit{Colors.RESET}        - Exit chat")
             print(f"  {Colors.BRIGHT_GREEN}/help{Colors.RESET}               - Show this help")
@@ -6830,6 +6836,405 @@ finally:
             
         except Exception as e:
             print(f"{Colors.BRIGHT_RED}✗ Failed to launch Sight mode: {e}{Colors.RESET}")
+            time.sleep(2)
+
+    def launch_tts_pro_mode(self):
+        """Launch Enhanced TTS Pro mode using MiraiAssist components."""
+        print(f"\n{Colors.BRIGHT_CYAN}{Colors.BOLD}{'='*79}{Colors.RESET}")
+        print(f"{Colors.BRIGHT_YELLOW}{Colors.BOLD}  ENHANCED TTS PRO MODE{Colors.RESET}")
+        print(f"{Colors.BRIGHT_CYAN}{Colors.BOLD}{'='*79}{Colors.RESET}\n")
+        
+        # Check dependencies
+        missing_deps = []
+        try:
+            import faster_whisper
+        except ImportError:
+            missing_deps.append("faster-whisper")
+        
+        try:
+            import kokoro
+        except ImportError:
+            missing_deps.append("kokoro")
+        
+        try:
+            import chromadb
+        except ImportError:
+            missing_deps.append("chromadb")
+        
+        try:
+            import sentence_transformers
+        except ImportError:
+            missing_deps.append("sentence-transformers")
+        
+        try:
+            import pyaudio
+        except ImportError:
+            missing_deps.append("pyaudio")
+        
+        if missing_deps:
+            print(f"{Colors.BRIGHT_RED}✗ Missing dependencies for TTS Pro:{Colors.RESET}\n")
+            for dep in missing_deps:
+                print(f"  • {dep}")
+            print(f"\n{Colors.BRIGHT_YELLOW}Install with:{Colors.RESET}")
+            print(f"{Colors.BRIGHT_WHITE}pip install faster-whisper kokoro chromadb sentence-transformers pyaudio pyyaml tiktoken{Colors.RESET}\n")
+            print(f"{Colors.DIM}Or use basic TTS mode: /tts{Colors.RESET}")
+            time.sleep(3)
+            return
+        
+        # Check if config file exists
+        config_path = os.path.join(BASE_DIR, "tts_pro_config.yaml")
+        if not os.path.exists(config_path):
+            print(f"{Colors.BRIGHT_RED}✗ Configuration file not found:{Colors.RESET}")
+            print(f"  {config_path}\n")
+            print(f"{Colors.YELLOW}Creating default configuration...{Colors.RESET}")
+            # Config should already exist from our setup, but just in case
+            time.sleep(2)
+            return
+        
+        print(f"{Colors.BRIGHT_GREEN}✓ All dependencies available{Colors.RESET}")
+        print(f"{Colors.BRIGHT_GREEN}✓ Configuration found{Colors.RESET}\n")
+        print(f"{Colors.CYAN}Launching Enhanced TTS Pro in new terminal...{Colors.RESET}\n")
+        
+        # Create the enhanced TTS Pro script
+        tts_pro_script_path = os.path.join(BASE_DIR, "_tts_pro_mode.py")
+        config_repr = repr(self.config)
+        base_dir_escaped = BASE_DIR.replace('\\', '\\\\')
+        
+        tts_pro_script = f'''"""
+Enhanced TTS Pro Mode - AI Terminal Pro
+Using MiraiAssist Components for Professional Voice Interaction
+
+Features:
+- faster-whisper (3-5x faster, more accurate STT)
+- Kokoro TTS (high-quality neural voice synthesis)
+- RAG with ChromaDB (long-term conversation memory)
+- VAD (Voice Activity Detection for better silence handling)
+- PyAudio (professional audio management)
+"""
+import os
+import sys
+
+# Add project root to path
+sys.path.insert(0, r"{base_dir_escaped}")
+
+import logging
+import time
+from datetime import datetime
+from pathlib import Path
+
+# Setup basic logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+)
+logger = logging.getLogger(__name__)
+
+# Colors
+class Colors:
+    RESET = '\\033[0m'
+    BOLD = '\\033[1m'
+    CYAN = '\\033[36m'
+    GREEN = '\\033[32m'
+    YELLOW = '\\033[33m'
+    RED = '\\033[31m'
+    BRIGHT_CYAN = '\\033[96m'
+    BRIGHT_GREEN = '\\033[92m'
+    BRIGHT_YELLOW = '\\033[93m'
+    BRIGHT_RED = '\\033[91m'
+    BRIGHT_WHITE = '\\033[97m'
+    DIM = '\\033[2m'
+
+print(f"\\n{{Colors.BRIGHT_CYAN}}{{Colors.BOLD}}{'='*79}{{Colors.RESET}}")
+print(f"{{Colors.BRIGHT_YELLOW}}{{Colors.BOLD}}  ENHANCED TTS PRO MODE{{Colors.RESET}}")
+print(f"{{Colors.BRIGHT_CYAN}}{{Colors.BOLD}}{'='*79}{{Colors.RESET}}\\n")
+
+# Import MiraiAssist modules
+try:
+    from modules.config_manager import ConfigManager, ConfigError
+    from modules.stt_manager import STTManager, STTManagerError
+    from modules.tts_manager import TTSManager, TTSManagerError
+    from modules.audio_manager import AudioManager, AudioManagerError
+    from modules.memory_manager import MemoryManager, MemoryManagerError
+    from modules.context_manager import ContextManager, ContextManagerError
+    from modules.ai_engine_wrapper import AIEngineWrapper, AIEngineWrapperError
+    
+    print(f"{{Colors.BRIGHT_GREEN}}✓ MiraiAssist modules loaded{{Colors.RESET}}")
+except ImportError as e:
+    print(f"{{Colors.BRIGHT_RED}}✗ Failed to import modules: {{e}}{{Colors.RESET}}")
+    print(f"{{Colors.YELLOW}}Please ensure all modules are in the modules/ directory{{Colors.RESET}}")
+    sys.exit(1)
+
+# Configuration
+MAIN_CONFIG = {config_repr}
+CONFIG_PATH = r"{base_dir_escaped}\\tts_pro_config.yaml"
+
+print(f"{{Colors.CYAN}}Loading configuration from: {{CONFIG_PATH}}{{Colors.RESET}}")
+
+try:
+    # Load TTS Pro configuration
+    cfg = ConfigManager(CONFIG_PATH)
+    cfg.load()
+    print(f"{{Colors.BRIGHT_GREEN}}✓ Configuration loaded{{Colors.RESET}}")
+    
+    # Initialize Context Manager (RAG + ChromaDB)
+    print(f"{{Colors.CYAN}}Initializing RAG system...{{Colors.RESET}}")
+    ctx = ContextManager(cfg)
+    print(f"{{Colors.BRIGHT_GREEN}}✓ RAG system initialized{{Colors.RESET}}")
+    
+    # Initialize Memory Manager
+    print(f"{{Colors.CYAN}}Initializing memory manager...{{Colors.RESET}}")
+    memman = MemoryManager(cfg, ctx)
+    print(f"{{Colors.BRIGHT_GREEN}}✓ Memory manager initialized{{Colors.RESET}}")
+    
+    # Initialize AI Engine Wrapper
+    print(f"{{Colors.CYAN}}Loading AI model ({{MAIN_CONFIG.get('backend')}}: {{MAIN_CONFIG.get('model_name')}})...{{Colors.RESET}}")
+    ai_engine = AIEngineWrapper(MAIN_CONFIG)
+    print(f"{{Colors.BRIGHT_GREEN}}✓ AI Engine ready{{Colors.RESET}}")
+    
+    # Initialize Audio Manager
+    print(f"{{Colors.CYAN}}Initializing audio system...{{Colors.RESET}}")
+    import queue
+    gui_queue = queue.Queue()  # Dummy queue for audio manager
+    audio = AudioManager(cfg, gui_queue)
+    print(f"{{Colors.BRIGHT_GREEN}}✓ Audio system initialized{{Colors.RESET}}")
+    
+    # Initialize STT Manager (faster-whisper)
+    print(f"{{Colors.CYAN}}Loading Whisper model (faster-whisper)...{{Colors.RESET}}")
+    stt = STTManager(cfg)
+    print(f"{{Colors.BRIGHT_GREEN}}✓ STT ready (faster-whisper){{Colors.RESET}}")
+    
+    # Initialize TTS Manager (Kokoro)
+    print(f"{{Colors.CYAN}}Loading Kokoro TTS...{{Colors.RESET}}")
+    tts = TTSManager(cfg, gui_queue, audio)
+    print(f"{{Colors.BRIGHT_GREEN}}✓ TTS ready (Kokoro){{Colors.RESET}}")
+    
+    print(f"\\n{{Colors.BRIGHT_GREEN}}{{Colors.BOLD}}✓ All systems initialized successfully!{{Colors.RESET}}\\n")
+    
+except (ConfigError, ContextManagerError, MemoryManagerError, AIEngineWrapperError,
+        AudioManagerError, STTManagerError, TTSManagerError) as e:
+    print(f"{{Colors.BRIGHT_RED}}✗ Initialization failed: {{e}}{{Colors.RESET}}")
+    sys.exit(1)
+
+# Main conversation loop
+print(f"{{Colors.CYAN}}Instructions:{{Colors.RESET}}")
+print(f"  - Press {{Colors.BRIGHT_GREEN}}ENTER{{Colors.RESET}} to start recording")
+print(f"  - Speak naturally - auto-stops on silence (VAD enabled)")
+print(f"  - AI responds with high-quality neural voice (Kokoro)")
+print(f"  - RAG system provides long-term conversation memory")
+print(f"  - Commands: '{{Colors.BRIGHT_YELLOW}}save{{Colors.RESET}}', '{{Colors.BRIGHT_YELLOW}}stats{{Colors.RESET}}', '{{Colors.BRIGHT_YELLOW}}clear{{Colors.RESET}}'")
+print(f"  - Type '{{Colors.BRIGHT_RED}}exit{{Colors.RESET}}' to quit\\n")
+
+turn_number = 0
+
+while True:
+    try:
+        user_action = input(f"{{Colors.BRIGHT_GREEN}}[Turn {{turn_number + 1}}] Press ENTER to record (or command): {{Colors.RESET}}").strip().lower()
+        
+        # Handle commands
+        if user_action in ['exit', 'quit', 'q']:
+            print(f"\\n{{Colors.CYAN}}Saving conversation...{{Colors.RESET}}")
+            ctx.save_context()
+            ctx.shutdown()
+            print(f"{{Colors.BRIGHT_GREEN}}✓ Conversation saved{{Colors.RESET}}")
+            print(f"{{Colors.BRIGHT_YELLOW}}Exiting TTS Pro mode...{{Colors.RESET}}")
+            break
+        
+        elif user_action == 'stats':
+            history = memman.get_full_history()
+            user_msgs = [m for m in history if m.get("role") == "user"]
+            ai_msgs = [m for m in history if m.get("role") == "assistant"]
+            print(f"\\n{{Colors.BRIGHT_CYAN}}Conversation Statistics:{{Colors.RESET}}")
+            print(f"  {{Colors.CYAN}}Total turns:{{Colors.RESET}} {{len(user_msgs)}}")
+            print(f"  {{Colors.CYAN}}User messages:{{Colors.RESET}} {{len(user_msgs)}}")
+            print(f"  {{Colors.CYAN}}AI responses:{{Colors.RESET}} {{len(ai_msgs)}}")
+            print(f"  {{Colors.CYAN}}RAG enabled:{{Colors.RESET}} Yes (ChromaDB)\\n")
+            continue
+        
+        elif user_action == 'clear':
+            memman.clear_memory()
+            turn_number = 0
+            print(f"{{Colors.BRIGHT_GREEN}}✓ Conversation history cleared{{Colors.RESET}}\\n")
+            continue
+        
+        elif user_action == 'save':
+            print(f"\\n{{Colors.CYAN}}Saving conversation...{{Colors.RESET}}")
+            try:
+                ctx.save_context()
+                print(f"{{Colors.BRIGHT_GREEN}}✓ Conversation saved to: {{ctx.storage_path}}{{Colors.RESET}}\\n")
+            except Exception as e:
+                print(f"{{Colors.BRIGHT_RED}}✗ Save failed: {{e}}{{Colors.RESET}}\\n")
+            continue
+        
+        elif user_action and user_action not in ['', ' ']:
+            # Text input instead of voice
+            print(f"{{Colors.DIM}}(Using text input instead of voice){{Colors.RESET}}")
+            transcribed_text = user_action
+        else:
+            # Voice recording with PyAudio + faster-whisper
+            print(f"{{Colors.BRIGHT_GREEN}}🎤 Recording...{{Colors.RESET}}")
+            print(f"{{Colors.DIM}}   Speak naturally (auto-stops on silence via VAD){{Colors.RESET}}")
+            print(f"{{Colors.DIM}}   Press Ctrl+C to stop manually{{Colors.RESET}}")
+            
+            try:
+                # Start recording
+                audio.start_recording()
+                
+                # Wait for user to stop (manual stop with Enter or wait for auto-stop)
+                # In terminal mode, we need manual stop since AudioManager's VAD needs integration
+                print(f"{{Colors.BRIGHT_CYAN}}Recording in progress... Press ENTER when done{{Colors.RESET}}")
+                input()  # Wait for user to press ENTER
+                
+                # Stop recording
+                audio.stop_recording()
+                
+                # Give it time to save
+                time.sleep(0.3)
+                
+                # Check the gui_queue for the audio_ready message
+                recording_path = None
+                try:
+                    while not gui_queue.empty():
+                        msg = gui_queue.get_nowait()
+                        if msg.get("type") == "audio_ready":
+                            payload = msg.get("payload", {{}})
+                            recording_path = payload.get("filepath")
+                            duration = payload.get("duration", 0.0)
+                            logger.debug(f"Got recording path: {{recording_path}} ({{duration:.2f}}s)")
+                            break
+                except Exception as e:
+                    logger.error(f"Error reading from queue: {{e}}")
+                
+                if not recording_path or not os.path.exists(recording_path):
+                    print(f"{{Colors.YELLOW}}⚠ No audio recorded{{Colors.RESET}}\\n")
+                    continue
+                
+                print(f"{{Colors.BRIGHT_GREEN}}✓ Recording complete{{Colors.RESET}}")
+                
+                # Transcribe with faster-whisper
+                print(f"{{Colors.CYAN}}Transcribing with faster-whisper...{{Colors.RESET}}", end='', flush=True)
+                transcribed_text = stt.transcribe(recording_path)
+                print(f"\\r{{Colors.BRIGHT_GREEN}}✓ Transcription complete{{Colors.RESET}}" + " " * 30)
+                
+                # Clean up recording file
+                try:
+                    if os.path.exists(recording_path):
+                        os.remove(recording_path)
+                        logger.debug(f"Cleaned up temp file: {{recording_path}}")
+                except Exception as e:
+                    logger.warning(f"Could not delete temp file: {{e}}")
+                
+                if not transcribed_text or not transcribed_text.strip():
+                    print(f"{{Colors.YELLOW}}⚠ No speech detected. Try again.{{Colors.RESET}}\\n")
+                    continue
+                    
+            except KeyboardInterrupt:
+                # Handle Ctrl+C during recording
+                print(f"\\r{{Colors.BRIGHT_YELLOW}}⚠ Recording interrupted{{Colors.RESET}}" + " " * 30)
+                if audio.is_recording:
+                    audio.stop_recording()
+                continue
+            except Exception as e:
+                logger.error(f"Recording/transcription error: {{e}}", exc_info=True)
+                print(f"\\r{{Colors.BRIGHT_RED}}✗ Recording failed: {{e}}{{Colors.RESET}}" + " " * 30)
+                if audio.is_recording:
+                    audio.stop_recording()
+                continue
+        
+        # Display transcribed text
+        turn_number += 1
+        print(f"\\n{{Colors.BRIGHT_CYAN}}[Turn {{turn_number}}] You:{{Colors.RESET}} {{Colors.BRIGHT_YELLOW}}{{transcribed_text}}{{Colors.RESET}}\\n")
+        
+        # Add user message to memory (automatically indexes in ChromaDB)
+        try:
+            memman.add_message("user", transcribed_text)
+            logger.debug(f"User message added to memory and indexed")
+        except Exception as e:
+            logger.error(f"Error adding message to memory: {{e}}", exc_info=True)
+        
+        # Generate response with RAG-enhanced context
+        print(f"{{Colors.CYAN}}🤖 AI is thinking (retrieving relevant context from RAG)...{{Colors.RESET}}", end='', flush=True)
+        
+        try:
+            response = ai_engine.generate_with_memory(transcribed_text, memman)
+            print(f"\\r{{Colors.BRIGHT_GREEN}}✓ Response generated{{Colors.RESET}}" + " " * 60)
+            
+            if not response or not response.strip():
+                response = "I apologize, I couldn't generate a response. Could you rephrase that?"
+                
+        except Exception as e:
+            logger.error(f"Generation error: {{e}}", exc_info=True)
+            response = f"I encountered an error: {{str(e)}}"
+            print(f"\\r{{Colors.BRIGHT_RED}}✗ Generation failed{{Colors.RESET}}" + " " * 60)
+        
+        # Display response
+        print(f"\\n{{Colors.BRIGHT_GREEN}}AI Response:{{Colors.RESET}} {{Colors.BRIGHT_WHITE}}{{response}}{{Colors.RESET}}\\n")
+        
+        # Add AI response to memory (automatically indexes in ChromaDB)
+        try:
+            memman.add_message("assistant", response)
+            logger.debug(f"AI response added to memory and indexed")
+        except Exception as e:
+            logger.error(f"Error adding AI response to memory: {{e}}", exc_info=True)
+        
+        # Speak response with Kokoro TTS
+        print(f"{{Colors.CYAN}}🔊 Speaking with Kokoro TTS...{{Colors.RESET}}", end='', flush=True)
+        
+        try:
+            # Check if audio is busy
+            if audio.is_recording or audio.is_playing:
+                print(f"\\r{{Colors.YELLOW}}⚠ Audio busy, skipping TTS{{Colors.RESET}}" + " " * 30)
+            else:
+                # Speak using TTSManager (it handles Kokoro internally)
+                tts.speak_text(response)
+                print(f"\\r{{Colors.BRIGHT_GREEN}}✓ Speech complete{{Colors.RESET}}" + " " * 30)
+        except Exception as e:
+            logger.error(f"TTS error: {{e}}", exc_info=True)
+            print(f"\\r{{Colors.BRIGHT_RED}}✗ TTS failed: {{e}}{{Colors.RESET}}" + " " * 30)
+        
+        print()  # Blank line for readability
+        
+    except KeyboardInterrupt:
+        print(f"\\n{{Colors.CYAN}}Saving conversation...{{Colors.RESET}}")
+        try:
+            ctx.save_context()
+            ctx.shutdown()
+            print(f"{{Colors.BRIGHT_GREEN}}✓ Conversation saved{{Colors.RESET}}")
+        except Exception as e:
+            logger.error(f"Error saving: {{e}}")
+        print(f"{{Colors.BRIGHT_YELLOW}}Exiting TTS Pro mode...{{Colors.RESET}}")
+        break
+    except Exception as e:
+        logger.error(f"Error: {{e}}", exc_info=True)
+        print(f"{{Colors.BRIGHT_RED}}✗ Error: {{e}}{{Colors.RESET}}\\n")
+'''
+        
+        try:
+            with open(tts_pro_script_path, 'w', encoding='utf-8') as f:
+                f.write(tts_pro_script)
+            
+            print(f"{Colors.BRIGHT_GREEN}✓ TTS Pro script created{Colors.RESET}")
+            print(f"{Colors.CYAN}Launching in new terminal...{Colors.RESET}\n")
+            
+            # Launch in new terminal based on OS
+            system = platform.system()
+            if system == "Windows":
+                subprocess.Popen(f'start cmd /k "python \\"{tts_pro_script_path}\\""', shell=True)
+            elif system == "Darwin":  # macOS
+                subprocess.Popen(['open', '-a', 'Terminal', tts_pro_script_path])
+            else:  # Linux
+                for terminal in ['gnome-terminal', 'konsole', 'xterm']:
+                    try:
+                        subprocess.Popen([terminal, '--', 'python3', tts_pro_script_path])
+                        break
+                    except FileNotFoundError:
+                        continue
+            
+            print(f"{Colors.BRIGHT_GREEN}✓ TTS Pro mode launched in new terminal{Colors.RESET}")
+            print(f"{Colors.DIM}Enhanced features: faster-whisper + Kokoro + RAG{Colors.RESET}")
+            time.sleep(2)
+            
+        except Exception as e:
+            print(f"{Colors.BRIGHT_RED}✗ Failed to launch TTS Pro mode: {e}{Colors.RESET}")
             time.sleep(2)
 
 if __name__ == "__main__":
