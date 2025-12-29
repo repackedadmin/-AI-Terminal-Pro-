@@ -114,7 +114,7 @@ class ConfigManager:
             logger.critical(msg, exc_info=True)
             raise ConfigError(msg) from exc
 
-    def get(self, section: str, key: Optional[str] = None, default: Optional[T] = None) -> Any | T:
+    def get(self, section: str, key: Optional[str] = None, default: Optional[T] = None) -> Union[Any, T]:
         """
         Retrieves a configuration value.
 
