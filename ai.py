@@ -6961,58 +6961,114 @@ try:
     print(f"{{Colors.BRIGHT_GREEN}}✓ MiraiAssist modules loaded{{Colors.RESET}}")
 except ImportError as e:
     print(f"{{Colors.BRIGHT_RED}}✗ Failed to import modules: {{e}}{{Colors.RESET}}")
+    import traceback
+    print(f"{{Colors.DIM}}{{traceback.format_exc()}}{{Colors.RESET}}")
     print(f"{{Colors.YELLOW}}Please ensure all modules are in the modules/ directory{{Colors.RESET}}")
+    sys.exit(1)
+except Exception as e:
+    print(f"{{Colors.BRIGHT_RED}}✗ Unexpected error importing modules: {{e}}{{Colors.RESET}}")
+    import traceback
+    print(f"{{Colors.DIM}}{{traceback.format_exc()}}{{Colors.RESET}}")
     sys.exit(1)
 
 # Configuration
 MAIN_CONFIG = {config_repr}
-CONFIG_PATH = r"{base_dir_escaped}\\tts_pro_config.yaml"
+CONFIG_PATH = os.path.join(r"{base_dir_escaped}", "tts_pro_config.yaml")
 
 print(f"{{Colors.CYAN}}Loading configuration from: {{CONFIG_PATH}}{{Colors.RESET}}")
 
+# Check if config file exists
+if not os.path.exists(CONFIG_PATH):
+    print(f"{{Colors.BRIGHT_RED}}✗ Configuration file not found: {{CONFIG_PATH}}{{Colors.RESET}}")
+    print(f"{{Colors.YELLOW}}Please ensure tts_pro_config.yaml exists in the project root{{Colors.RESET}}")
+    sys.exit(1)
+
 try:
     # Load TTS Pro configuration
+    print(f"{{Colors.CYAN}}Step 1/7: Loading configuration...{{Colors.RESET}}")
     cfg = ConfigManager(CONFIG_PATH)
     cfg.load()
     print(f"{{Colors.BRIGHT_GREEN}}✓ Configuration loaded{{Colors.RESET}}")
     
     # Initialize Context Manager (RAG + ChromaDB)
-    print(f"{{Colors.CYAN}}Initializing RAG system...{{Colors.RESET}}")
-    ctx = ContextManager(cfg)
-    print(f"{{Colors.BRIGHT_GREEN}}✓ RAG system initialized{{Colors.RESET}}")
+    print(f"{{Colors.CYAN}}Step 2/7: Initializing RAG system (ChromaDB)...{{Colors.RESET}}")
+    try:
+        ctx = ContextManager(cfg)
+        print(f"{{Colors.BRIGHT_GREEN}}✓ RAG system initialized{{Colors.RESET}}")
+    except Exception as e:
+        print(f"{{Colors.BRIGHT_RED}}✗ RAG initialization failed: {{e}}{{Colors.RESET}}")
+        print(f"{{Colors.YELLOW}}Tip: Ensure sentence-transformers and chromadb are installed{{Colors.RESET}}")
+        raise
     
     # Initialize Memory Manager
-    print(f"{{Colors.CYAN}}Initializing memory manager...{{Colors.RESET}}")
-    memman = MemoryManager(cfg, ctx)
-    print(f"{{Colors.BRIGHT_GREEN}}✓ Memory manager initialized{{Colors.RESET}}")
+    print(f"{{Colors.CYAN}}Step 3/7: Initializing memory manager...{{Colors.RESET}}")
+    try:
+        memman = MemoryManager(cfg, ctx)
+        print(f"{{Colors.BRIGHT_GREEN}}✓ Memory manager initialized{{Colors.RESET}}")
+    except Exception as e:
+        print(f"{{Colors.BRIGHT_RED}}✗ Memory manager initialization failed: {{e}}{{Colors.RESET}}")
+        raise
     
     # Initialize AI Engine Wrapper
-    print(f"{{Colors.CYAN}}Loading AI model ({{MAIN_CONFIG.get('backend')}}: {{MAIN_CONFIG.get('model_name')}})...{{Colors.RESET}}")
-    ai_engine = AIEngineWrapper(MAIN_CONFIG)
-    print(f"{{Colors.BRIGHT_GREEN}}✓ AI Engine ready{{Colors.RESET}}")
+    print(f"{{Colors.CYAN}}Step 4/7: Loading AI model ({{MAIN_CONFIG.get('backend')}}: {{MAIN_CONFIG.get('model_name')}})...{{Colors.RESET}}")
+    try:
+        ai_engine = AIEngineWrapper(MAIN_CONFIG)
+        print(f"{{Colors.BRIGHT_GREEN}}✓ AI Engine ready{{Colors.RESET}}")
+    except Exception as e:
+        print(f"{{Colors.BRIGHT_RED}}✗ AI Engine initialization failed: {{e}}{{Colors.RESET}}")
+        print(f"{{Colors.YELLOW}}Tip: Check that your model is available and backend is configured correctly{{Colors.RESET}}")
+        raise
     
     # Initialize Audio Manager
-    print(f"{{Colors.CYAN}}Initializing audio system...{{Colors.RESET}}")
+    print(f"{{Colors.CYAN}}Step 5/7: Initializing audio system (PyAudio)...{{Colors.RESET}}")
     import queue
     gui_queue = queue.Queue()  # Dummy queue for audio manager
-    audio = AudioManager(cfg, gui_queue)
-    print(f"{{Colors.BRIGHT_GREEN}}✓ Audio system initialized{{Colors.RESET}}")
+    try:
+        audio = AudioManager(cfg, gui_queue)
+        print(f"{{Colors.BRIGHT_GREEN}}✓ Audio system initialized{{Colors.RESET}}")
+    except Exception as e:
+        print(f"{{Colors.BRIGHT_RED}}✗ Audio initialization failed: {{e}}{{Colors.RESET}}")
+        print(f"{{Colors.YELLOW}}Tip: Ensure pyaudio is installed correctly (may require system libraries){{Colors.RESET}}")
+        raise
     
     # Initialize STT Manager (faster-whisper)
-    print(f"{{Colors.CYAN}}Loading Whisper model (faster-whisper)...{{Colors.RESET}}")
-    stt = STTManager(cfg)
-    print(f"{{Colors.BRIGHT_GREEN}}✓ STT ready (faster-whisper){{Colors.RESET}}")
+    print(f"{{Colors.CYAN}}Step 6/7: Loading Whisper model (faster-whisper)...{{Colors.RESET}}")
+    try:
+        stt = STTManager(cfg)
+        print(f"{{Colors.BRIGHT_GREEN}}✓ STT ready (faster-whisper){{Colors.RESET}}")
+    except Exception as e:
+        print(f"{{Colors.BRIGHT_RED}}✗ STT initialization failed: {{e}}{{Colors.RESET}}")
+        print(f"{{Colors.YELLOW}}Tip: Ensure faster-whisper is installed: pip install faster-whisper{{Colors.RESET}}")
+        raise
     
     # Initialize TTS Manager (Kokoro)
-    print(f"{{Colors.CYAN}}Loading Kokoro TTS...{{Colors.RESET}}")
-    tts = TTSManager(cfg, gui_queue, audio)
-    print(f"{{Colors.BRIGHT_GREEN}}✓ TTS ready (Kokoro){{Colors.RESET}}")
+    print(f"{{Colors.CYAN}}Step 7/7: Loading Kokoro TTS...{{Colors.RESET}}")
+    try:
+        tts = TTSManager(cfg, gui_queue, audio)
+        print(f"{{Colors.BRIGHT_GREEN}}✓ TTS ready (Kokoro){{Colors.RESET}}")
+    except Exception as e:
+        print(f"{{Colors.BRIGHT_RED}}✗ TTS initialization failed: {{e}}{{Colors.RESET}}")
+        print(f"{{Colors.YELLOW}}Tip: Ensure kokoro is installed: pip install kokoro{{Colors.RESET}}")
+        raise
     
     print(f"\\n{{Colors.BRIGHT_GREEN}}{{Colors.BOLD}}✓ All systems initialized successfully!{{Colors.RESET}}\\n")
     
 except (ConfigError, ContextManagerError, MemoryManagerError, AIEngineWrapperError,
         AudioManagerError, STTManagerError, TTSManagerError) as e:
-    print(f"{{Colors.BRIGHT_RED}}✗ Initialization failed: {{e}}{{Colors.RESET}}")
+    print(f"{{Colors.BRIGHT_RED}}✗ Initialization failed: {{type(e).__name__}}: {{e}}{{Colors.RESET}}")
+    import traceback
+    print(f"\\n{{Colors.DIM}}Full error details:{{Colors.RESET}}")
+    print(f"{{Colors.DIM}}{{traceback.format_exc()}}{{Colors.RESET}}")
+    print(f"\\n{{Colors.YELLOW}}Troubleshooting:{{Colors.RESET}}")
+    print(f"  1. Check that all dependencies are installed: pip install faster-whisper kokoro pyaudio sentence-transformers chromadb tiktoken")
+    print(f"  2. Verify tts_pro_config.yaml exists and is valid YAML")
+    print(f"  3. Check logs/tts_pro.log for detailed error information")
+    sys.exit(1)
+except Exception as e:
+    print(f"{{Colors.BRIGHT_RED}}✗ Unexpected initialization error: {{type(e).__name__}}: {{e}}{{Colors.RESET}}")
+    import traceback
+    print(f"\\n{{Colors.DIM}}Full error details:{{Colors.RESET}}")
+    print(f"{{Colors.DIM}}{{traceback.format_exc()}}{{Colors.RESET}}")
     sys.exit(1)
 
 # Main conversation loop
