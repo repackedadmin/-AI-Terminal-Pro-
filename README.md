@@ -33,8 +33,8 @@ Built for **privacy-first professionals**.
 - 💻 **Multi purpose terminal GUI??**  
 - 🧠 **Full Automation**  
 - 🛠️ **Background Agent** 
-- 🔐 **TTS**  
-- 📁 **Sight** camera enabled functionality  
+- 🔐 ~~**TTS**~~  
+- 📁 ~~**Sight** camera enabled functionality~~ 
 - 🌐 **Vision** image generation
 - 🔌 **API Gateway** 
 - 🧪 **GPU + CPU compatability** for user performance  
