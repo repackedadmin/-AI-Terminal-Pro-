@@ -50,6 +50,36 @@ try:
 except ImportError:
     PLAYWRIGHT_AVAILABLE = False
 
+# Whisper for speech recognition
+try:
+    import whisper
+    WHISPER_AVAILABLE = True
+except ImportError:
+    WHISPER_AVAILABLE = False
+
+# Text-to-Speech
+try:
+    import pyttsx3
+    TTS_AVAILABLE = True
+except ImportError:
+    TTS_AVAILABLE = False
+
+# OpenCV for camera capture
+try:
+    import cv2
+    import numpy as np
+    CV2_AVAILABLE = True
+except ImportError:
+    CV2_AVAILABLE = False
+
+# Audio recording
+try:
+    import sounddevice as sd
+    import soundfile as sf
+    AUDIO_AVAILABLE = True
+except ImportError:
+    AUDIO_AVAILABLE = False
+
 # ANSI Color Codes for cross-platform terminal colors
 class Colors:
     RESET = '\033[0m'
@@ -5575,6 +5605,16 @@ class App:
                     print(f"{Colors.BRIGHT_RED}✗ File not found: {filepath}{Colors.RESET}")
             return "COMMAND"
         
+        elif cmd == "/tts":
+            # Launch Text-to-Speech mode in a new terminal
+            self.launch_tts_mode()
+            return "COMMAND"
+        
+        elif cmd == "/sight":
+            # Launch Sight/Vision mode in a new terminal
+            self.launch_sight_mode()
+            return "COMMAND"
+        
         elif cmd == "/help":
             print(f"\n{Colors.BRIGHT_CYAN}{Colors.BOLD}Available Commands:{Colors.RESET}\n")
             print(f"  {Colors.BRIGHT_GREEN}/new [name]{Colors.RESET}          - Create new chat session")
@@ -5583,7 +5623,10 @@ class App:
             print(f"  {Colors.BRIGHT_GREEN}/project [name|desc]{Colors.RESET} - Create/switch project (list if no args)")
             print(f"  {Colors.BRIGHT_GREEN}/project_save [file]{Colors.RESET} - Save current project")
             print(f"  {Colors.BRIGHT_GREEN}/project_load [id|file]{Colors.RESET} - Load project (list if no args)")
-            print(f"  {Colors.BRIGHT_RED}/back, /exit{Colors.RESET}        - Exit chat")
+            print(f"\n{Colors.BRIGHT_YELLOW}{Colors.BOLD}Advanced Features:{Colors.RESET}\n")
+            print(f"  {Colors.BRIGHT_CYAN}/tts{Colors.RESET}                 - Launch Text-to-Speech mode (voice commands)")
+            print(f"  {Colors.BRIGHT_CYAN}/sight{Colors.RESET}               - Launch Vision mode (camera interaction)")
+            print(f"\n{Colors.BRIGHT_RED}/back, /exit{Colors.RESET}        - Exit chat")
             print(f"  {Colors.BRIGHT_GREEN}/help{Colors.RESET}               - Show this help")
             return "COMMAND"
         
@@ -5757,6 +5800,633 @@ class App:
                     
             except KeyboardInterrupt:
                 break
+
+    def launch_tts_mode(self):
+        """Launch Text-to-Speech mode in a new terminal with full LLM integration."""
+        if not WHISPER_AVAILABLE:
+            print(f"\n{Colors.BRIGHT_RED}✗ Whisper not available{Colors.RESET}")
+            print(f"{Colors.YELLOW}Install with: pip install openai-whisper{Colors.RESET}")
+            time.sleep(2)
+            return
+        
+        if not TTS_AVAILABLE:
+            print(f"\n{Colors.BRIGHT_YELLOW}⚠ TTS engine not available{Colors.RESET}")
+            print(f"{Colors.YELLOW}Install with: pip install pyttsx3{Colors.RESET}")
+            print(f"{Colors.DIM}TTS mode will work but responses won't be spoken.{Colors.RESET}")
+            time.sleep(2)
+        
+        if not AUDIO_AVAILABLE:
+            print(f"\n{Colors.BRIGHT_RED}✗ Audio recording not available{Colors.RESET}")
+            print(f"{Colors.YELLOW}Install with: pip install sounddevice soundfile{Colors.RESET}")
+            time.sleep(2)
+            return
+        
+        # Create TTS script with full LLM integration
+        tts_script_path = os.path.join(BASE_DIR, "_tts_mode.py")
+        config_json = json.dumps(self.config, indent=2)
+        tts_script = f'''"""
+TTS Mode - Voice-controlled AI Assistant with Full LLM Integration
+Run this in a separate terminal for voice interaction
+"""
+import os
+import sys
+import json
+import time
+import whisper
+import sounddevice as sd
+import soundfile as sf
+import numpy as np
+import requests
+import torch
+from datetime import datetime
+from transformers import AutoTokenizer, AutoModelForCausalLM
+
+try:
+    import pyttsx3
+    TTS_AVAILABLE = True
+except ImportError:
+    TTS_AVAILABLE = False
+
+# Colors
+class Colors:
+    RESET = '\\033[0m'
+    BOLD = '\\033[1m'
+    CYAN = '\\033[36m'
+    GREEN = '\\033[32m'
+    YELLOW = '\\033[33m'
+    RED = '\\033[31m'
+    BRIGHT_CYAN = '\\033[96m'
+    BRIGHT_GREEN = '\\033[92m'
+    BRIGHT_YELLOW = '\\033[93m'
+    BRIGHT_RED = '\\033[91m'
+    BRIGHT_WHITE = '\\033[97m'
+    DIM = '\\033[2m'
+
+# Configuration
+SAMPLE_RATE = 16000
+DURATION = 5  # seconds per recording
+MODEL_SIZE = "base"  # Options: tiny, base, small, medium, large
+TEMP_AUDIO_FILE = os.path.join("{BASE_DIR}", "_temp_audio.wav")
+CONFIG = {config_json}
+
+# AI Engine Class - Full Implementation
+class AIEngine:
+    def __init__(self, config):
+        self.config = config
+        self.backend = config.get("backend")
+        self.model_name = config.get("model_name")
+        self.tokenizer = None
+        self.model = None
+        self.device = "cpu"
+        self._load()
+
+    def _load(self):
+        print(f"{{Colors.BRIGHT_CYAN}}[SYSTEM]{{Colors.RESET}} Loading Backend: {{Colors.BRIGHT_WHITE}}{{self.backend}}{{Colors.RESET}} ({{Colors.BRIGHT_WHITE}}{{self.model_name}}{{Colors.RESET}})...")
+        if self.backend == "huggingface":
+            try:
+                self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
+                if not self.tokenizer.pad_token:
+                    self.tokenizer.pad_token = self.tokenizer.eos_token
+            
+                if torch.cuda.is_available(): 
+                    self.device = "cuda"
+                elif torch.backends.mps.is_available(): 
+                    self.device = "mps"
+                
+                self.model = AutoModelForCausalLM.from_pretrained(self.model_name)
+                self.model.to(self.device)
+                print(f"{{Colors.BRIGHT_GREEN}}[SYSTEM]{{Colors.RESET}} Model loaded on {{Colors.BRIGHT_WHITE}}{{self.device}}{{Colors.RESET}}.")
+            except Exception as e:
+                print(f"{{Colors.BRIGHT_RED}}[CRITICAL]{{Colors.RESET}} Model Load Failed: {{e}}")
+                sys.exit(1)
+        elif self.backend == "ollama":
+            try:
+                requests.get("http://localhost:11434")
+                print(f"{{Colors.BRIGHT_GREEN}}[SYSTEM]{{Colors.RESET}} Ollama connection established.")
+            except:
+                print(f"{{Colors.YELLOW}}[WARNING]{{Colors.RESET}} Ollama is not running on localhost:11434.")
+
+    def generate(self, prompt):
+        if self.backend == "huggingface":
+            inputs = self.tokenizer(prompt, return_tensors="pt", truncation=True, max_length=2048).to(self.device)
+            with torch.no_grad():
+                out = self.model.generate(
+                    **inputs, 
+                    max_new_tokens=self.config.get("max_response_tokens"),
+                    do_sample=True,
+                    temperature=self.config.get("temperature"),
+                    pad_token_id=self.tokenizer.eos_token_id
+                )
+            full = self.tokenizer.decode(out[0], skip_special_tokens=True)
+            response = full[len(prompt):].strip()
+            if "You:" in response: response = response.split("You:")[0]
+            return response.strip()
+            
+        elif self.backend == "ollama":
+            try:
+                res = requests.post("http://localhost:11434/api/generate", json={{
+                    "model": self.model_name,
+                    "prompt": prompt,
+                    "stream": False,
+                    "options": {{
+                        "temperature": self.config.get("temperature"),
+                        "num_predict": self.config.get("max_response_tokens")
+                    }}
+                }})
+                if res.status_code == 200:
+                    return res.json()['response'].strip()
+                return f"Ollama Error: {{res.text}}"
+            except Exception as e:
+                return f"Connection Error: {{e}}"
+
+print(f"\\n{{Colors.BRIGHT_CYAN}}{{Colors.BOLD}}{'='*79}{{Colors.RESET}}")
+print(f"{{Colors.BRIGHT_YELLOW}}{{Colors.BOLD}}  TEXT-TO-SPEECH MODE{{Colors.RESET}}")
+print(f"{{Colors.BRIGHT_CYAN}}{{Colors.BOLD}}{'='*79}{{Colors.RESET}}\\n")
+
+# Initialize AI Engine
+print(f"{{Colors.CYAN}}Initializing AI Engine...{{Colors.RESET}}")
+try:
+    ai_engine = AIEngine(CONFIG)
+    print(f"{{Colors.BRIGHT_GREEN}}✓ AI Engine initialized successfully{{Colors.RESET}}\\n")
+except Exception as e:
+    print(f"{{Colors.BRIGHT_RED}}✗ Failed to initialize AI Engine: {{e}}{{Colors.RESET}}")
+    sys.exit(1)
+
+# Initialize Whisper
+print(f"{{Colors.CYAN}}Loading Whisper model ({{MODEL_SIZE}})...{{Colors.RESET}}")
+try:
+    whisper_model = whisper.load_model(MODEL_SIZE)
+    print(f"{{Colors.BRIGHT_GREEN}}✓ Whisper model loaded successfully{{Colors.RESET}}\\n")
+except Exception as e:
+    print(f"{{Colors.BRIGHT_RED}}✗ Failed to load Whisper model: {{e}}{{Colors.RESET}}")
+    sys.exit(1)
+
+# Initialize TTS if available
+tts_engine = None
+if TTS_AVAILABLE:
+    try:
+        tts_engine = pyttsx3.init()
+        tts_engine.setProperty('rate', 150)  # Speed
+        tts_engine.setProperty('volume', 0.9)  # Volume
+        print(f"{{Colors.BRIGHT_GREEN}}✓ TTS engine initialized{{Colors.RESET}}\\n")
+    except Exception as e:
+        print(f"{{Colors.BRIGHT_YELLOW}}⚠ TTS initialization failed: {{e}}{{Colors.RESET}}\\n")
+        tts_engine = None
+
+def speak(text):
+    """Speak text using TTS if available."""
+    if tts_engine:
+        try:
+            tts_engine.say(text)
+            tts_engine.runAndWait()
+        except Exception as e:
+            print(f"{{Colors.YELLOW}}⚠ TTS error: {{e}}{{Colors.RESET}}")
+
+def record_audio(duration=DURATION):
+    """Record audio from microphone."""
+    print(f"{{Colors.BRIGHT_GREEN}}🎤 Recording for {{duration}} seconds... (speak now){{Colors.RESET}}")
+    try:
+        audio = sd.rec(int(duration * SAMPLE_RATE), samplerate=SAMPLE_RATE, channels=1, dtype='float32')
+        sd.wait()
+        return audio
+    except Exception as e:
+        print(f"{{Colors.BRIGHT_RED}}✗ Recording failed: {{e}}{{Colors.RESET}}")
+        return None
+
+def transcribe_audio(audio_data):
+    """Transcribe audio using Whisper."""
+    try:
+        # Save to temporary file
+        sf.write(TEMP_AUDIO_FILE, audio_data, SAMPLE_RATE)
+        
+        # Transcribe
+        print(f"{{Colors.CYAN}}Transcribing...{{Colors.RESET}}")
+        result = whisper_model.transcribe(TEMP_AUDIO_FILE)
+        text = result["text"].strip()
+        
+        # Clean up
+        if os.path.exists(TEMP_AUDIO_FILE):
+            os.remove(TEMP_AUDIO_FILE)
+        
+        return text
+    except Exception as e:
+        print(f"{{Colors.BRIGHT_RED}}✗ Transcription failed: {{e}}{{Colors.RESET}}")
+        return None
+
+def process_with_llm(user_text, conversation_history):
+    """Process user input with the LLM and return response."""
+    try:
+        # Build prompt with conversation history
+        system_prompt = CONFIG.get("system_prompt", "You are a helpful AI assistant.")
+        
+        # Format conversation
+        conversation = ""
+        for role, msg in conversation_history[-10:]:  # Last 10 messages for context
+            if role == "user":
+                conversation += f"You: {{msg}}\\n"
+            elif role == "ai":
+                conversation += f"AI: {{msg}}\\n"
+        
+        # Add current input
+        conversation += f"You: {{user_text}}\\nAI:"
+        
+        # Full prompt
+        full_prompt = f"{{system_prompt}}\\n\\n{{conversation}}"
+        
+        # Generate response
+        response = ai_engine.generate(full_prompt)
+        return response
+    except Exception as e:
+        return f"Error: {{str(e)}}"
+
+print(f"{{Colors.CYAN}}Instructions:{{Colors.RESET}}")
+print(f"  - Press {{Colors.BRIGHT_GREEN}}ENTER{{Colors.RESET}} to start recording")
+print(f"  - Speak your command/question ({{DURATION}}s recording)")
+print(f"  - Your speech will be transcribed and sent to the AI")
+print(f"  - Type '{{Colors.BRIGHT_RED}}exit{{Colors.RESET}}' or '{{Colors.BRIGHT_RED}}quit{{Colors.RESET}}' to stop\\n")
+
+speak("Text to speech mode activated. Press enter to start recording.")
+
+# Conversation history for context
+conversation_history = []
+
+while True:
+    try:
+        user_action = input(f"{{Colors.BRIGHT_GREEN}}Press ENTER to record (or 'exit' to quit): {{Colors.RESET}}").strip().lower()
+        
+        if user_action in ['exit', 'quit', 'q']:
+            speak("Goodbye")
+            print(f"\\n{{Colors.BRIGHT_YELLOW}}Exiting TTS mode...{{Colors.RESET}}")
+            break
+        
+        # Record audio
+        audio_data = record_audio(DURATION)
+        if audio_data is None:
+            continue
+        
+        # Transcribe
+        transcribed_text = transcribe_audio(audio_data)
+        if not transcribed_text:
+            print(f"{{Colors.YELLOW}}⚠ No speech detected. Try again.{{Colors.RESET}}\\n")
+            continue
+        
+        print(f"\\n{{Colors.BRIGHT_CYAN}}You said:{{Colors.RESET}} {{Colors.BRIGHT_YELLOW}}{{transcribed_text}}{{Colors.RESET}}\\n")
+        
+        # Process with LLM
+        print(f"{{Colors.CYAN}}🤖 AI is thinking...{{Colors.RESET}}", end='', flush=True)
+        response = process_with_llm(transcribed_text, conversation_history)
+        print(f"\\r{{Colors.BRIGHT_GREEN}}✓ Response ready{{Colors.RESET}}" + " " * 30)
+        
+        # Save to conversation history
+        conversation_history.append(("user", transcribed_text))
+        conversation_history.append(("ai", response))
+        
+        # Display and speak response
+        print(f"\\n{{Colors.BRIGHT_GREEN}}AI Response:{{Colors.RESET}} {{Colors.BRIGHT_WHITE}}{{response}}{{Colors.RESET}}\\n")
+        speak(response)
+        
+    except KeyboardInterrupt:
+        speak("Goodbye")
+        print(f"\\n{{Colors.BRIGHT_YELLOW}}Exiting TTS mode...{{Colors.RESET}}")
+        break
+    except Exception as e:
+        print(f"{{Colors.BRIGHT_RED}}✗ Error: {{e}}{{Colors.RESET}}\\n")
+'''
+        
+        try:
+            with open(tts_script_path, 'w', encoding='utf-8') as f:
+                f.write(tts_script)
+            
+            print(f"\n{Colors.BRIGHT_GREEN}✓ TTS mode script created{Colors.RESET}")
+            print(f"{Colors.CYAN}Launching in new terminal...{Colors.RESET}\n")
+            
+            # Launch in new terminal based on OS
+            system = platform.system()
+            if system == "Windows":
+                subprocess.Popen(f'start cmd /k "python \\"{tts_script_path}\\""', shell=True)
+            elif system == "Darwin":  # macOS
+                subprocess.Popen(['open', '-a', 'Terminal', tts_script_path])
+            else:  # Linux
+                # Try common terminal emulators
+                for terminal in ['gnome-terminal', 'konsole', 'xterm']:
+                    try:
+                        subprocess.Popen([terminal, '--', 'python3', tts_script_path])
+                        break
+                    except FileNotFoundError:
+                        continue
+            
+            print(f"{Colors.BRIGHT_GREEN}✓ TTS mode launched in new terminal{Colors.RESET}")
+            print(f"{Colors.DIM}The TTS terminal will handle voice commands independently.{Colors.RESET}")
+            time.sleep(2)
+            
+        except Exception as e:
+            print(f"{Colors.BRIGHT_RED}✗ Failed to launch TTS mode: {e}{Colors.RESET}")
+            time.sleep(2)
+
+    def launch_sight_mode(self):
+        """Launch Sight/Vision mode in a new terminal with full LLM integration."""
+        if not CV2_AVAILABLE:
+            print(f"\n{Colors.BRIGHT_RED}✗ OpenCV not available{Colors.RESET}")
+            print(f"{Colors.YELLOW}Install with: pip install opencv-python{Colors.RESET}")
+            time.sleep(2)
+            return
+        
+        # Create Sight script with full LLM integration
+        sight_script_path = os.path.join(BASE_DIR, "_sight_mode.py")
+        config_json = json.dumps(self.config, indent=2)
+        sight_script = f'''"""
+Sight Mode - Camera Vision AI Assistant with Full LLM Integration
+Captures webcam frames and sends them to the LLM for visual analysis
+"""
+import os
+import sys
+import cv2
+import base64
+import time
+import requests
+import json
+import torch
+from datetime import datetime
+from transformers import AutoTokenizer, AutoModelForCausalLM
+
+# Colors
+class Colors:
+    RESET = '\\033[0m'
+    BOLD = '\\033[1m'
+    CYAN = '\\033[36m'
+    GREEN = '\\033[32m'
+    YELLOW = '\\033[33m'
+    RED = '\\033[31m'
+    BRIGHT_CYAN = '\\033[96m'
+    BRIGHT_GREEN = '\\033[92m'
+    BRIGHT_YELLOW = '\\033[93m'
+    BRIGHT_RED = '\\033[91m'
+    BRIGHT_WHITE = '\\033[97m'
+    DIM = '\\033[2m'
+
+# Configuration
+CAPTURE_INTERVAL = 3  # seconds between frames
+FRAME_WIDTH = 640
+FRAME_HEIGHT = 480
+JPEG_QUALITY = 85
+CONFIG = {config_json}
+
+# AI Engine Class - Full Implementation
+class AIEngine:
+    def __init__(self, config):
+        self.config = config
+        self.backend = config.get("backend")
+        self.model_name = config.get("model_name")
+        self.tokenizer = None
+        self.model = None
+        self.device = "cpu"
+        self._load()
+
+    def _load(self):
+        print(f"{{Colors.BRIGHT_CYAN}}[SYSTEM]{{Colors.RESET}} Loading Backend: {{Colors.BRIGHT_WHITE}}{{self.backend}}{{Colors.RESET}} ({{Colors.BRIGHT_WHITE}}{{self.model_name}}{{Colors.RESET}})...")
+        if self.backend == "huggingface":
+            try:
+                self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
+                if not self.tokenizer.pad_token:
+                    self.tokenizer.pad_token = self.tokenizer.eos_token
+            
+                if torch.cuda.is_available(): 
+                    self.device = "cuda"
+                elif torch.backends.mps.is_available(): 
+                    self.device = "mps"
+                
+                self.model = AutoModelForCausalLM.from_pretrained(self.model_name)
+                self.model.to(self.device)
+                print(f"{{Colors.BRIGHT_GREEN}}[SYSTEM]{{Colors.RESET}} Model loaded on {{Colors.BRIGHT_WHITE}}{{self.device}}{{Colors.RESET}}.")
+            except Exception as e:
+                print(f"{{Colors.BRIGHT_RED}}[CRITICAL]{{Colors.RESET}} Model Load Failed: {{e}}")
+                sys.exit(1)
+        elif self.backend == "ollama":
+            try:
+                requests.get("http://localhost:11434")
+                print(f"{{Colors.BRIGHT_GREEN}}[SYSTEM]{{Colors.RESET}} Ollama connection established.")
+            except:
+                print(f"{{Colors.YELLOW}}[WARNING]{{Colors.RESET}} Ollama is not running on localhost:11434.")
+
+    def generate(self, prompt):
+        if self.backend == "huggingface":
+            inputs = self.tokenizer(prompt, return_tensors="pt", truncation=True, max_length=2048).to(self.device)
+            with torch.no_grad():
+                out = self.model.generate(
+                    **inputs, 
+                    max_new_tokens=self.config.get("max_response_tokens"),
+                    do_sample=True,
+                    temperature=self.config.get("temperature"),
+                    pad_token_id=self.tokenizer.eos_token_id
+                )
+            full = self.tokenizer.decode(out[0], skip_special_tokens=True)
+            response = full[len(prompt):].strip()
+            if "You:" in response: response = response.split("You:")[0]
+            return response.strip()
+            
+        elif self.backend == "ollama":
+            try:
+                res = requests.post("http://localhost:11434/api/generate", json={{
+                    "model": self.model_name,
+                    "prompt": prompt,
+                    "stream": False,
+                    "options": {{
+                        "temperature": self.config.get("temperature"),
+                        "num_predict": self.config.get("max_response_tokens")
+                    }}
+                }})
+                if res.status_code == 200:
+                    return res.json()['response'].strip()
+                return f"Ollama Error: {{res.text}}"
+            except Exception as e:
+                return f"Connection Error: {{e}}"
+
+print(f"\\n{{Colors.BRIGHT_CYAN}}{{Colors.BOLD}}{'='*79}{{Colors.RESET}}")
+print(f"{{Colors.BRIGHT_YELLOW}}{{Colors.BOLD}}  SIGHT MODE - CAMERA VISION{{Colors.RESET}}")
+print(f"{{Colors.BRIGHT_CYAN}}{{Colors.BOLD}}{'='*79}{{Colors.RESET}}\\n")
+
+# Initialize AI Engine
+print(f"{{Colors.CYAN}}Initializing AI Engine...{{Colors.RESET}}")
+try:
+    ai_engine = AIEngine(CONFIG)
+    print(f"{{Colors.BRIGHT_GREEN}}✓ AI Engine initialized successfully{{Colors.RESET}}\\n")
+except Exception as e:
+    print(f"{{Colors.BRIGHT_RED}}✗ Failed to initialize AI Engine: {{e}}{{Colors.RESET}}")
+    sys.exit(1)
+
+print(f"{{Colors.CYAN}}Initializing camera...{{Colors.RESET}}")
+try:
+    cap = cv2.VideoCapture(0)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
+    
+    if not cap.isOpened():
+        raise Exception("Could not open camera")
+    
+    print(f"{{Colors.BRIGHT_GREEN}}✓ Camera initialized successfully{{Colors.RESET}}\\n")
+except Exception as e:
+    print(f"{{Colors.BRIGHT_RED}}✗ Failed to initialize camera: {{e}}{{Colors.RESET}}")
+    sys.exit(1)
+
+def capture_frame():
+    """Capture a single frame from the webcam."""
+    ret, frame = cap.read()
+    if not ret:
+        return None
+    return frame
+
+def encode_frame_base64(frame):
+    """Encode frame as base64 JPEG."""
+    encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY]
+    _, buffer = cv2.imencode('.jpg', frame, encode_param)
+    jpg_as_text = base64.b64encode(buffer).decode('utf-8')
+    return jpg_as_text
+
+def process_frame(frame, instruction="What do you see?", conversation_history=None):
+    """Process frame with LLM and return response."""
+    if conversation_history is None:
+        conversation_history = []
+    
+    # Encode frame
+    base64_image = encode_frame_base64(frame)
+    
+    # Build prompt with conversation history
+    system_prompt = CONFIG.get("system_prompt", "You are a helpful AI assistant with vision capabilities.")
+    
+    # Format conversation
+    conversation = ""
+    for role, msg in conversation_history[-10:]:  # Last 10 messages for context
+        if role == "user":
+            conversation += f"You: {{msg}}\\n"
+        elif role == "ai":
+            conversation += f"AI: {{msg}}\\n"
+    
+    # Note: Most text-only LLMs cannot process images directly
+    # This provides context about the image and the user's question
+    image_context = f"[Camera frame captured at {{datetime.now().strftime('%H:%M:%S')}}. Frame dimensions: {{frame.shape[1]}}x{{frame.shape[0]}} pixels. Base64 encoded size: {{len(base64_image)}} bytes]"
+    
+    # Add current instruction with image context
+    conversation += f"You: {{image_context}} {{instruction}}\\nAI:"
+    
+    # Full prompt
+    full_prompt = f"{{system_prompt}}\\n\\n{{conversation}}"
+    
+    # Generate response
+    try:
+        print(f"{{Colors.CYAN}}🤖 AI is analyzing...{{Colors.RESET}}", end='', flush=True)
+        response = ai_engine.generate(full_prompt)
+        print(f"\\r{{Colors.BRIGHT_GREEN}}✓ Response ready{{Colors.RESET}}" + " " * 30)
+        return response
+    except Exception as e:
+        return f"Error: {{str(e)}}"
+
+print(f"{{Colors.CYAN}}Instructions:{{Colors.RESET}}")
+print(f"  - Camera will capture frames every {{CAPTURE_INTERVAL}} seconds")
+print(f"  - Type your question/instruction and press ENTER")
+print(f"  - The frame will be captured and sent to the AI for analysis")
+print(f"  - Type '{{Colors.BRIGHT_RED}}exit{{Colors.RESET}}' or '{{Colors.BRIGHT_RED}}quit{{Colors.RESET}}' to stop")
+print(f"  - Press {{Colors.BRIGHT_GREEN}}ENTER{{Colors.RESET}} without text to capture with default prompt\\n")
+
+# Show camera preview window
+cv2.namedWindow('Camera Preview', cv2.WINDOW_NORMAL)
+cv2.resizeWindow('Camera Preview', FRAME_WIDTH, FRAME_HEIGHT)
+
+print(f"{{Colors.BRIGHT_GREEN}}✓ Camera preview window opened{{Colors.RESET}}")
+print(f"{{Colors.DIM}}Position the camera and adjust as needed{{Colors.RESET}}\\n")
+
+# Conversation history for context
+conversation_history = []
+last_input_time = time.time()
+input_mode = False
+current_input = ""
+
+print(f"{{Colors.CYAN}}Press SPACE to enter instruction, ESC to exit{{Colors.RESET}}\\n")
+
+try:
+    while True:
+        # Update camera preview
+        frame = capture_frame()
+        if frame is not None:
+            # Add timestamp overlay
+            timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            cv2.putText(frame, timestamp, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            cv2.putText(frame, "Sight Mode - AI Vision", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+            
+            # Add instruction if in input mode
+            if input_mode:
+                cv2.putText(frame, "Type instruction in terminal...", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
+            
+            cv2.imshow('Camera Preview', frame)
+        
+        # Check for keyboard input
+        key = cv2.waitKey(100)
+        if key == 27:  # ESC key
+            print(f"\\n{{Colors.BRIGHT_YELLOW}}ESC pressed. Exiting...{{Colors.RESET}}")
+            break
+        elif key == 32:  # SPACE key
+            input_mode = True
+            instruction = input(f"\\n{{Colors.BRIGHT_GREEN}}Instruction (or 'exit' to quit): {{Colors.RESET}}").strip()
+            input_mode = False
+            
+            if instruction.lower() in ['exit', 'quit', 'q']:
+                break
+            
+            if instruction:
+                # Capture and process frame
+                frame = capture_frame()
+                if frame is not None:
+                    print(f"{{Colors.BRIGHT_CYAN}}📸 Capturing frame for analysis...{{Colors.RESET}}")
+                    response = process_frame(frame, instruction, conversation_history)
+                    
+                    # Save to conversation history
+                    conversation_history.append(("user", instruction))
+                    conversation_history.append(("ai", response))
+                    
+                    # Display response
+                    print(f"\\n{{Colors.BRIGHT_GREEN}}AI Response:{{Colors.RESET}} {{Colors.BRIGHT_WHITE}}{{response}}{{Colors.RESET}}\\n")
+                    print(f"{{Colors.DIM}}Press SPACE for next instruction{{Colors.RESET}}\\n")
+            else:
+                print(f"{{Colors.YELLOW}}⚠ Empty instruction. Press SPACE to try again.{{Colors.RESET}}")
+
+except KeyboardInterrupt:
+    print(f"\\n{{Colors.BRIGHT_YELLOW}}Interrupted. Exiting...{{Colors.RESET}}")
+except Exception as e:
+    print(f"{{Colors.BRIGHT_RED}}✗ Error: {{e}}{{Colors.RESET}}")
+finally:
+    cap.release()
+    cv2.destroyAllWindows()
+    print(f"{{Colors.BRIGHT_GREEN}}✓ Camera released{{Colors.RESET}}")
+'''
+        
+        try:
+            with open(sight_script_path, 'w', encoding='utf-8') as f:
+                f.write(sight_script)
+            
+            print(f"\n{Colors.BRIGHT_GREEN}✓ Sight mode script created{Colors.RESET}")
+            print(f"{Colors.CYAN}Launching in new terminal...{Colors.RESET}\n")
+            
+            # Launch in new terminal based on OS
+            system = platform.system()
+            if system == "Windows":
+                subprocess.Popen(f'start cmd /k "python \\"{sight_script_path}\\""', shell=True)
+            elif system == "Darwin":  # macOS
+                subprocess.Popen(['open', '-a', 'Terminal', sight_script_path])
+            else:  # Linux
+                # Try common terminal emulators
+                for terminal in ['gnome-terminal', 'konsole', 'xterm']:
+                    try:
+                        subprocess.Popen([terminal, '--', 'python3', sight_script_path])
+                        break
+                    except FileNotFoundError:
+                        continue
+            
+            print(f"{Colors.BRIGHT_GREEN}✓ Sight mode launched in new terminal{Colors.RESET}")
+            print(f"{Colors.DIM}The camera preview and vision analysis will run independently.{Colors.RESET}")
+            time.sleep(2)
+            
+        except Exception as e:
+            print(f"{Colors.BRIGHT_RED}✗ Failed to launch Sight mode: {e}{Colors.RESET}")
+            time.sleep(2)
 
 if __name__ == "__main__":
     app = App()
