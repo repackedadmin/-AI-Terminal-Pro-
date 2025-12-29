@@ -20,6 +20,7 @@ import re
 import threading
 import hashlib
 import base64
+import shlex
 from datetime import datetime
 from bs4 import BeautifulSoup
 from transformers import AutoTokenizer, AutoModelForCausalLM
@@ -117,11 +118,19 @@ DEFAULT_CONFIG = {
     "first_run": True,
     "backend": "huggingface",  # Options: "huggingface" or "ollama"
     "model_name": "gpt2",      # Options: "gpt2", "gpt2-xl", "llama3", "mistral"
-    "system_prompt": "You are a helpful AI assistant with full OS awareness and extensive memory capabilities. You have access to a large context window (32K+ tokens) and can maintain context across long conversations and complex projects. You automatically detect the operating system and use platform-appropriate commands. When working on projects, you remember project context, previous decisions, and ongoing work. When asked to perform a task, use the available ACTION tools with OS-specific commands. CRITICAL: When generating scripts (batch, PowerShell, bash, Python, etc.), always write the COMPLETE, FULL script from start to finish - never truncate, cut off, or leave scripts incomplete.",
+    "system_prompt": "You are a helpful AI assistant with full OS awareness and extensive memory capabilities. You have access to a large context window (32K+ tokens) and can maintain context across long conversations and complex projects. You automatically detect the operating system and use platform-appropriate commands. When working on projects, you remember project context, previous decisions, and ongoing work. When asked to perform a task, use the available ACTION tools with OS-specific commands. IMPORTANT: When asked to browse the web or interact with websites, you can use browser interaction commands. For example, to search Google and click results: 1) Use ACTION: BROWSE_SEARCH [query] to search Google, 2) Use ACTION: BROWSE_CLICK_FIRST to click the first result, 3) Use ACTION: BROWSE_WAIT [ms] to wait for pages to load. You can also use BROWSE_CLICK, BROWSE_TYPE, and BROWSE_PRESS to interact with page elements. The browser is VISIBLE so the user can see all your actions in real-time. After completing browser actions, provide your summary/analysis. CRITICAL: When generating scripts (batch, PowerShell, bash, Python, etc.), always write the COMPLETE, FULL script from start to finish - never truncate, cut off, or leave scripts incomplete.",
     "enable_dangerous_commands": False,  # Safety lock for file system/terminal
     "max_context_window": 32768,  # Large context window for project assistance and long conversations
     "max_response_tokens": 2000,  # Increased for script generation and longer responses
-    "temperature": 0.7
+    "temperature": 0.7,
+    # Default external editor command (used when creating tools / MCP servers)
+    # Example values:
+    #   "code"         (VS Code)
+    #   "cursor"       (Cursor)
+    #   "notepad++"    (Notepad++)
+    #   "sublime_text" (Sublime Text)
+    #   "notepad"      (Windows Notepad)
+    "default_editor_command": ""
 }
 
 # ==============================================================================
@@ -1127,6 +1136,274 @@ class APIServerManager:
 #                           5. TOOL REGISTRY & PATH RESOLVER
 # ==============================================================================
 
+class BrowserManager:
+    """Manages a persistent Playwright browser instance for web interactions."""
+    def __init__(self):
+        self.playwright = None
+        self.browser = None
+        self.context = None
+        self.page = None
+        self.pages = []  # Track multiple pages/tabs
+        self.is_open = False
+    
+    def launch(self, headless=False):
+        """Launch a browser instance."""
+        if not PLAYWRIGHT_AVAILABLE:
+            return False
+        
+        try:
+            if not self.is_open:
+                self.playwright = sync_playwright().start()
+                self.browser = self.playwright.chromium.launch(
+                    headless=headless,
+                    args=['--start-maximized'] if not headless else []
+                )
+                self.context = self.browser.new_context(
+                    user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                    viewport={'width': 1920, 'height': 1080} if headless else None
+                )
+                self.page = self.context.new_page()
+                self.is_open = True
+            return True
+        except Exception as e:
+            print(f"{Colors.BRIGHT_RED}[BROWSER]{Colors.RESET} Failed to launch browser: {e}")
+            return False
+    
+    def close(self):
+        """Close the browser instance."""
+        try:
+            if self.page:
+                self.page.close()
+            if self.context:
+                self.context.close()
+            if self.browser:
+                self.browser.close()
+            if self.playwright:
+                self.playwright.stop()
+            self.is_open = False
+        except Exception:
+            pass
+    
+    def navigate(self, url):
+        """Navigate to a URL."""
+        if not self.is_open or not self.page:
+            return False
+        try:
+            if not url.startswith(("http://", "https://")):
+                url = "https://" + url
+            self.page.goto(url, wait_until="networkidle", timeout=30000)
+            self.page.wait_for_timeout(2000)
+            return True
+        except Exception as e:
+            return f"Navigation error: {e}"
+    
+    def get_content(self, page=None):
+        """Get page content from a specific page or the current page."""
+        target_page = page or self.page
+        if not self.is_open or not target_page:
+            return None
+        try:
+            content = target_page.evaluate("""
+                () => {
+                    const scripts = document.querySelectorAll('script, style, noscript');
+                    scripts.forEach(el => el.remove());
+                    const main = document.querySelector('main, article, [role="main"]') || document.body;
+                    return {
+                        title: document.title,
+                        content: main.innerText || main.textContent || '',
+                        url: window.location.href
+                    };
+                }
+            """)
+            return content
+        except Exception as e:
+            return {"error": str(e)}
+    
+    def open_new_tab(self, url):
+        """Open a new tab and navigate to URL."""
+        if not self.is_open or not self.context:
+            return None
+        try:
+            new_page = self.context.new_page()
+            if not url.startswith(("http://", "https://")):
+                url = "https://" + url
+            new_page.goto(url, wait_until="networkidle", timeout=30000)
+            new_page.wait_for_timeout(2000)
+            self.pages.append(new_page)
+            return new_page
+        except Exception as e:
+            return None
+    
+    def browse_multiple(self, urls):
+        """Browse multiple URLs, opening each in a new tab."""
+        if not self.is_open:
+            return []
+        
+        results = []
+        # Navigate main page to first URL
+        if urls:
+            first_url = urls[0]
+            if not first_url.startswith(("http://", "https://")):
+                first_url = "https://" + first_url
+            nav_result = self.navigate(first_url)
+            if nav_result == True:
+                content = self.get_content(self.page)
+                if content:
+                    results.append(content)
+            
+            # Open remaining URLs in new tabs
+            for url in urls[1:]:
+                new_page = self.open_new_tab(url)
+                if new_page:
+                    content = self.get_content(new_page)
+                    if content:
+                        results.append(content)
+        
+        return results
+    
+    def click(self, selector, page=None):
+        """Click an element on the page by selector."""
+        target_page = page or self.page
+        if not self.is_open or not target_page:
+            return False, "Browser not open"
+        try:
+            target_page.wait_for_selector(selector, timeout=10000)
+            target_page.click(selector)
+            target_page.wait_for_timeout(1000)  # Wait for page to react
+            return True, f"Clicked element: {selector}"
+        except Exception as e:
+            return False, f"Click failed: {str(e)}"
+    
+    def type_text(self, selector, text, page=None):
+        """Type text into an input field."""
+        target_page = page or self.page
+        if not self.is_open or not target_page:
+            return False, "Browser not open"
+        try:
+            target_page.wait_for_selector(selector, timeout=10000)
+            target_page.fill(selector, text)
+            target_page.wait_for_timeout(500)
+            return True, f"Typed '{text}' into {selector}"
+        except Exception as e:
+            return False, f"Type failed: {str(e)}"
+    
+    def press_key(self, selector, key, page=None):
+        """Press a key in an element (e.g., Enter in search box)."""
+        target_page = page or self.page
+        if not self.is_open or not target_page:
+            return False, "Browser not open"
+        try:
+            target_page.wait_for_selector(selector, timeout=10000)
+            target_page.press(selector, key)
+            target_page.wait_for_timeout(1000)
+            return True, f"Pressed {key} in {selector}"
+        except Exception as e:
+            return False, f"Press key failed: {str(e)}"
+    
+    def search_google(self, query, page=None):
+        """Perform a Google search."""
+        target_page = page or self.page
+        if not self.is_open or not target_page:
+            return False, "Browser not open"
+        try:
+            # Navigate to Google if not already there
+            current_url = target_page.url
+            if "google.com" not in current_url.lower():
+                target_page.goto("https://www.google.com", wait_until="networkidle", timeout=30000)
+                target_page.wait_for_timeout(2000)
+            
+            # Find and fill search box
+            search_selectors = [
+                'textarea[name="q"]',
+                'input[name="q"]',
+                'textarea[aria-label*="Search"]',
+                'input[aria-label*="Search"]'
+            ]
+            
+            search_box = None
+            for selector in search_selectors:
+                try:
+                    target_page.wait_for_selector(selector, timeout=5000)
+                    search_box = selector
+                    break
+                except:
+                    continue
+            
+            if not search_box:
+                return False, "Could not find Google search box"
+            
+            target_page.fill(search_box, query)
+            target_page.wait_for_timeout(500)
+            target_page.press(search_box, "Enter")
+            target_page.wait_for_timeout(3000)  # Wait for results
+            
+            return True, f"Search completed for: {query}"
+        except Exception as e:
+            return False, f"Google search failed: {str(e)}"
+    
+    def click_first_result(self, page=None):
+        """Click the first search result on Google."""
+        target_page = page or self.page
+        if not self.is_open or not target_page:
+            return False, "Browser not open"
+        try:
+            # Wait for search results
+            target_page.wait_for_timeout(2000)
+            
+            # Try different selectors for Google search results
+            # Google search results are typically in div.g with links
+            result_selectors = [
+                'div.g a',  # Google result link (most reliable)
+                'div[data-ved] a',
+                'a[data-ved]',  # Direct link with data-ved attribute
+                'h3 a',  # Link inside h3 heading
+            ]
+            
+            clicked = False
+            for selector in result_selectors:
+                try:
+                    # Wait for selector to appear
+                    target_page.wait_for_selector(selector, timeout=5000)
+                    # Get all matching elements
+                    elements = target_page.query_selector_all(selector)
+                    if elements and len(elements) > 0:
+                        # Click the first result
+                        first_link = elements[0]
+                        first_link.click()
+                        target_page.wait_for_timeout(3000)  # Wait for navigation
+                        clicked = True
+                        break
+                except Exception:
+                    continue
+            
+            if clicked:
+                return True, "Clicked first search result"
+            else:
+                return False, "Could not find search results to click"
+        except Exception as e:
+            return False, f"Click first result failed: {str(e)}"
+    
+    def wait(self, milliseconds, page=None):
+        """Wait for specified milliseconds."""
+        target_page = page or self.page
+        if not self.is_open or not target_page:
+            return False, "Browser not open"
+        try:
+            target_page.wait_for_timeout(milliseconds)
+            return True, f"Waited {milliseconds}ms"
+        except Exception as e:
+            return False, f"Wait failed: {str(e)}"
+    
+    def get_current_url(self, page=None):
+        """Get the current page URL."""
+        target_page = page or self.page
+        if not self.is_open or not target_page:
+            return None
+        try:
+            return target_page.url
+        except:
+            return None
+
 class ToolRegistry:
     """Manages Native Tools, Custom Scripts, and MCP Clients."""
     def __init__(self, config):
@@ -1134,6 +1411,7 @@ class ToolRegistry:
         self.mcp_clients = {}
         self.custom_tool_manager = CustomToolManager()
         self.playwright_browsers_installed = False
+        self.browser_manager = BrowserManager() if PLAYWRIGHT_AVAILABLE else None
         self.load_mcp_servers()
         # Check Playwright browsers in background to avoid blocking startup
         threading.Thread(target=self._ensure_playwright_browsers, daemon=True).start()
@@ -1241,9 +1519,33 @@ class ToolRegistry:
             p += "     Linux Commands: mkdir folder, touch file.txt, ls, rm, cat\n"
             p += "     Desktop Access: Use ~/Desktop/ or /home/username/Desktop/\n"
         
-        p += "   - ACTION: BROWSE [url] (Uses Playwright for full browser rendering with JavaScript support)\n"
+        p += "   - ACTION: BROWSE [url(s)] (Launches VISIBLE Playwright browser for web browsing and interaction)\n"
         if PLAYWRIGHT_AVAILABLE:
-            p += "     Playwright is available - can handle dynamic content, SPAs, and JavaScript-heavy sites\n"
+            p += "     IMPORTANT: Browser launches in VISIBLE mode - user can see and interact with it!\n"
+            p += "     The browser stays open for continued interaction. Can handle dynamic content, SPAs, JavaScript.\n"
+            p += "     MULTIPLE URLS: You can browse multiple websites in one request!\n"
+            p += "       - Separate URLs by comma: ACTION: BROWSE https://site1.com, https://site2.com\n"
+            p += "       - Or by pipe: ACTION: BROWSE https://site1.com | https://site2.com\n"
+            p += "       - Or by space: ACTION: BROWSE https://site1.com https://site2.com\n"
+            p += "       Each URL opens in a separate browser tab.\n"
+            p += "     CRITICAL: ONLY provide the URL(s) in the BROWSE action - no additional text, summaries, or explanations!\n"
+            p += "     Format: ACTION: BROWSE https://example.com (ONLY the URL(s), nothing else on that line)\n"
+            p += "     Examples:\n"
+            p += "       Single: ACTION: BROWSE https://example.com\n"
+            p += "       Multiple: ACTION: BROWSE https://example.com, https://google.com, https://github.com\n"
+            p += "\n   BROWSER INTERACTION COMMANDS (use after BROWSE to interact with pages):\n"
+            p += "   - ACTION: BROWSE_SEARCH [query] (Perform Google search - opens Google and searches)\n"
+            p += "   - ACTION: BROWSE_CLICK_FIRST (Click the first Google search result)\n"
+            p += "   - ACTION: BROWSE_CLICK [selector] (Click an element by CSS selector, e.g., 'button#submit')\n"
+            p += "   - ACTION: BROWSE_TYPE [selector] | [text] (Type text into an input field)\n"
+            p += "   - ACTION: BROWSE_PRESS [selector] | [key] (Press a key like Enter, Escape, etc.)\n"
+            p += "   - ACTION: BROWSE_WAIT [milliseconds] (Wait for page to load, e.g., BROWSE_WAIT 2000)\n"
+            p += "   Example workflow:\n"
+            p += "     1. ACTION: BROWSE https://google.com\n"
+            p += "     2. ACTION: BROWSE_SEARCH repacked.online\n"
+            p += "     3. ACTION: BROWSE_WAIT 2000\n"
+            p += "     4. ACTION: BROWSE_CLICK_FIRST\n"
+            p += "     5. Then provide summary of the site\n"
         else:
             p += "     Note: Playwright not installed - using basic HTTP requests (install with: pip install playwright && python -m playwright install)\n"
         p += "   - ACTION: FILE_READ [path] (Reads file content)\n"
@@ -1360,7 +1662,100 @@ class ToolRegistry:
                 return f"CMD Error: {e.output}"
         
         elif action == "BROWSE":
-            return self._browse(args.strip())
+            # Extract only the URL - stop at newlines, extra text, or other delimiters
+            url = args.strip()
+            # Remove any trailing text after the URL (LLM sometimes adds summaries)
+            # URL should end with a space, newline, or be the last thing
+            if '\n' in url:
+                url = url.split('\n')[0].strip()
+            # Remove common trailing patterns that aren't URLs
+            url = url.split('**')[0].strip()  # Remove markdown formatting
+            url = url.split('Summary:')[0].strip()  # Remove summary text
+            url = url.split('Summary')[0].strip()
+            # Clean up any remaining whitespace
+            url = url.strip()
+            return self._browse(url)
+        
+        elif action == "BROWSE_CLICK":
+            # Click an element: BROWSE_CLICK selector
+            if not PLAYWRIGHT_AVAILABLE or not self.browser_manager or not self.browser_manager.is_open:
+                return "Error: Browser not open. Use BROWSE first to open a website."
+            selector = args.strip()
+            success, message = self.browser_manager.click(selector)
+            if success:
+                return f"✓ {message}"
+            else:
+                return f"✗ {message}"
+        
+        elif action == "BROWSE_TYPE":
+            # Type text into a field: BROWSE_TYPE selector | text
+            if not PLAYWRIGHT_AVAILABLE or not self.browser_manager or not self.browser_manager.is_open:
+                return "Error: Browser not open. Use BROWSE first to open a website."
+            if "|" not in args:
+                return "Error: Use format 'BROWSE_TYPE selector | text'"
+            selector, text = args.split("|", 1)
+            selector = selector.strip()
+            text = text.strip()
+            success, message = self.browser_manager.type_text(selector, text)
+            if success:
+                return f"✓ {message}"
+            else:
+                return f"✗ {message}"
+        
+        elif action == "BROWSE_PRESS":
+            # Press a key: BROWSE_PRESS selector | key
+            if not PLAYWRIGHT_AVAILABLE or not self.browser_manager or not self.browser_manager.is_open:
+                return "Error: Browser not open. Use BROWSE first to open a website."
+            if "|" not in args:
+                return "Error: Use format 'BROWSE_PRESS selector | key' (e.g., Enter, Escape)"
+            selector, key = args.split("|", 1)
+            selector = selector.strip()
+            key = key.strip()
+            success, message = self.browser_manager.press_key(selector, key)
+            if success:
+                return f"✓ {message}"
+            else:
+                return f"✗ {message}"
+        
+        elif action == "BROWSE_SEARCH":
+            # Perform Google search: BROWSE_SEARCH query
+            if not PLAYWRIGHT_AVAILABLE or not self.browser_manager:
+                return "Error: Browser not available. Use BROWSE first."
+            if not self.browser_manager.is_open:
+                # Launch browser if not open
+                print(f"{Colors.BRIGHT_CYAN}[BROWSER]{Colors.RESET} Launching browser for search...")
+                if not self.browser_manager.launch(headless=False):
+                    return "Error: Failed to launch browser."
+            query = args.strip()
+            success, message = self.browser_manager.search_google(query)
+            if success:
+                return f"✓ {message}"
+            else:
+                return f"✗ {message}"
+        
+        elif action == "BROWSE_CLICK_FIRST":
+            # Click first search result: BROWSE_CLICK_FIRST
+            if not PLAYWRIGHT_AVAILABLE or not self.browser_manager or not self.browser_manager.is_open:
+                return "Error: Browser not open. Use BROWSE_SEARCH first."
+            success, message = self.browser_manager.click_first_result()
+            if success:
+                return f"✓ {message}"
+            else:
+                return f"✗ {message}"
+        
+        elif action == "BROWSE_WAIT":
+            # Wait: BROWSE_WAIT milliseconds
+            if not PLAYWRIGHT_AVAILABLE or not self.browser_manager or not self.browser_manager.is_open:
+                return "Error: Browser not open."
+            try:
+                ms = int(args.strip())
+                success, message = self.browser_manager.wait(ms)
+                if success:
+                    return f"✓ {message}"
+                else:
+                    return f"✗ {message}"
+            except ValueError:
+                return "Error: BROWSE_WAIT requires a number (milliseconds)"
 
         elif action == "FILE_LIST":
             target = self.resolve_path(args) if args else SANDBOX_DIR
@@ -1392,85 +1787,168 @@ class ToolRegistry:
 
         return "Unknown Action."
 
-    def _browse(self, url):
-        """Browse web using Playwright for full browser rendering and JavaScript support."""
-        # Sanitize URL
-        url = url.replace('[', '').replace(']', '').replace('"', '').replace("'", "").strip()
-        if not url:
-            return "Error: No URL provided"
+    def _parse_urls(self, url_string):
+        """Parse multiple URLs from a string. Supports comma, space, newline, or pipe separation."""
+        # Remove brackets, quotes first
+        url_string = url_string.replace('[', '').replace(']', '').replace('"', '').replace("'", "").strip()
         
-        if not url.startswith(("http://", "https://")):
-            url = "https://" + url
+        # Remove trailing text that might have been included
+        for delimiter in ['\n', '\r', '**', 'Summary:', 'Summary', 'Description:', 'Note:', ' -', ' –']:
+            if delimiter in url_string:
+                url_string = url_string.split(delimiter)[0].strip()
+        
+        # Try different separators
+        urls = []
+        
+        # Try comma separation first
+        if ',' in url_string:
+            urls = [u.strip() for u in url_string.split(',')]
+        # Try pipe separation
+        elif '|' in url_string:
+            urls = [u.strip() for u in url_string.split('|')]
+        # Try newline separation
+        elif '\n' in url_string:
+            urls = [u.strip() for u in url_string.split('\n') if u.strip()]
+        # Try space separation (but be careful - URLs shouldn't have spaces)
+        elif ' ' in url_string and ('http://' in url_string or 'https://' in url_string):
+            # Only split on space if we see multiple http/https patterns
+            parts = url_string.split()
+            urls = []
+            current_url = ""
+            for part in parts:
+                if part.startswith(('http://', 'https://')):
+                    if current_url:
+                        urls.append(current_url.strip())
+                    current_url = part
+                elif current_url:
+                    current_url += " " + part
+                else:
+                    # Might be a domain without http
+                    if '.' in part and ' ' not in part:
+                        urls.append(part)
+            if current_url:
+                urls.append(current_url.strip())
+        else:
+            # Single URL
+            urls = [url_string.strip()]
+        
+        # Clean and validate URLs
+        cleaned_urls = []
+        for url in urls:
+            url = url.strip()
+            if not url:
+                continue
+            # Remove any remaining trailing text
+            for delimiter in ['\n', '\r', '**', 'Summary:', 'Summary', 'Description:', 'Note:']:
+                if delimiter in url:
+                    url = url.split(delimiter)[0].strip()
+            
+            # Validate URL format
+            if url and (url.startswith(("http://", "https://")) or ('.' in url and ' ' not in url)):
+                cleaned_urls.append(url)
+        
+        return cleaned_urls
+    
+    def _browse(self, url):
+        """Browse web using Playwright - supports single or multiple URLs. Launches VISIBLE browser."""
+        # Parse URLs (supports multiple URLs separated by comma, space, newline, or pipe)
+        urls = self._parse_urls(url)
+        
+        if not urls:
+            return "Error: No valid URL(s) provided"
         
         # Use Playwright if available
-        if PLAYWRIGHT_AVAILABLE:
+        if PLAYWRIGHT_AVAILABLE and self.browser_manager:
             try:
                 # Ensure browsers are installed
                 if not self.playwright_browsers_installed:
                     self._ensure_playwright_browsers()
                 
-                with sync_playwright() as p:
-                    # Launch browser in headless mode
-                    browser = p.chromium.launch(headless=True)
-                    context = browser.new_context(
-                        user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-                    )
-                    page = context.new_page()
+                # Launch browser in VISIBLE mode (headless=False) for user interaction
+                if not self.browser_manager.is_open:
+                    print(f"{Colors.BRIGHT_CYAN}[BROWSER]{Colors.RESET} Launching Playwright browser...")
+                    if not self.browser_manager.launch(headless=False):
+                        return "Failed to launch browser. Falling back to basic HTTP request."
+                    print(f"{Colors.BRIGHT_GREEN}[BROWSER]{Colors.RESET} Browser launched successfully!")
+                
+                # Handle multiple URLs
+                if len(urls) > 1:
+                    print(f"{Colors.BRIGHT_CYAN}[BROWSER]{Colors.RESET} Opening {len(urls)} websites in separate tabs...")
+                    results = self.browser_manager.browse_multiple(urls)
                     
-                    # Navigate to URL with timeout
-                    page.goto(url, wait_until="networkidle", timeout=30000)
-                    
-                    # Wait for page to load
-                    page.wait_for_timeout(2000)
-                    
-                    # Get page content
-                    # Try to get main content, fallback to body
-                    try:
-                        # Get visible text content
-                        content = page.evaluate("""
-                            () => {
-                                // Remove script and style elements
-                                const scripts = document.querySelectorAll('script, style, noscript');
-                                scripts.forEach(el => el.remove());
+                    if results:
+                        output = f"{Colors.BRIGHT_GREEN}[BROWSER]{Colors.RESET} Successfully opened {len(results)} website(s) in browser tabs:\n\n"
+                        
+                        for i, page_data in enumerate(results, 1):
+                            if "error" not in page_data:
+                                title = page_data.get("title", "No title")
+                                content = page_data.get("content", "")
+                                current_url = page_data.get("url", urls[i-1] if i-1 < len(urls) else "Unknown")
                                 
-                                // Get main content or body
-                                const main = document.querySelector('main, article, [role="main"]') || document.body;
-                                return main.innerText || main.textContent || '';
-                            }
-                        """)
-                    except:
-                        # Fallback to simple text extraction
-                        content = page.content()
-                        soup = BeautifulSoup(content, 'html.parser')
-                        for s in soup(["script", "style", "noscript"]):
-                            s.extract()
-                        content = soup.get_text()
+                                # Clean and format content
+                                lines = [line.strip() for line in content.splitlines() if line.strip()]
+                                text_content = '\n'.join(lines)
+                                
+                                # Limit content size
+                                if len(text_content) > 3000:
+                                    text_content = text_content[:3000] + "... [Truncated - see browser tab for full content]"
+                                
+                                output += f"{Colors.BRIGHT_CYAN}--- Tab {i}: {current_url} ---{Colors.RESET}\n"
+                                output += f"Title: {title}\n"
+                                output += f"Content Preview:\n{text_content}\n\n"
+                        
+                        output += f"{Colors.BRIGHT_CYAN}[NOTE]{Colors.RESET} All websites are open in browser tabs. "
+                        output += "You can switch between tabs to view each site."
+                        return output
+                    else:
+                        return "Error: Failed to open websites in browser tabs."
+                
+                else:
+                    # Single URL - use existing logic
+                    url = urls[0]
+                    if not url.startswith(("http://", "https://")):
+                        url = "https://" + url
                     
-                    # Get page title
-                    try:
-                        title = page.title()
-                    except:
-                        title = "No title"
+                    nav_result = self.browser_manager.navigate(url)
+                    if nav_result != True:
+                        return f"Navigation failed: {nav_result}"
                     
-                    browser.close()
-                    
-                    # Clean and format content
-                    lines = [line.strip() for line in content.splitlines() if line.strip()]
-                    text_content = '\n'.join(lines)
-                    
-                    # Limit to reasonable size
-                    if len(text_content) > 5000:
-                        text_content = text_content[:5000] + "... [Truncated]"
-                    
-                    result = f"Title: {title}\n\nContent:\n{text_content}"
-                    return result
+                    page_data = self.browser_manager.get_content()
+                    if page_data and "error" not in page_data:
+                        title = page_data.get("title", "No title")
+                        content = page_data.get("content", "")
+                        current_url = page_data.get("url", url)
+                        
+                        # Clean and format content
+                        lines = [line.strip() for line in content.splitlines() if line.strip()]
+                        text_content = '\n'.join(lines)
+                        
+                        # Limit to reasonable size for display
+                        if len(text_content) > 5000:
+                            text_content = text_content[:5000] + "... [Truncated - browser is open for full content]"
+                        
+                        result = f"Browser opened and navigated to: {current_url}\n"
+                        result += f"Title: {title}\n\n"
+                        result += f"Page Content:\n{text_content}\n\n"
+                        result += f"{Colors.BRIGHT_CYAN}[NOTE]{Colors.RESET} Browser window is open and ready for interaction. "
+                        result += "You can continue to interact with the page through the browser."
+                        return result
+                    else:
+                        error_msg = page_data.get("error", "Unknown error") if page_data else "Failed to get content"
+                        return f"Error getting page content: {error_msg}"
                     
             except Exception as e:
                 # Fallback to requests if Playwright fails
-                return self._browse_fallback(url, str(e))
+                if len(urls) == 1:
+                    return self._browse_fallback(urls[0], str(e))
+                else:
+                    return f"Error browsing multiple sites: {e}"
         else:
             # Fallback to requests if Playwright not available
-            return self._browse_fallback(url, "Playwright not installed")
+            if len(urls) == 1:
+                return self._browse_fallback(urls[0], "Playwright not installed")
+            else:
+                return "Error: Multiple URL browsing requires Playwright. Please install: pip install playwright && python -m playwright install"
     
     def _browse_fallback(self, url, error_msg=""):
         """Fallback browsing method using requests and BeautifulSoup."""
@@ -3415,9 +3893,13 @@ class App:
         danger_color = Colors.BRIGHT_RED if self.config.get('enable_dangerous_commands') else Colors.BRIGHT_GREEN
         print(f"{Colors.CYAN}Dangerous Commands:{Colors.RESET} {danger_color}{danger_status}{Colors.RESET}\n")
         
+        current_editor = self.config.get("default_editor_command") or "None (use OS default)"
+        print(f"{Colors.CYAN}Default Editor for Tools/MCP:{Colors.RESET} {Colors.BRIGHT_WHITE}{current_editor}{Colors.RESET}\n")
+        
         print(f"{Colors.BRIGHT_GREEN}  [1]{Colors.RESET} Toggle Dangerous Commands {Colors.DIM}(Allow writing outside sandbox){Colors.RESET}")
         print(f"{Colors.BRIGHT_GREEN}  [2]{Colors.RESET} Edit System Prompt")
-        print(f"{Colors.BRIGHT_GREEN}  [3]{Colors.RESET} Back\n")
+        print(f"{Colors.BRIGHT_GREEN}  [3]{Colors.RESET} Set Default Editor for Tools/MCP Servers")
+        print(f"{Colors.BRIGHT_GREEN}  [4]{Colors.RESET} Back\n")
         
         c = input(f"{Colors.BRIGHT_GREEN}Choice: {Colors.RESET}")
         if c == "1":
@@ -3436,6 +3918,113 @@ class App:
                 self.cfg_mgr.update("system_prompt", new_p)
                 print(f"{Colors.BRIGHT_GREEN}✓ System prompt updated{Colors.RESET}")
                 time.sleep(1)
+        elif c == "3":
+            # Configure default editor for tools / MCP servers
+            print(f"\n{Colors.CYAN}Configure Default Editor:{Colors.RESET}")
+            print(f"{Colors.DIM}This editor will be used to open new tools and MCP configuration files.{Colors.RESET}\n")
+            
+            # Detect common editors
+            candidates = []
+            platform_name = platform.system()
+            
+            # Common GUI editors
+            common_cmds = [
+                ("VS Code", "code"),
+                ("Cursor", "cursor"),
+                ("Notepad++", "notepad++"),
+                ("Sublime Text", "sublime_text"),
+                ("Visual Studio", "devenv"),
+                ("PyCharm", "pycharm"),
+            ]
+            
+            for label, cmd in common_cmds:
+                if shutil.which(cmd):
+                    candidates.append((label, cmd))
+            
+            # Always include OS default / custom
+            print(f"{Colors.CYAN}Available editors detected on this system:{Colors.RESET}\n")
+            idx = 1
+            print(f"  {Colors.CYAN}[{idx}]{Colors.RESET} {Colors.BRIGHT_WHITE}OS Default Editor{Colors.RESET} {Colors.DIM}(no custom command){Colors.RESET}")
+            idx += 1
+            
+            for label, cmd in candidates:
+                print(f"  {Colors.CYAN}[{idx}]{Colors.RESET} {Colors.BRIGHT_WHITE}{label}{Colors.RESET} {Colors.DIM}({cmd}){Colors.RESET}")
+                idx += 1
+            
+            print(f"  {Colors.CYAN}[{idx}]{Colors.RESET} {Colors.BRIGHT_WHITE}Custom Command{Colors.RESET}")
+            
+            choice = input(f"\n{Colors.BRIGHT_GREEN}Select editor [{1}-{idx}]: {Colors.RESET}").strip()
+            try:
+                choice_idx = int(choice)
+            except ValueError:
+                print(f"{Colors.YELLOW}⚠ Invalid selection. Editor not changed.{Colors.RESET}")
+                time.sleep(1.5)
+                return
+            
+            if choice_idx == 1:
+                # OS default
+                self.cfg_mgr.update("default_editor_command", "")
+                print(f"{Colors.BRIGHT_GREEN}✓ Default editor set to OS default{Colors.RESET}")
+                time.sleep(1.5)
+                return
+            
+            if 2 <= choice_idx < idx:
+                label, cmd = candidates[choice_idx - 2]
+                self.cfg_mgr.update("default_editor_command", cmd)
+                print(f"{Colors.BRIGHT_GREEN}✓ Default editor set to: {Colors.BRIGHT_WHITE}{label} ({cmd}){Colors.RESET}")
+                time.sleep(1.5)
+                return
+            
+            if choice_idx == idx:
+                custom_cmd = input(f"{Colors.BRIGHT_GREEN}Enter custom editor command (e.g., 'code', 'cursor', 'notepad++'): {Colors.RESET}").strip()
+                if custom_cmd:
+                    self.cfg_mgr.update("default_editor_command", custom_cmd)
+                    print(f"{Colors.BRIGHT_GREEN}✓ Default editor set to custom command: {Colors.BRIGHT_WHITE}{custom_cmd}{Colors.RESET}")
+                else:
+                    print(f"{Colors.YELLOW}⚠ Empty command. Editor not changed.{Colors.RESET}")
+                time.sleep(1.5)
+                return
+            
+            print(f"{Colors.YELLOW}⚠ Invalid selection. Editor not changed.{Colors.RESET}")
+            time.sleep(1.5)
+    
+    def open_in_default_editor(self, filepath):
+        """
+        Open a file in the configured default editor.
+        Falls back to OS default if no editor is configured.
+        """
+        try:
+            editor_cmd = self.config.get("default_editor_command") or self.cfg_mgr.get("default_editor_command")
+        except Exception:
+            editor_cmd = ""
+        
+        filepath = os.path.abspath(filepath)
+        
+        try:
+            if editor_cmd:
+                # Use configured editor command
+                if platform.system() == "Windows":
+                    # On Windows, allow commands like "code" or "notepad++"
+                    cmd = f'{editor_cmd} "{filepath}"'
+                    subprocess.Popen(cmd, shell=True)
+                else:
+                    # POSIX-style: split command and append filepath
+                    parts = shlex.split(editor_cmd)
+                    parts.append(filepath)
+                    subprocess.Popen(parts)
+                print(f"{Colors.DIM}Opened in editor: {editor_cmd} {filepath}{Colors.RESET}")
+            else:
+                # Fallback to OS default handler
+                system = platform.system()
+                if system == "Windows":
+                    os.startfile(filepath)
+                elif system == "Darwin":
+                    subprocess.Popen(["open", filepath])
+                else:
+                    subprocess.Popen(["xdg-open", filepath])
+                print(f"{Colors.DIM}Opened file with OS default editor: {filepath}{Colors.RESET}")
+        except Exception as e:
+            print(f"{Colors.BRIGHT_RED}✗ Failed to open editor: {e}{Colors.RESET}")
 
     def document_menu(self):
         self.clear()
@@ -3551,6 +4140,15 @@ class App:
                 
                 if self.registry.custom_tool_manager.create_python_tool(name, description, indented_code):
                     print(f"\n{Colors.BRIGHT_GREEN}✓ Python tool '{name}' created!{Colors.RESET}")
+                    # Offer to open in default editor
+                    try:
+                        filename = name if name.endswith(".py") else name + ".py"
+                        tool_path = os.path.join(CUSTOM_TOOLS_DIR, filename)
+                        open_choice = input(f"{Colors.BRIGHT_GREEN}Open tool in your default editor now? [Y/n]: {Colors.RESET}").strip().lower()
+                        if open_choice in ("", "y", "yes"):
+                            self.open_in_default_editor(tool_path)
+                    except Exception as e:
+                        print(f"{Colors.DIM}Editor open skipped: {e}{Colors.RESET}")
                 else:
                     print(f"\n{Colors.BRIGHT_RED}✗ Failed to create tool.{Colors.RESET}")
                 time.sleep(2)
@@ -3573,12 +4171,28 @@ class App:
                     command = input(f"{Colors.BRIGHT_GREEN}Command: {Colors.RESET}").strip()
                     if self.registry.custom_tool_manager.create_json_tool(name, description, command, is_script=False):
                         print(f"\n{Colors.BRIGHT_GREEN}✓ JSON tool '{name}' created!{Colors.RESET}")
+                        try:
+                            filename = name if name.endswith(".json") else name + ".json"
+                            tool_path = os.path.join(CUSTOM_TOOLS_DIR, filename)
+                            open_choice = input(f"{Colors.BRIGHT_GREEN}Open tool definition in your default editor now? [Y/n]: {Colors.RESET}").strip().lower()
+                            if open_choice in ("", "y", "yes"):
+                                self.open_in_default_editor(tool_path)
+                        except Exception as e:
+                            print(f"{Colors.DIM}Editor open skipped: {e}{Colors.RESET}")
                     else:
                         print(f"\n{Colors.BRIGHT_RED}✗ Failed to create tool.{Colors.RESET}")
                 else:
                     script_path = input(f"{Colors.BRIGHT_GREEN}Script File Path: {Colors.RESET}").strip()
                     if self.registry.custom_tool_manager.create_json_tool(name, description, script_path, is_script=True):
                         print(f"\n{Colors.BRIGHT_GREEN}✓ JSON tool '{name}' created!{Colors.RESET}")
+                        try:
+                            filename = name if name.endswith(".json") else name + ".json"
+                            tool_path = os.path.join(CUSTOM_TOOLS_DIR, filename)
+                            open_choice = input(f"{Colors.BRIGHT_GREEN}Open tool definition in your default editor now? [Y/n]: {Colors.RESET}").strip().lower()
+                            if open_choice in ("", "y", "yes"):
+                                self.open_in_default_editor(tool_path)
+                        except Exception as e:
+                            print(f"{Colors.DIM}Editor open skipped: {e}{Colors.RESET}")
                     else:
                         print(f"\n{Colors.BRIGHT_RED}✗ Failed to create tool.{Colors.RESET}")
                 time.sleep(2)
@@ -3609,12 +4223,34 @@ class App:
                     command = input(f"{Colors.BRIGHT_GREEN}Command: {Colors.RESET}").strip()
                     if self.registry.custom_tool_manager.create_yaml_tool(name, description, command, is_script=False):
                         print(f"\n{Colors.BRIGHT_GREEN}✓ YAML tool '{name}' created!{Colors.RESET}")
+                        try:
+                            if not (name.endswith(".yaml") or name.endswith(".yml")):
+                                filename = name + ".yaml"
+                            else:
+                                filename = name
+                            tool_path = os.path.join(CUSTOM_TOOLS_DIR, filename)
+                            open_choice = input(f"{Colors.BRIGHT_GREEN}Open tool definition in your default editor now? [Y/n]: {Colors.RESET}").strip().lower()
+                            if open_choice in ("", "y", "yes"):
+                                self.open_in_default_editor(tool_path)
+                        except Exception as e:
+                            print(f"{Colors.DIM}Editor open skipped: {e}{Colors.RESET}")
                     else:
                         print(f"\n{Colors.BRIGHT_RED}✗ Failed to create tool.{Colors.RESET}")
                 else:
                     script_path = input(f"{Colors.BRIGHT_GREEN}Script File Path: {Colors.RESET}").strip()
                     if self.registry.custom_tool_manager.create_yaml_tool(name, description, script_path, is_script=True):
                         print(f"\n{Colors.BRIGHT_GREEN}✓ YAML tool '{name}' created!{Colors.RESET}")
+                        try:
+                            if not (name.endswith(".yaml") or name.endswith(".yml")):
+                                filename = name + ".yaml"
+                            else:
+                                filename = name
+                            tool_path = os.path.join(CUSTOM_TOOLS_DIR, filename)
+                            open_choice = input(f"{Colors.BRIGHT_GREEN}Open tool definition in your default editor now? [Y/n]: {Colors.RESET}").strip().lower()
+                            if open_choice in ("", "y", "yes"):
+                                self.open_in_default_editor(tool_path)
+                        except Exception as e:
+                            print(f"{Colors.DIM}Editor open skipped: {e}{Colors.RESET}")
                     else:
                         print(f"\n{Colors.BRIGHT_RED}✗ Failed to create tool.{Colors.RESET}")
                 time.sleep(2)
@@ -3801,6 +4437,14 @@ class App:
                 d[server_name] = cmd
                 with open(MCP_CONFIG_FILE, 'w') as f:
                     json.dump(d, f, indent=4)
+                
+                # Offer to open MCP config in default editor
+                try:
+                    open_choice = input(f"{Colors.BRIGHT_GREEN}Open MCP config file in your default editor now? [Y/n]: {Colors.RESET}").strip().lower()
+                    if open_choice in ("", "y", "yes"):
+                        self.open_in_default_editor(MCP_CONFIG_FILE)
+                except Exception as e:
+                    print(f"{Colors.DIM}Editor open skipped: {e}{Colors.RESET}")
                 
                 # Try to start immediately if registry is available
                 if self.registry:
@@ -4977,16 +5621,63 @@ class App:
                             output = self.registry.execute_custom(script, args)
                             
                         else:
-                            # Native Tools (CMD, FILE_READ, etc)
+                            # Native Tools (CMD, FILE_READ, BROWSE, etc)
                             output = self.registry.execute_native(cmd_part)
                 
                     except Exception as e:
                         output = f"Execution Error: {str(e)}"
                     
-                    print(f"\n{Colors.BRIGHT_YELLOW}{Colors.BOLD}SYSTEM:{Colors.RESET} {Colors.BRIGHT_WHITE}{output}{Colors.RESET}")
-                    self.memory.save_message(self.current_session_id, "You", user_input)
-                    self.memory.save_message(self.current_session_id, "AI", response)
-                    self.memory.save_message(self.current_session_id, "System", str(output))
+                    # Special handling for BROWSE: don't dump full page content, generate a summary instead
+                    if action_type == "BROWSE":
+                        # Print concise system status
+                        print(f"\n{Colors.BRIGHT_YELLOW}{Colors.BOLD}SYSTEM:{Colors.RESET} {Colors.BRIGHT_WHITE}Browsing complete. Generating summary based on page content...{Colors.RESET}")
+                        
+                        # Build a focused summarization prompt
+                        summary_instruction = (
+                            "You are summarizing a web page that was just browsed using a browser tool.\n"
+                            "The user originally asked:\n"
+                            f"\"{user_input}\"\n\n"
+                            "You have the following raw page content (truncated if very long):\n"
+                            "----- PAGE CONTENT START -----\n"
+                            f"{str(output)[:8000]}\n"
+                            "----- PAGE CONTENT END -----\n\n"
+                            "Based on this content, provide a concise, high-level summary of the website in 3-5 sentences.\n"
+                            "- Focus on what the site is, what it offers, and who it's for.\n"
+                            "- Do NOT mention tools, Playwright, browsers, or that you are summarizing content.\n"
+                            "- Do NOT repeat large chunks of the page; just describe it.\n"
+                        )
+                        
+                        # Use the existing system prompt plus the tool prompt for consistent behavior
+                        summary_sys = self.config.get("system_prompt") + "\n\n" + summary_instruction
+                        summary_prompt = self.context_mgr.build_prompt(
+                            summary_sys,
+                            history,          # include recent history for extra context
+                            "",               # no additional RAG for summary
+                            user_input        # keep the original user request visible
+                        )
+                        
+                        # Temporarily bump response tokens for a good summary
+                        original_max = self.engine.config.get("max_response_tokens", 2000)
+                        self.engine.config["max_response_tokens"] = max(original_max, 512)
+                        try:
+                            summary = self.engine.generate(summary_prompt)
+                        finally:
+                            self.engine.config["max_response_tokens"] = original_max
+                        
+                        # Print AI summary (this is what the user sees)
+                        print(f"\n{Colors.BRIGHT_BLUE}{Colors.BOLD}AI (Summary):{Colors.RESET} {Colors.BRIGHT_WHITE}{summary}{Colors.RESET}")
+                        
+                        # Save conversation history
+                        self.memory.save_message(self.current_session_id, "You", user_input)
+                        self.memory.save_message(self.current_session_id, "AI", response)
+                        self.memory.save_message(self.current_session_id, "System", str(output))
+                        self.memory.save_message(self.current_session_id, "AI", summary)
+                    else:
+                        # Default behavior for non-BROWSE actions
+                        print(f"\n{Colors.BRIGHT_YELLOW}{Colors.BOLD}SYSTEM:{Colors.RESET} {Colors.BRIGHT_WHITE}{output}{Colors.RESET}")
+                        self.memory.save_message(self.current_session_id, "You", user_input)
+                        self.memory.save_message(self.current_session_id, "AI", response)
+                        self.memory.save_message(self.current_session_id, "System", str(output))
                     
                 else:
                     print(f"\n{Colors.BRIGHT_BLUE}{Colors.BOLD}AI:{Colors.RESET} {Colors.BRIGHT_WHITE}{response}{Colors.RESET}")
