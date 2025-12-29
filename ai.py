@@ -5838,6 +5838,8 @@ import soundfile as sf
 import numpy as np
 import requests
 import torch
+import threading
+import queue
 from datetime import datetime
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
@@ -5864,7 +5866,10 @@ class Colors:
 
 # Configuration
 SAMPLE_RATE = 16000
-DURATION = 5  # seconds per recording
+SILENCE_THRESHOLD = 0.01  # Audio level threshold for silence detection
+SILENCE_DURATION = 2.0  # Seconds of silence before auto-stop
+MAX_RECORDING_DURATION = 120  # Maximum 2 minutes per recording
+CHUNK_DURATION = 0.5  # Process audio in 0.5 second chunks
 MODEL_SIZE = "base"  # Options: tiny, base, small, medium, large
 TEMP_AUDIO_FILE = os.path.join("{BASE_DIR}", "_temp_audio.wav")
 CONFIG = {config_repr}
@@ -5982,8 +5987,102 @@ def speak(text):
         except Exception as e:
             print(f"{{Colors.YELLOW}}⚠ TTS error: {{e}}{{Colors.RESET}}")
 
-def record_audio(duration=DURATION):
-    """Record audio from microphone."""
+def detect_silence(audio_chunk, threshold=SILENCE_THRESHOLD):
+    """Detect if audio chunk is mostly silence."""
+    rms = np.sqrt(np.mean(audio_chunk**2))
+    return rms < threshold
+
+def record_audio_continuous():
+    """
+    Record audio continuously with automatic silence detection.
+    Stops recording after detecting sustained silence or on max duration.
+    Returns the complete audio recording.
+    """
+    
+    print(f"{{Colors.BRIGHT_GREEN}}🎤 Recording... Speak naturally (auto-stops after {{SILENCE_DURATION}}s silence){{Colors.RESET}}")
+    print(f"{{Colors.DIM}}   Press Ctrl+C to stop manually{{Colors.RESET}}")
+    
+    audio_queue = queue.Queue()
+    recording = True
+    
+    def audio_callback(indata, frames, time_info, status):
+        """Callback for audio stream."""
+        if status:
+            print(f"{{Colors.YELLOW}}Audio status: {{status}}{{Colors.RESET}}")
+        audio_queue.put(indata.copy())
+    
+    try:
+        # Start audio stream
+        stream = sd.InputStream(
+            samplerate=SAMPLE_RATE,
+            channels=1,
+            dtype='float32',
+            callback=audio_callback,
+            blocksize=int(SAMPLE_RATE * CHUNK_DURATION)
+        )
+        
+        stream.start()
+        
+        audio_chunks = []
+        silence_start = None
+        total_duration = 0
+        chunk_size = int(SAMPLE_RATE * CHUNK_DURATION)
+        
+        print(f"{{Colors.BRIGHT_CYAN}}● Recording in progress...{{Colors.RESET}}", end='', flush=True)
+        
+        while recording:
+            try:
+                # Get audio chunk (non-blocking with timeout)
+                chunk = audio_queue.get(timeout=CHUNK_DURATION)
+                audio_chunks.append(chunk)
+                total_duration += CHUNK_DURATION
+                
+                # Check for silence
+                is_silent = detect_silence(chunk)
+                
+                if is_silent:
+                    if silence_start is None:
+                        silence_start = total_duration
+                    elif (total_duration - silence_start) >= SILENCE_DURATION:
+                        # Sustained silence detected
+                        print(f"\\r{{Colors.BRIGHT_GREEN}}✓ Recording complete ({{total_duration:.1f}}s){{Colors.RESET}}" + " " * 30)
+                        break
+                else:
+                    # Reset silence detection if sound detected
+                    silence_start = None
+                    # Update recording indicator
+                    dots = "." * (int(total_duration) % 4)
+                    print(f"\\r{{Colors.BRIGHT_CYAN}}● Recording {{total_duration:.1f}}s{{dots}}{{Colors.RESET}}", end='', flush=True)
+                
+                # Check max duration
+                if total_duration >= MAX_RECORDING_DURATION:
+                    print(f"\\r{{Colors.BRIGHT_YELLOW}}⚠ Max duration reached ({{MAX_RECORDING_DURATION}}s){{Colors.RESET}}" + " " * 30)
+                    break
+                    
+            except queue.Empty:
+                continue
+            except KeyboardInterrupt:
+                print(f"\\r{{Colors.BRIGHT_YELLOW}}⚠ Recording stopped manually{{Colors.RESET}}" + " " * 30)
+                break
+        
+        stream.stop()
+        stream.close()
+        
+        # Combine all chunks
+        if audio_chunks:
+            audio = np.concatenate(audio_chunks, axis=0)
+            print(f"{{Colors.DIM}}   Recorded {{total_duration:.1f}} seconds of audio{{Colors.RESET}}")
+            return audio
+        else:
+            print(f"{{Colors.YELLOW}}⚠ No audio recorded{{Colors.RESET}}")
+            return None
+            
+    except Exception as e:
+        print(f"\\r{{Colors.BRIGHT_RED}}✗ Recording failed: {{e}}{{Colors.RESET}}" + " " * 30)
+        return None
+
+def record_audio_fixed(duration=5):
+    """Record audio for a fixed duration (fallback method)."""
     print(f"{{Colors.BRIGHT_GREEN}}🎤 Recording for {{duration}} seconds... (speak now){{Colors.RESET}}")
     try:
         audio = sd.rec(int(duration * SAMPLE_RATE), samplerate=SAMPLE_RATE, channels=1, dtype='float32')
@@ -6013,25 +6112,86 @@ def transcribe_audio(audio_data):
         print(f"{{Colors.BRIGHT_RED}}✗ Transcription failed: {{e}}{{Colors.RESET}}")
         return None
 
-def process_with_llm(user_text, conversation_history):
-    """Process user input with the LLM and return response."""
+def count_tokens_estimate(text):
+    """Estimate token count (rough approximation: 1 token ≈ 4 characters)."""
+    return len(text) // 4
+
+def manage_conversation_history(conversation_history, max_tokens=1500):
+    """
+    Intelligently manage conversation history to fit within token limits.
+    Keeps recent messages and summarizes or truncates older ones.
+    """
+    if not conversation_history:
+        return []
+    
+    # Always keep the last 20 messages (10 exchanges) for immediate context
+    recent_messages = conversation_history[-20:]
+    
+    # Calculate tokens for recent messages
+    recent_text = "\\n".join([f"{{role}}: {{msg}}" for role, msg in recent_messages])
+    recent_tokens = count_tokens_estimate(recent_text)
+    
+    # If recent messages fit, return them
+    if recent_tokens <= max_tokens:
+        return recent_messages
+    
+    # If recent messages exceed limit, progressively reduce
+    for i in range(10, 2, -1):  # Try keeping last 10, 9, 8... exchanges
+        truncated = conversation_history[-(i*2):]
+        text = "\\n".join([f"{{role}}: {{msg}}" for role, msg in truncated])
+        if count_tokens_estimate(text) <= max_tokens:
+            return truncated
+    
+    # Fallback: keep only last 4 messages (2 exchanges)
+    return conversation_history[-4:]
+
+def process_with_llm(user_text, conversation_history, turn_number=1):
+    """
+    Process user input with the LLM and return response.
+    Handles long conversations with intelligent history management.
+    """
     try:
         # Build prompt with conversation history
         system_prompt = CONFIG.get("system_prompt", "You are a helpful AI assistant.")
         
-        # Format conversation
+        # Get managed conversation history (fits within token limits)
+        managed_history = manage_conversation_history(conversation_history, max_tokens=1500)
+        
+        # Format conversation with clear structure
         conversation = ""
-        for role, msg in conversation_history[-10:]:  # Last 10 messages for context
-            if role == "user":
-                conversation += f"You: {{msg}}\\n"
-            elif role == "ai":
-                conversation += f"AI: {{msg}}\\n"
+        if managed_history:
+            conversation += "Previous conversation:\\n"
+            for role, msg in managed_history:
+                if role == "user":
+                    conversation += f"You: {{msg}}\\n"
+                elif role == "ai":
+                    conversation += f"AI: {{msg}}\\n"
+            conversation += "\\n"
         
         # Add current input
-        conversation += f"You: {{user_text}}\\nAI:"
+        conversation += f"Current question (Turn {{turn_number}}):\\nYou: {{user_text}}\\nAI:"
         
         # Full prompt
         full_prompt = f"{{system_prompt}}\\n\\n{{conversation}}"
+        
+        # Token management check
+        prompt_tokens = count_tokens_estimate(full_prompt)
+        max_context = CONFIG.get("max_context_window", 2048)
+        
+        if prompt_tokens > max_context * 0.7:  # Use 70% of context for prompt
+            # Aggressively truncate
+            managed_history = manage_conversation_history(conversation_history, max_tokens=800)
+            conversation = ""
+            if managed_history:
+                conversation += "Recent conversation:\\n"
+                for role, msg in managed_history[-6:]:  # Last 3 exchanges only
+                    if role == "user":
+                        conversation += f"You: {{msg}}\\n"
+                    elif role == "ai":
+                        conversation += f"AI: {{msg}}\\n"
+                conversation += "\\n"
+            conversation += f"You: {{user_text}}\\nAI:"
+            full_prompt = f"{{system_prompt}}\\n\\n{{conversation}}"
         
         # Generate response
         response = ai_engine.generate(full_prompt)
@@ -6039,42 +6199,133 @@ def process_with_llm(user_text, conversation_history):
     except Exception as e:
         return f"Error: {{str(e)}}"
 
+def save_conversation_to_file(conversation_history, filename="tts_conversation.txt"):
+    """Save the conversation history to a file."""
+    try:
+        filepath = os.path.join("{BASE_DIR}", filename)
+        with open(filepath, 'w', encoding='utf-8') as f:
+            f.write(f"TTS Conversation Log - {{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}}\\n")
+            f.write("=" * 79 + "\\n\\n")
+            for i, (role, msg) in enumerate(conversation_history, 1):
+                if role == "user":
+                    f.write(f"[{{i}}] You: {{msg}}\\n\\n")
+                elif role == "ai":
+                    f.write(f"[{{i}}] AI: {{msg}}\\n\\n")
+        return filepath
+    except Exception as e:
+        return None
+
 print(f"{{Colors.CYAN}}Instructions:{{Colors.RESET}}")
 print(f"  - Press {{Colors.BRIGHT_GREEN}}ENTER{{Colors.RESET}} to start recording")
-print(f"  - Speak your command/question ({{DURATION}}s recording)")
-print(f"  - Your speech will be transcribed and sent to the AI")
+print(f"  - Speak naturally - recording auto-stops after {{SILENCE_DURATION}}s of silence")
+print(f"  - Maximum recording time: {{MAX_RECORDING_DURATION}}s per turn")
+print(f"  - AI will respond with voice and text")
+print(f"  - Commands: '{{Colors.BRIGHT_YELLOW}}save{{Colors.RESET}}', '{{Colors.BRIGHT_YELLOW}}stats{{Colors.RESET}}', '{{Colors.BRIGHT_YELLOW}}clear{{Colors.RESET}}', '{{Colors.BRIGHT_YELLOW}}fixed{{Colors.RESET}}' (5s mode)")
 print(f"  - Type '{{Colors.BRIGHT_RED}}exit{{Colors.RESET}}' or '{{Colors.BRIGHT_RED}}quit{{Colors.RESET}}' to stop\\n")
 
 speak("Text to speech mode activated. Press enter to start recording.")
 
 # Conversation history for context
 conversation_history = []
+turn_number = 0
+use_continuous_mode = True  # Default to continuous recording
 
 while True:
     try:
-        user_action = input(f"{{Colors.BRIGHT_GREEN}}Press ENTER to record (or 'exit' to quit): {{Colors.RESET}}").strip().lower()
+        mode_indicator = "●" if use_continuous_mode else "⏱"
+        user_action = input(f"{{Colors.BRIGHT_GREEN}}[Turn {{turn_number + 1}}] {{mode_indicator}} Press ENTER to record (or command): {{Colors.RESET}}").strip().lower()
         
+        # Handle text commands
         if user_action in ['exit', 'quit', 'q']:
+            # Save conversation before exiting
+            if conversation_history:
+                print(f"\\n{{Colors.CYAN}}Saving conversation...{{Colors.RESET}}")
+                filepath = save_conversation_to_file(conversation_history)
+                if filepath:
+                    print(f"{{Colors.BRIGHT_GREEN}}✓ Conversation saved to: {{filepath}}{{Colors.RESET}}")
             speak("Goodbye")
             print(f"\\n{{Colors.BRIGHT_YELLOW}}Exiting TTS mode...{{Colors.RESET}}")
             break
         
-        # Record audio
-        audio_data = record_audio(DURATION)
-        if audio_data is None:
+        elif user_action == 'save':
+            if conversation_history:
+                filepath = save_conversation_to_file(conversation_history)
+                if filepath:
+                    print(f"{{Colors.BRIGHT_GREEN}}✓ Conversation saved to: {{filepath}}{{Colors.RESET}}\\n")
+                    speak("Conversation saved")
+                else:
+                    print(f"{{Colors.BRIGHT_RED}}✗ Failed to save conversation{{Colors.RESET}}\\n")
+            else:
+                print(f"{{Colors.YELLOW}}⚠ No conversation to save{{Colors.RESET}}\\n")
             continue
         
-        # Transcribe
-        transcribed_text = transcribe_audio(audio_data)
-        if not transcribed_text:
-            print(f"{{Colors.YELLOW}}⚠ No speech detected. Try again.{{Colors.RESET}}\\n")
+        elif user_action == 'stats':
+            if conversation_history:
+                user_msgs = [msg for role, msg in conversation_history if role == "user"]
+                ai_msgs = [msg for role, msg in conversation_history if role == "ai"]
+                total_text = " ".join([msg for _, msg in conversation_history])
+                estimated_tokens = count_tokens_estimate(total_text)
+                
+                print(f"\\n{{Colors.BRIGHT_CYAN}}Conversation Statistics:{{Colors.RESET}}")
+                print(f"  {{Colors.CYAN}}Total turns:{{Colors.RESET}} {{len(user_msgs)}}")
+                print(f"  {{Colors.CYAN}}User messages:{{Colors.RESET}} {{len(user_msgs)}}")
+                print(f"  {{Colors.CYAN}}AI responses:{{Colors.RESET}} {{len(ai_msgs)}}")
+                print(f"  {{Colors.CYAN}}Total characters:{{Colors.RESET}} {{len(total_text)}}")
+                print(f"  {{Colors.CYAN}}Estimated tokens:{{Colors.RESET}} {{estimated_tokens}}")
+                print(f"  {{Colors.CYAN}}History in context:{{Colors.RESET}} {{len(manage_conversation_history(conversation_history))}} messages\\n")
+                speak(f"You have had {{len(user_msgs)}} exchanges with the AI")
+            else:
+                print(f"{{Colors.YELLOW}}⚠ No conversation yet{{Colors.RESET}}\\n")
             continue
         
-        print(f"\\n{{Colors.BRIGHT_CYAN}}You said:{{Colors.RESET}} {{Colors.BRIGHT_YELLOW}}{{transcribed_text}}{{Colors.RESET}}\\n")
+        elif user_action == 'clear':
+            if conversation_history:
+                # Save before clearing
+                save_conversation_to_file(conversation_history, f"tts_conversation_backup_{{datetime.now().strftime('%Y%m%d_%H%M%S')}}.txt")
+                conversation_history.clear()
+                turn_number = 0
+                print(f"{{Colors.BRIGHT_GREEN}}✓ Conversation history cleared (backup saved){{Colors.RESET}}\\n")
+                speak("History cleared")
+            else:
+                print(f"{{Colors.YELLOW}}⚠ History is already empty{{Colors.RESET}}\\n")
+            continue
+        
+        elif user_action == 'fixed':
+            use_continuous_mode = not use_continuous_mode
+            mode_name = "Continuous (auto-stop on silence)" if use_continuous_mode else "Fixed (5 seconds)"
+            print(f"{{Colors.BRIGHT_CYAN}}✓ Recording mode: {{mode_name}}{{Colors.RESET}}\\n")
+            speak(f"Switched to {{'continuous' if use_continuous_mode else 'fixed'}} mode")
+            continue
+        
+        elif user_action and user_action not in ['', ' ']:
+            # Text input instead of voice
+            print(f"{{Colors.DIM}}(Using text input instead of voice){{Colors.RESET}}")
+            transcribed_text = user_action
+        else:
+            # Record audio (continuous or fixed mode)
+            if use_continuous_mode:
+                audio_data = record_audio_continuous()
+            else:
+                audio_data = record_audio_fixed(5)
+            
+            if audio_data is None:
+                continue
+            
+            # Transcribe
+            print(f"{{Colors.CYAN}}Transcribing audio...{{Colors.RESET}}", end='', flush=True)
+            transcribed_text = transcribe_audio(audio_data)
+            print(f"\\r{{Colors.BRIGHT_GREEN}}✓ Transcription complete{{Colors.RESET}}" + " " * 30)
+            
+            if not transcribed_text:
+                print(f"{{Colors.YELLOW}}⚠ No speech detected. Try again.{{Colors.RESET}}\\n")
+                continue
+        
+        turn_number += 1
+        print(f"\\n{{Colors.BRIGHT_CYAN}}[Turn {{turn_number}}] You said:{{Colors.RESET}} {{Colors.BRIGHT_YELLOW}}{{transcribed_text}}{{Colors.RESET}}\\n")
         
         # Process with LLM
         print(f"{{Colors.CYAN}}🤖 AI is thinking...{{Colors.RESET}}", end='', flush=True)
-        response = process_with_llm(transcribed_text, conversation_history)
+        response = process_with_llm(transcribed_text, conversation_history, turn_number)
         print(f"\\r{{Colors.BRIGHT_GREEN}}✓ Response ready{{Colors.RESET}}" + " " * 30)
         
         # Save to conversation history
@@ -6083,14 +6334,26 @@ while True:
         
         # Display and speak response
         print(f"\\n{{Colors.BRIGHT_GREEN}}AI Response:{{Colors.RESET}} {{Colors.BRIGHT_WHITE}}{{response}}{{Colors.RESET}}\\n")
+        
+        # Memory warning
+        if len(conversation_history) > 100:
+            print(f"{{Colors.YELLOW}}⚠ Conversation getting long ({{len(conversation_history)//2}} turns). Consider 'save' and 'clear' to manage memory.{{Colors.RESET}}\\n")
+        
         speak(response)
         
     except KeyboardInterrupt:
+        # Save conversation before exiting
+        if conversation_history:
+            print(f"\\n{{Colors.CYAN}}Saving conversation...{{Colors.RESET}}")
+            filepath = save_conversation_to_file(conversation_history)
+            if filepath:
+                print(f"{{Colors.BRIGHT_GREEN}}✓ Conversation saved to: {{filepath}}{{Colors.RESET}}")
         speak("Goodbye")
         print(f"\\n{{Colors.BRIGHT_YELLOW}}Exiting TTS mode...{{Colors.RESET}}")
         break
     except Exception as e:
         print(f"{{Colors.BRIGHT_RED}}✗ Error: {{e}}{{Colors.RESET}}\\n")
+        speak("An error occurred")
 '''
         
         try:
@@ -6282,8 +6545,44 @@ def encode_frame_base64(frame):
     jpg_as_text = base64.b64encode(buffer).decode('utf-8')
     return jpg_as_text
 
-def process_frame(frame, instruction="What do you see?", conversation_history=None):
-    """Process frame with LLM and return response."""
+def count_tokens_estimate(text):
+    """Estimate token count (rough approximation: 1 token ≈ 4 characters)."""
+    return len(text) // 4
+
+def manage_conversation_history(conversation_history, max_tokens=1500):
+    """
+    Intelligently manage conversation history to fit within token limits.
+    Keeps recent messages and summarizes or truncates older ones.
+    """
+    if not conversation_history:
+        return []
+    
+    # Always keep the last 20 messages (10 exchanges) for immediate context
+    recent_messages = conversation_history[-20:]
+    
+    # Calculate tokens for recent messages
+    recent_text = "\\n".join([f"{{role}}: {{msg}}" for role, msg in recent_messages])
+    recent_tokens = count_tokens_estimate(recent_text)
+    
+    # If recent messages fit, return them
+    if recent_tokens <= max_tokens:
+        return recent_messages
+    
+    # If recent messages exceed limit, progressively reduce
+    for i in range(10, 2, -1):  # Try keeping last 10, 9, 8... exchanges
+        truncated = conversation_history[-(i*2):]
+        text = "\\n".join([f"{{role}}: {{msg}}" for role, msg in truncated])
+        if count_tokens_estimate(text) <= max_tokens:
+            return truncated
+    
+    # Fallback: keep only last 4 messages (2 exchanges)
+    return conversation_history[-4:]
+
+def process_frame(frame, instruction="What do you see?", conversation_history=None, turn_number=1):
+    """
+    Process frame with LLM and return response.
+    Handles long conversations with intelligent history management.
+    """
     if conversation_history is None:
         conversation_history = []
     
@@ -6293,23 +6592,48 @@ def process_frame(frame, instruction="What do you see?", conversation_history=No
     # Build prompt with conversation history
     system_prompt = CONFIG.get("system_prompt", "You are a helpful AI assistant with vision capabilities.")
     
-    # Format conversation
+    # Get managed conversation history (fits within token limits)
+    managed_history = manage_conversation_history(conversation_history, max_tokens=1500)
+    
+    # Format conversation with clear structure
     conversation = ""
-    for role, msg in conversation_history[-10:]:  # Last 10 messages for context
-        if role == "user":
-            conversation += f"You: {{msg}}\\n"
-        elif role == "ai":
-            conversation += f"AI: {{msg}}\\n"
+    if managed_history:
+        conversation += "Previous conversation:\\n"
+        for role, msg in managed_history:
+            if role == "user":
+                conversation += f"You: {{msg}}\\n"
+            elif role == "ai":
+                conversation += f"AI: {{msg}}\\n"
+        conversation += "\\n"
     
     # Note: Most text-only LLMs cannot process images directly
     # This provides context about the image and the user's question
     image_context = f"[Camera frame captured at {{datetime.now().strftime('%H:%M:%S')}}. Frame dimensions: {{frame.shape[1]}}x{{frame.shape[0]}} pixels. Base64 encoded size: {{len(base64_image)}} bytes]"
     
     # Add current instruction with image context
-    conversation += f"You: {{image_context}} {{instruction}}\\nAI:"
+    conversation += f"Current question (Turn {{turn_number}}):\\nYou: {{image_context}} {{instruction}}\\nAI:"
     
     # Full prompt
     full_prompt = f"{{system_prompt}}\\n\\n{{conversation}}"
+    
+    # Token management check
+    prompt_tokens = count_tokens_estimate(full_prompt)
+    max_context = CONFIG.get("max_context_window", 2048)
+    
+    if prompt_tokens > max_context * 0.7:  # Use 70% of context for prompt
+        # Aggressively truncate
+        managed_history = manage_conversation_history(conversation_history, max_tokens=800)
+        conversation = ""
+        if managed_history:
+            conversation += "Recent conversation:\\n"
+            for role, msg in managed_history[-6:]:  # Last 3 exchanges only
+                if role == "user":
+                    conversation += f"You: {{msg}}\\n"
+                elif role == "ai":
+                    conversation += f"AI: {{msg}}\\n"
+            conversation += "\\n"
+        conversation += f"You: {{image_context}} {{instruction}}\\nAI:"
+        full_prompt = f"{{system_prompt}}\\n\\n{{conversation}}"
     
     # Generate response
     try:
@@ -6320,12 +6644,28 @@ def process_frame(frame, instruction="What do you see?", conversation_history=No
     except Exception as e:
         return f"Error: {{str(e)}}"
 
+def save_conversation_to_file(conversation_history, filename="sight_conversation.txt"):
+    """Save the conversation history to a file."""
+    try:
+        filepath = os.path.join("{BASE_DIR}", filename)
+        with open(filepath, 'w', encoding='utf-8') as f:
+            f.write(f"Sight Mode Conversation Log - {{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}}\\n")
+            f.write("=" * 79 + "\\n\\n")
+            for i, (role, msg) in enumerate(conversation_history, 1):
+                if role == "user":
+                    f.write(f"[{{i}}] You: {{msg}}\\n\\n")
+                elif role == "ai":
+                    f.write(f"[{{i}}] AI: {{msg}}\\n\\n")
+        return filepath
+    except Exception as e:
+        return None
+
 print(f"{{Colors.CYAN}}Instructions:{{Colors.RESET}}")
-print(f"  - Camera will capture frames every {{CAPTURE_INTERVAL}} seconds")
+print(f"  - Press {{Colors.BRIGHT_GREEN}}SPACE{{Colors.RESET}} to enter instruction")
 print(f"  - Type your question/instruction and press ENTER")
-print(f"  - The frame will be captured and sent to the AI for analysis")
-print(f"  - Type '{{Colors.BRIGHT_RED}}exit{{Colors.RESET}}' or '{{Colors.BRIGHT_RED}}quit{{Colors.RESET}}' to stop")
-print(f"  - Press {{Colors.BRIGHT_GREEN}}ENTER{{Colors.RESET}} without text to capture with default prompt\\n")
+print(f"  - AI will analyze the camera frame and respond")
+print(f"  - Commands: '{{Colors.BRIGHT_YELLOW}}save{{Colors.RESET}}', '{{Colors.BRIGHT_YELLOW}}stats{{Colors.RESET}}', '{{Colors.BRIGHT_YELLOW}}clear{{Colors.RESET}}'")
+print(f"  - Press {{Colors.BRIGHT_RED}}ESC{{Colors.RESET}} to exit\\n")
 
 # Show camera preview window
 cv2.namedWindow('Camera Preview', cv2.WINDOW_NORMAL)
@@ -6336,9 +6676,8 @@ print(f"{{Colors.DIM}}Position the camera and adjust as needed{{Colors.RESET}}\\
 
 # Conversation history for context
 conversation_history = []
-last_input_time = time.time()
+turn_number = 0
 input_mode = False
-current_input = ""
 
 print(f"{{Colors.CYAN}}Press SPACE to enter instruction, ESC to exit{{Colors.RESET}}\\n")
 
@@ -6350,7 +6689,7 @@ try:
             # Add timestamp overlay
             timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             cv2.putText(frame, timestamp, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-            cv2.putText(frame, "Sight Mode - AI Vision", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+            cv2.putText(frame, f"Sight Mode - Turn {{turn_number}}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
             
             # Add instruction if in input mode
             if input_mode:
@@ -6361,22 +6700,76 @@ try:
         # Check for keyboard input
         key = cv2.waitKey(100)
         if key == 27:  # ESC key
+            # Save conversation before exiting
+            if conversation_history:
+                print(f"\\n{{Colors.CYAN}}Saving conversation...{{Colors.RESET}}")
+                filepath = save_conversation_to_file(conversation_history)
+                if filepath:
+                    print(f"{{Colors.BRIGHT_GREEN}}✓ Conversation saved to: {{filepath}}{{Colors.RESET}}")
             print(f"\\n{{Colors.BRIGHT_YELLOW}}ESC pressed. Exiting...{{Colors.RESET}}")
             break
         elif key == 32:  # SPACE key
             input_mode = True
-            instruction = input(f"\\n{{Colors.BRIGHT_GREEN}}Instruction (or 'exit' to quit): {{Colors.RESET}}").strip()
+            instruction = input(f"\\n{{Colors.BRIGHT_GREEN}}[Turn {{turn_number + 1}}] Instruction (or command): {{Colors.RESET}}").strip()
             input_mode = False
             
+            # Handle commands
             if instruction.lower() in ['exit', 'quit', 'q']:
+                # Save conversation before exiting
+                if conversation_history:
+                    print(f"\\n{{Colors.CYAN}}Saving conversation...{{Colors.RESET}}")
+                    filepath = save_conversation_to_file(conversation_history)
+                    if filepath:
+                        print(f"{{Colors.BRIGHT_GREEN}}✓ Conversation saved to: {{filepath}}{{Colors.RESET}}")
                 break
+            
+            elif instruction.lower() == 'save':
+                if conversation_history:
+                    filepath = save_conversation_to_file(conversation_history)
+                    if filepath:
+                        print(f"{{Colors.BRIGHT_GREEN}}✓ Conversation saved to: {{filepath}}{{Colors.RESET}}\\n")
+                    else:
+                        print(f"{{Colors.BRIGHT_RED}}✗ Failed to save conversation{{Colors.RESET}}\\n")
+                else:
+                    print(f"{{Colors.YELLOW}}⚠ No conversation to save{{Colors.RESET}}\\n")
+                continue
+            
+            elif instruction.lower() == 'stats':
+                if conversation_history:
+                    user_msgs = [msg for role, msg in conversation_history if role == "user"]
+                    ai_msgs = [msg for role, msg in conversation_history if role == "ai"]
+                    total_text = " ".join([msg for _, msg in conversation_history])
+                    estimated_tokens = count_tokens_estimate(total_text)
+                    
+                    print(f"\\n{{Colors.BRIGHT_CYAN}}Conversation Statistics:{{Colors.RESET}}")
+                    print(f"  {{Colors.CYAN}}Total turns:{{Colors.RESET}} {{len(user_msgs)}}")
+                    print(f"  {{Colors.CYAN}}User messages:{{Colors.RESET}} {{len(user_msgs)}}")
+                    print(f"  {{Colors.CYAN}}AI responses:{{Colors.RESET}} {{len(ai_msgs)}}")
+                    print(f"  {{Colors.CYAN}}Total characters:{{Colors.RESET}} {{len(total_text)}}")
+                    print(f"  {{Colors.CYAN}}Estimated tokens:{{Colors.RESET}} {{estimated_tokens}}")
+                    print(f"  {{Colors.CYAN}}History in context:{{Colors.RESET}} {{len(manage_conversation_history(conversation_history))}} messages\\n")
+                else:
+                    print(f"{{Colors.YELLOW}}⚠ No conversation yet{{Colors.RESET}}\\n")
+                continue
+            
+            elif instruction.lower() == 'clear':
+                if conversation_history:
+                    # Save before clearing
+                    save_conversation_to_file(conversation_history, f"sight_conversation_backup_{{datetime.now().strftime('%Y%m%d_%H%M%S')}}.txt")
+                    conversation_history.clear()
+                    turn_number = 0
+                    print(f"{{Colors.BRIGHT_GREEN}}✓ Conversation history cleared (backup saved){{Colors.RESET}}\\n")
+                else:
+                    print(f"{{Colors.YELLOW}}⚠ History is already empty{{Colors.RESET}}\\n")
+                continue
             
             if instruction:
                 # Capture and process frame
                 frame = capture_frame()
                 if frame is not None:
-                    print(f"{{Colors.BRIGHT_CYAN}}📸 Capturing frame for analysis...{{Colors.RESET}}")
-                    response = process_frame(frame, instruction, conversation_history)
+                    turn_number += 1
+                    print(f"{{Colors.BRIGHT_CYAN}}📸 [Turn {{turn_number}}] Capturing frame for analysis...{{Colors.RESET}}")
+                    response = process_frame(frame, instruction, conversation_history, turn_number)
                     
                     # Save to conversation history
                     conversation_history.append(("user", instruction))
@@ -6384,11 +6777,22 @@ try:
                     
                     # Display response
                     print(f"\\n{{Colors.BRIGHT_GREEN}}AI Response:{{Colors.RESET}} {{Colors.BRIGHT_WHITE}}{{response}}{{Colors.RESET}}\\n")
+                    
+                    # Memory warning
+                    if len(conversation_history) > 100:
+                        print(f"{{Colors.YELLOW}}⚠ Conversation getting long ({{len(conversation_history)//2}} turns). Consider 'save' and 'clear'.{{Colors.RESET}}\\n")
+                    
                     print(f"{{Colors.DIM}}Press SPACE for next instruction{{Colors.RESET}}\\n")
             else:
                 print(f"{{Colors.YELLOW}}⚠ Empty instruction. Press SPACE to try again.{{Colors.RESET}}")
 
 except KeyboardInterrupt:
+    # Save conversation before exiting
+    if conversation_history:
+        print(f"\\n{{Colors.CYAN}}Saving conversation...{{Colors.RESET}}")
+        filepath = save_conversation_to_file(conversation_history)
+        if filepath:
+            print(f"{{Colors.BRIGHT_GREEN}}✓ Conversation saved to: {{filepath}}{{Colors.RESET}}")
     print(f"\\n{{Colors.BRIGHT_YELLOW}}Interrupted. Exiting...{{Colors.RESET}}")
 except Exception as e:
     print(f"{{Colors.BRIGHT_RED}}✗ Error: {{e}}{{Colors.RESET}}")
