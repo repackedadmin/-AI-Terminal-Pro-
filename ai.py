@@ -6327,4 +6327,29 @@ finally:
             # Launch in new terminal based on OS
             system = platform.system()
             if system == "Windows":
-                
+                # Use proper Windows command - normalize path and quote it
+                normalized_path = os.path.normpath(vision_assistant_path)
+                cmd = ['cmd', '/c', 'start', 'cmd', '/k', 'python', normalized_path]
+                subprocess.Popen(cmd, shell=False)
+            elif system == "Darwin":  # macOS
+                subprocess.Popen(['open', '-a', 'Terminal', vision_assistant_path])
+            else:  # Linux
+                for terminal in ['gnome-terminal', 'konsole', 'xterm']:
+                    try:
+                        subprocess.Popen([terminal, '--', 'python3', vision_assistant_path])
+                        break
+                    except FileNotFoundError:
+                        continue
+            
+            print(f"{Colors.BRIGHT_GREEN}✓ Vision + Voice Assistant launched{Colors.RESET}")
+            print(f"{Colors.DIM}Features: Continuous listening + Camera vision + Local AI (100% private){Colors.RESET}")
+            time.sleep(2)
+            
+        except Exception as e:
+            print(f"{Colors.BRIGHT_RED}✗ Failed to launch Vision Assistant: {e}{Colors.RESET}")
+            time.sleep(2)
+
+if __name__ == "__main__":
+    app = App()
+    app.run()
+
