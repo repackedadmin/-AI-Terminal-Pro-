@@ -5996,11 +5996,26 @@ class Assistant:
             # Show progress indicator
             print(f"{{Colors.CYAN}}🤖 Thinking...{{Colors.RESET}}", end='', flush=True)
             
-            # Build optimized prompt (shorter for faster processing)
-            system_prompt = "You are a helpful AI assistant. Keep responses concise and natural."
+            # Build explicit vision-capable system prompt
+            system_prompt = """You are a helpful AI assistant with ACTIVE VISION CAPABILITIES. You are currently connected to a live webcam feed that shows the user's environment in real-time.
+
+CRITICAL INSTRUCTIONS:
+- You CAN and DO see the user's environment through the webcam feed
+- NEVER say you cannot see, don't have vision, or lack visual access
+- When asked about what you see, describe the environment, objects, people, or actions visible in the webcam feed
+- If the user shows you something, acknowledge it and describe what you observe
+- Act confidently about your vision capabilities - you have full visual access
+- Be descriptive and helpful about what you see in the camera feed
+
+Example responses:
+- User: "What do you see?" → "I can see [describe what's visible in the webcam]"
+- User: "Look at this" → "I can see [describe what they're showing]"
+- User: "Can you see me?" → "Yes, I can see you through the webcam feed. [describe what you see]"
+
+Keep responses natural, helpful, and always acknowledge your active vision capabilities."""
             
-            # Simplified vision context (minimal text)
-            vision_context = "[You can see the user's environment via webcam.]"
+            # Explicit vision context that emphasizes the LLM CAN see
+            vision_context = "🔴 LIVE WEBCAM FEED ACTIVE - You are viewing the user's environment in real-time. You CAN see everything in the camera feed. "
             
             # Format conversation history (reduced to last 4 exchanges for speed)
             conversation = ""
@@ -6010,8 +6025,8 @@ class Assistant:
                 elif role == "assistant":
                     conversation += f"AI: {{msg[:200]}}\\n"
             
-            # Add current input with vision context
-            conversation += f"User: {{vision_context}} {{prompt[:300]}}\\nAI:"  # Limit prompt length
+            # Add current input with explicit vision context at the start
+            conversation += f"User: {{vision_context}}The user says: {{prompt[:300]}}\\nAI:"  # Limit prompt length
             
             # Full prompt (optimized)
             full_prompt = f"{{system_prompt}}\\n\\n{{conversation}}"
@@ -6285,6 +6300,12 @@ print(f"  - TTS responses with pyttsx3 (local, no API)")
 print(f"  - Press {{Colors.BRIGHT_RED}}ESC{{Colors.RESET}} or {{Colors.BRIGHT_RED}}Q{{Colors.RESET}} to exit")
 print(f"\\n{{Colors.BRIGHT_GREEN}}🎤 Listening... Speak to the AI{{Colors.RESET}}\\n")
 print(f"{{Colors.DIM}}100% Local Processing - No cloud APIs, your data stays private{{Colors.RESET}}\\n")
+
+# Immediately describe what the camera sees when vision starts
+print(f"{{Colors.CYAN}}📷 Capturing initial view and describing what I see...{{Colors.RESET}}\\n")
+time.sleep(0.5)  # Brief pause to ensure camera frame is ready
+initial_frame = webcam_stream.read(encode=False)
+assistant.answer("Please describe in detail what you can see in the camera feed right now. Be specific about the environment, objects, people, or anything visible.", initial_frame)
 
 # Main loop - show camera preview
 try:
