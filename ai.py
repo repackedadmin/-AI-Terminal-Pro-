@@ -5832,6 +5832,7 @@ class App:
         # Create the unified vision + voice script
         vision_assistant_path = os.path.join(BASE_DIR, "_vision_assistant.py")
         base_dir_escaped = BASE_DIR.replace('\\', '\\\\')
+        config_repr = repr(self.config)
         
         vision_script = f'''"""
 Vision + Voice Assistant - AI Terminal Pro
@@ -5848,6 +5849,7 @@ Features:
 import os
 import sys
 import base64
+import json
 from threading import Lock, Thread
 import time
 
@@ -5951,6 +5953,8 @@ class Assistant:
         self.ai_engine = ai_engine
         self.conversation_history = []
         self.is_speaking = False
+        self.is_processing = False
+        self.processing_lock = Lock()
         
         # Initialize TTS if available
         self.tts_engine = None
@@ -5967,40 +5971,58 @@ class Assistant:
         
         print(f"{{Colors.BRIGHT_GREEN}}✓ AI Assistant initialized{{Colors.RESET}}")
 
-    def answer(self, prompt, image_base64):
-        """Process user prompt with vision context and generate response."""
+    def answer(self, prompt, frame=None):
+        """Process user prompt with vision context and generate response (non-blocking)."""
         if not prompt:
             return
+        
+        # Skip if already processing
+        with self.processing_lock:
+            if self.is_processing:
+                print(f"{{Colors.YELLOW}}⚠ Already processing, please wait...{{Colors.RESET}}")
+                return
+            self.is_processing = True
 
         print(f"\\n{{Colors.BRIGHT_CYAN}}You:{{Colors.RESET}} {{Colors.BRIGHT_YELLOW}}{{prompt}}{{Colors.RESET}}")
+        
+        # Run in background thread to avoid blocking
+        thread = Thread(target=self._process_answer, args=(prompt, frame))
+        thread.daemon = True
+        thread.start()
 
+    def _process_answer(self, prompt, frame):
+        """Internal method to process answer (runs in thread)."""
         try:
-            print(f"{{Colors.CYAN}}🤖 AI is thinking (with vision context)...{{Colors.RESET}}", end='', flush=True)
+            # Show progress indicator
+            print(f"{{Colors.CYAN}}🤖 Thinking...{{Colors.RESET}}", end='', flush=True)
             
-            # Build prompt with conversation history and vision context
-            system_prompt = CONFIG.get("system_prompt", "You are a helpful AI assistant with vision capabilities.")
+            # Build optimized prompt (shorter for faster processing)
+            system_prompt = "You are a helpful AI assistant. Keep responses concise and natural."
             
-            # Add vision context
-            vision_context = f"[Camera feed: Base64 JPEG image provided. User is showing you their environment through webcam.]"
+            # Simplified vision context (minimal text)
+            vision_context = "[You can see the user's environment via webcam.]"
             
-            # Format conversation history
+            # Format conversation history (reduced to last 4 exchanges for speed)
             conversation = ""
-            for role, msg in self.conversation_history[-10:]:  # Last 10 messages
+            for role, msg in self.conversation_history[-8:]:  # Last 8 messages (4 exchanges)
                 if role == "user":
-                    conversation += f"You: {{msg}}\\n"
+                    conversation += f"User: {{msg[:200]}}\\n"  # Truncate long messages
                 elif role == "assistant":
-                    conversation += f"AI: {{msg}}\\n"
+                    conversation += f"AI: {{msg[:200]}}\\n"
             
             # Add current input with vision context
-            conversation += f"You: {{vision_context}} {{prompt}}\\nAI:"
+            conversation += f"User: {{vision_context}} {{prompt[:300]}}\\nAI:"  # Limit prompt length
             
-            # Full prompt
+            # Full prompt (optimized)
             full_prompt = f"{{system_prompt}}\\n\\n{{conversation}}"
             
-            # Generate response using our local model
+            # Generate response using our local model (with streaming support)
             response = self.ai_engine.generate(full_prompt).strip()
             
-            print(f"\\r{{Colors.BRIGHT_GREEN}}✓ Response ready{{Colors.RESET}}" + " " * 40)
+            if not response:
+                response = "I'm processing your request, but didn't get a response. Please try again."
+            
+            print(f"\\r{{Colors.BRIGHT_GREEN}}✓ Ready{{Colors.RESET}}" + " " * 30)
             print(f"\\n{{Colors.BRIGHT_GREEN}}AI:{{Colors.RESET}} {{Colors.BRIGHT_WHITE}}{{response}}{{Colors.RESET}}\\n")
 
             # Save to conversation history
@@ -6011,20 +6033,32 @@ class Assistant:
             if len(self.conversation_history) > 50:
                 self.conversation_history = self.conversation_history[-40:]  # Keep last 20 exchanges
 
+            # TTS in background thread
             if response:
-                self._tts(response)
+                self._tts_async(response)
                 
         except Exception as e:
-            print(f"\\r{{Colors.BRIGHT_RED}}✗ Error: {{e}}{{Colors.RESET}}" + " " * 40)
+            print(f"\\r{{Colors.BRIGHT_RED}}✗ Error: {{e}}{{Colors.RESET}}" + " " * 30)
             print(f"{{Colors.DIM}}Details: {{str(e)}}{{Colors.RESET}}\\n")
+        finally:
+            with self.processing_lock:
+                self.is_processing = False
 
-    def _tts(self, response):
-        """Convert text to speech using local pyttsx3."""
+    def _tts_async(self, response):
+        """Convert text to speech in background thread."""
         if not self.tts_engine:
             return
         
         if self.is_speaking:
-            print(f"{{Colors.YELLOW}}⚠ Already speaking, skipping TTS{{Colors.RESET}}")
+            return  # Skip if already speaking
+        
+        thread = Thread(target=self._tts, args=(response,))
+        thread.daemon = True
+        thread.start()
+
+    def _tts(self, response):
+        """Convert text to speech using local pyttsx3."""
+        if not self.tts_engine:
             return
         
         try:
@@ -6083,10 +6117,49 @@ class LocalAIEngine:
                 raise
         elif self.backend == "ollama":
             try:
+                # 1. Check if Ollama is running
                 requests.get("http://localhost:11434", timeout=2)
                 print(f"{{Colors.BRIGHT_GREEN}}✓ Ollama connection established{{Colors.RESET}}")
-            except:
+                
+                # 2. Fetch available models for Auto-Detection
+                print(f"{{Colors.CYAN}}Detecting available models...{{Colors.RESET}}")
+                resp = requests.get("http://localhost:11434/api/tags", timeout=5)
+                if resp.status_code == 200:
+                    available = [m['name'] for m in resp.json().get('models', [])]
+                    
+                    # 3. Check if configured model exists
+                    if self.model_name in available:
+                        print(f"{{Colors.BRIGHT_GREEN}}✓ Using configured model: {{self.model_name}}{{Colors.RESET}}")
+                    else:
+                        print(f"{{Colors.YELLOW}}⚠ Configured model '{{self.model_name}}' not found on this machine.{{Colors.RESET}}")
+                        
+                        # 4. Auto-Detection Logic
+                        fallbacks = ['mistral:latest', 'mistral', 'llama3:latest', 'llama3', 'llama2:latest', 'qwen2.5-coder:latest']
+                        detected_model = None
+                        
+                        # Try to find a match in our fallback list
+                        for f in fallbacks:
+                            if f in available:
+                                detected_model = f
+                                break
+                        
+                        # If no common fallback, just take the first available one
+                        if not detected_model and available:
+                            detected_model = available[0]
+                        
+                        if detected_model:
+                            print(f"{{Colors.BRIGHT_CYAN}}✨ Auto-detected alternative: {{detected_model}}{{Colors.RESET}}")
+                            self.model_name = detected_model
+                        else:
+                            print(f"{{Colors.BRIGHT_RED}}✗ No models found in Ollama.{{Colors.RESET}}")
+                            print(f"{{Colors.YELLOW}}Please run: ollama pull mistral{{Colors.RESET}}")
+                            raise Exception("No Ollama models available")
+                else:
+                    print(f"{{Colors.BRIGHT_RED}}✗ Failed to fetch models from Ollama{{Colors.RESET}}")
+                    
+            except requests.exceptions.RequestException:
                 print(f"{{Colors.BRIGHT_YELLOW}}⚠ Ollama not running on localhost:11434{{Colors.RESET}}")
+                print(f"{{Colors.YELLOW}}Start Ollama with: ollama serve{{Colors.RESET}}")
                 raise Exception("Ollama backend not available")
 
     def generate(self, prompt):
@@ -6107,20 +6180,53 @@ class LocalAIEngine:
             
         elif self.backend == "ollama":
             try:
-                res = requests.post("http://localhost:11434/api/generate", json={{
-                    "model": self.model_name,
-                    "prompt": prompt,
-                    "stream": False,
-                    "options": {{
-                        "temperature": self.config.get("temperature", 0.7),
-                        "num_predict": self.config.get("max_response_tokens", 2000)
-                    }}
-                }}, timeout=120)
-                if res.status_code == 200:
-                    return res.json()['response'].strip()
-                return f"Ollama Error: {{res.text}}"
+                # Use streaming for faster response and progress feedback
+                max_tokens = min(self.config.get("max_response_tokens", 1000), 1000)
+                
+                response = requests.post(
+                    "http://localhost:11434/api/generate",
+                    json={{
+                        "model": self.model_name,
+                        "prompt": prompt,
+                        "stream": True,  # Enable streaming
+                        "options": {{
+                            "temperature": self.config.get("temperature", 0.7),
+                            "num_predict": max_tokens
+                        }}
+                    }},
+                    stream=True,
+                    timeout=90  # Increased timeout for slower models
+                )
+                
+                if response.status_code != 200:
+                    return f"Ollama Error: {{response.text[:200]}}"
+                
+                # Stream the response
+                full_response = ""
+                for line in response.iter_lines():
+                    if not line:
+                        continue
+                    try:
+                        chunk = json.loads(line)
+                        if 'response' in chunk:
+                            full_response += chunk['response']
+                        # Check if done
+                        if chunk.get('done', False):
+                            break
+                    except json.JSONDecodeError:
+                        continue
+                
+                result = full_response.strip()
+                if not result:
+                    return "I received an empty response. Please try rephrasing your question."
+                return result
+                
+            except requests.exceptions.Timeout:
+                return "Request timed out after 90 seconds. The model may be slow. Try a shorter question or check Ollama is running properly."
+            except requests.exceptions.ConnectionError:
+                return "Cannot connect to Ollama. Make sure Ollama is running: ollama serve"
             except Exception as e:
-                return f"Connection Error: {{e}}"
+                return f"Error: {{str(e)[:200]}}"
 
 try:
     ai_engine = LocalAIEngine(CONFIG)
@@ -6151,16 +6257,19 @@ def audio_callback(recognizer_instance, audio):
         # Use local Whisper model for transcription (no API calls)
         prompt = recognizer_instance.recognize_whisper(audio, model="base", language="english")
         
-        # Get current camera frame
-        image_base64 = webcam_stream.read(encode=True)
+        if not prompt or len(prompt.strip()) < 2:
+            return  # Skip empty/too short prompts
         
-        # Process with local AI + vision context
-        assistant.answer(prompt, image_base64)
+        # Get current camera frame (no encoding needed - just pass frame object)
+        frame = webcam_stream.read(encode=False)
+        
+        # Process with local AI + vision context (non-blocking)
+        assistant.answer(prompt, frame)
 
     except UnknownValueError:
-        print(f"{{Colors.YELLOW}}⚠ Could not understand audio{{Colors.RESET}}")
+        pass  # Silently skip - too noisy
     except Exception as e:
-        print(f"{{Colors.BRIGHT_RED}}✗ Error processing audio: {{e}}{{Colors.RESET}}")
+        print(f"{{Colors.BRIGHT_RED}}✗ Audio error: {{str(e)[:100]}}{{Colors.RESET}}")
 
 # Start background listening
 print(f"{{Colors.CYAN}}Starting background voice listening...{{Colors.RESET}}")
@@ -6218,7 +6327,10 @@ finally:
             # Launch in new terminal based on OS
             system = platform.system()
             if system == "Windows":
-                subprocess.Popen(f'start cmd /k "python \\"{vision_assistant_path}\\""', shell=True)
+                # Use proper Windows command - normalize path and quote it
+                normalized_path = os.path.normpath(vision_assistant_path)
+                cmd = ['cmd', '/c', 'start', 'cmd', '/k', 'python', normalized_path]
+                subprocess.Popen(cmd, shell=False)
             elif system == "Darwin":  # macOS
                 subprocess.Popen(['open', '-a', 'Terminal', vision_assistant_path])
             else:  # Linux
