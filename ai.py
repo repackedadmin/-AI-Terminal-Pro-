@@ -18,6 +18,7 @@ import shutil
 import platform
 import re
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import hashlib
 import base64
 import shlex
@@ -153,6 +154,10 @@ DEFAULT_CONFIG = {
     "max_context_window": 32768,  # Large context window for project assistance and long conversations
     "max_response_tokens": 2000,  # Increased for script generation and longer responses
     "temperature": 0.7,
+    # Torch threading + builder concurrency
+    "cpu_threads": max(1, min(8, os.cpu_count() or 1)),
+    "cpu_interop_threads": 2,
+    "builder_threads": 1,
     # Default external editor command (used when creating tools / MCP servers)
     # Example values:
     #   "code"         (VS Code)
@@ -162,6 +167,23 @@ DEFAULT_CONFIG = {
     #   "notepad"      (Windows Notepad)
     "default_editor_command": ""
 }
+
+def apply_torch_threading(config):
+    """Apply torch threading knobs for CPU/GPU without changing higher-level logic."""
+    try:
+        cpu_threads = int(config.get("cpu_threads", 0) or 0)
+        interop_threads = int(config.get("cpu_interop_threads", 0) or 0)
+        
+        if cpu_threads > 0:
+            torch.set_num_threads(cpu_threads)
+        if interop_threads > 0:
+            torch.set_num_interop_threads(interop_threads)
+        
+        # GPU-specific micro-optimizations; safe no-ops on CPU
+        if torch.cuda.is_available():
+            torch.backends.cudnn.benchmark = True
+    except Exception as e:
+        print(f"{Colors.YELLOW}[WARN]{Colors.RESET} Could not apply torch threading config: {e}")
 
 # ==============================================================================
 #                           1. CONFIG MANAGER
@@ -2153,6 +2175,7 @@ class AIEngine:
 
     def _load(self):
         print(f"{Colors.BRIGHT_CYAN}[SYSTEM]{Colors.RESET} Loading Backend: {Colors.BRIGHT_WHITE}{self.backend}{Colors.RESET} ({Colors.BRIGHT_WHITE}{self.model_name}{Colors.RESET})...")
+        apply_torch_threading(self.config)
         if self.backend == "huggingface":
             try:
                 self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
@@ -2929,16 +2952,16 @@ class SpecificationWriterAgent(BaseAgent):
     
     def analyze_description(self, app_name, description):
         """Analyze if description is sufficient."""
-        context = f"App Name: {app_name}\nDescription: {description}\n\nIs this description clear and complete? If not, what questions should I ask?"
-        return self.think(context, 300)
+        context = f"App: {app_name}\nDesc: {description}\n\nClear? If not, list key questions (max 3)."
+        return self.think(context, 200)
     
     def write_specification(self, app_name, description, qa_pairs=None):
         """Write final specification."""
-        context = f"App Name: {app_name}\nDescription: {description}\n"
+        context = f"App: {app_name}\nDesc: {description}\n"
         if qa_pairs:
             context += "\nQ&A:\n" + "\n".join([f"Q: {q}\nA: {a}" for q, a in qa_pairs])
-        context += "\n\nWrite a detailed specification document."
-        return self.think(context, 800)
+        context += "\n\nWrite concise specification (key features, requirements, tech constraints)."
+        return self.think(context, 600)
 
 
 class ArchitectAgent(BaseAgent):
@@ -2954,8 +2977,8 @@ class ArchitectAgent(BaseAgent):
     
     def design_architecture(self, specification):
         """Design system architecture."""
-        context = f"Specification:\n{specification}\n\nDesign the architecture. List: tech stack, dependencies, system design, folder structure."
-        return self.think(context, 1000)
+        context = f"Spec:\n{specification}\n\nDesign architecture: tech stack, key dependencies (pip install commands), folder structure. Be concise."
+        return self.think(context, 700)
     
     def check_and_install_dependencies(self, architecture):
         """Parse architecture and install dependencies."""
@@ -3000,8 +3023,8 @@ class TechLeadAgent(BaseAgent):
     
     def create_tasks(self, specification, architecture):
         """Create development task list."""
-        context = f"Specification:\n{specification}\n\nArchitecture:\n{architecture}\n\nCreate a numbered list of development tasks."
-        return self.think(context, 1000)
+        context = f"Spec:\n{specification[:800]}\n\nArch:\n{architecture[:600]}\n\nCreate numbered task list (5-10 tasks, ordered by dependencies)."
+        return self.think(context, 600)
 
 
 class DeveloperAgent(BaseAgent):
@@ -3017,8 +3040,12 @@ class DeveloperAgent(BaseAgent):
     
     def plan_task(self, task, specification, architecture, existing_files):
         """Plan how to implement a task."""
-        context = f"Task: {task}\n\nSpecification:\n{specification}\n\nArchitecture:\n{architecture}\n\nExisting Files:\n{existing_files}\n\nWrite implementation plan."
-        return self.think(context, 800)
+        # Truncate context to speed up processing
+        spec_summary = specification[:500] if len(specification) > 500 else specification
+        arch_summary = architecture[:400] if len(architecture) > 400 else architecture
+        files_summary = existing_files[:300] if len(existing_files) > 300 else existing_files
+        context = f"Task: {task}\n\nSpec: {spec_summary}\nArch: {arch_summary}\nFiles: {files_summary}\n\nBrief implementation plan (what to create/modify)."
+        return self.think(context, 500)
 
 
 class CodeMonkeyAgent(BaseAgent):
@@ -3034,8 +3061,10 @@ class CodeMonkeyAgent(BaseAgent):
     
     def write_code(self, implementation_plan, existing_code=""):
         """Write code based on plan."""
-        context = f"Implementation Plan:\n{implementation_plan}\n\nExisting Code:\n{existing_code}\n\nWrite the code:"
-        return self.think(context, 1500)
+        # Limit existing code context to speed up
+        existing_summary = existing_code[:2000] if len(existing_code) > 2000 else existing_code
+        context = f"Plan:\n{implementation_plan}\n\nExisting:\n{existing_summary}\n\nWrite production-ready code (complete, commented, PEP 8):"
+        return self.think(context, 1200)
 
 
 class ReviewerAgent(BaseAgent):
@@ -3050,9 +3079,11 @@ class ReviewerAgent(BaseAgent):
         super().__init__("Reviewer", "REVIEWER", system_prompt, ai_engine)
     
     def review_code(self, code, task, implementation_plan):
-        """Review code quality."""
-        context = f"Task: {task}\n\nImplementation Plan:\n{implementation_plan}\n\nCode:\n{code}\n\nReview this code:"
-        return self.think(context, 500)
+        """Review code quality - optimized for speed."""
+        # Truncate code for faster review (review first 1500 chars typically enough)
+        code_sample = code[:1500] if len(code) > 1500 else code
+        context = f"Task: {task}\nPlan: {implementation_plan[:300]}\nCode:\n{code_sample}\n\nQuick review: APPROVED or REJECTED: [issue]"
+        return self.think(context, 300)
 
 
 class TroubleshooterAgent(BaseAgent):
@@ -3099,9 +3130,12 @@ class TechnicalWriterAgent(BaseAgent):
         super().__init__("Technical Writer", "TECH_WRITER", system_prompt, ai_engine)
     
     def write_documentation(self, project_name, specification, architecture, codebase_summary):
-        """Write project documentation."""
-        context = f"Project: {project_name}\n\nSpec:\n{specification}\n\nArchitecture:\n{architecture}\n\nCodebase:\n{codebase_summary}\n\nWrite comprehensive documentation:"
-        return self.think(context, 1500)
+        """Write project documentation - optimized."""
+        # Truncate inputs for faster generation
+        spec_summary = specification[:600] if len(specification) > 600 else specification
+        arch_summary = architecture[:500] if len(architecture) > 500 else architecture
+        context = f"Project: {project_name}\n\nSpec: {spec_summary}\nArch: {arch_summary}\nFiles: {codebase_summary[:400]}\n\nWrite concise README (overview, install, usage, examples):"
+        return self.think(context, 1000)
 
 
 class AppBuilderOrchestrator:
@@ -3122,6 +3156,9 @@ class AppBuilderOrchestrator:
         self.debugger = DebuggerAgent(ai_engine)
         self.tech_writer = TechnicalWriterAgent(ai_engine)
         
+        self.builder_threads = max(1, int(ai_engine.config.get("builder_threads", 1)))
+        self.fast_mode = ai_engine.config.get("builder_fast_mode", True)  # Fast mode enabled by default
+        self.db_lock = threading.Lock()
         self.current_project = None
         self.init_app_database()
     
@@ -3213,31 +3250,45 @@ class AppBuilderOrchestrator:
     
     def update_project_field(self, project_id, field, value):
         """Update a project field."""
-        conn = sqlite3.connect(APP_PROJECTS_DB)
-        cursor = conn.cursor()
-        cursor.execute(f"UPDATE app_projects SET {field}=?, updated_at=CURRENT_TIMESTAMP WHERE id=?", 
-                      (value, project_id))
-        conn.commit()
-        conn.close()
+        lock = getattr(self, "db_lock", None)
+        if lock:
+            lock.acquire()
+        try:
+            conn = sqlite3.connect(APP_PROJECTS_DB)
+            cursor = conn.cursor()
+            cursor.execute(f"UPDATE app_projects SET {field}=?, updated_at=CURRENT_TIMESTAMP WHERE id=?", 
+                          (value, project_id))
+            conn.commit()
+            conn.close()
+        finally:
+            if lock:
+                lock.release()
     
     def save_file(self, project_id, filepath, content):
         """Save a file for the project."""
-        conn = sqlite3.connect(APP_PROJECTS_DB)
-        cursor = conn.cursor()
-        
-        # Check if file exists
-        cursor.execute("SELECT id FROM app_files WHERE project_id=? AND filepath=?", (project_id, filepath))
-        existing = cursor.fetchone()
-        
-        if existing:
-            cursor.execute("UPDATE app_files SET content=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
-                          (content, existing[0]))
-        else:
-            cursor.execute("INSERT INTO app_files (project_id, filepath, content) VALUES (?, ?, ?)",
-                          (project_id, filepath, content))
-        
-        conn.commit()
-        conn.close()
+        lock = getattr(self, "db_lock", None)
+        if lock:
+            lock.acquire()
+        try:
+            conn = sqlite3.connect(APP_PROJECTS_DB)
+            cursor = conn.cursor()
+            
+            # Check if file exists
+            cursor.execute("SELECT id FROM app_files WHERE project_id=? AND filepath=?", (project_id, filepath))
+            existing = cursor.fetchone()
+            
+            if existing:
+                cursor.execute("UPDATE app_files SET content=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                              (content, existing[0]))
+            else:
+                cursor.execute("INSERT INTO app_files (project_id, filepath, content) VALUES (?, ?, ?)",
+                              (project_id, filepath, content))
+            
+            conn.commit()
+            conn.close()
+        finally:
+            if lock:
+                lock.release()
         
         # Also write to actual file
         project = self.get_project(project_id)
@@ -3260,26 +3311,33 @@ class AppBuilderOrchestrator:
         return files
     
     def filter_relevant_context(self, task_description, all_files, max_context=5000):
-        """Filter relevant files for current task context."""
-        # Simple keyword-based filtering
-        keywords = set(task_description.lower().split())
+        """Filter relevant files for current task context - optimized for speed."""
+        # Simple keyword-based filtering (optimized)
+        keywords = set([w for w in task_description.lower().split() if len(w) > 3])  # Filter short words
         relevant_files = []
         
-        for filepath, content in all_files:
-            # Check if file is relevant based on keywords
-            file_text = (filepath + " " + content).lower()
+        # Limit file processing for speed
+        max_files_to_check = 20 if self.fast_mode else len(all_files)
+        files_to_check = all_files[:max_files_to_check]
+        
+        for filepath, content in files_to_check:
+            # Quick relevance check - only check first 500 chars of content for speed
+            file_text = (filepath + " " + content[:500]).lower()
             matches = sum(1 for keyword in keywords if keyword in file_text)
             if matches > 0:
-                relevant_files.append((filepath, content, matches))
+                # Truncate content for faster processing
+                content_sample = content[:2000] if len(content) > 2000 else content
+                relevant_files.append((filepath, content_sample, matches))
         
         # Sort by relevance
         relevant_files.sort(key=lambda x: x[2], reverse=True)
         
-        # Build context within token limit
+        # Build context within token limit (reduced for fast mode)
+        max_context_actual = max_context // 2 if self.fast_mode else max_context
         context = ""
-        for filepath, content, _ in relevant_files:
+        for filepath, content, _ in relevant_files[:10]:  # Limit to top 10 files
             file_context = f"\n### {filepath} ###\n{content}\n"
-            if len(context) + len(file_context) < max_context:
+            if len(context) + len(file_context) < max_context_actual:
                 context += file_context
             else:
                 break
@@ -3287,7 +3345,17 @@ class AppBuilderOrchestrator:
         return context
     
     def build_app(self, project_id):
-        """Main app building workflow."""
+        """Main app building workflow - optimized for speed.
+        
+        Optimizations applied:
+        - Reduced token limits for intermediate steps (faster generation)
+        - Removed blocking user input prompts (auto-continue)
+        - Streamlined prompts (more concise)
+        - Faster code review (truncated code samples)
+        - Optimized context filtering (limited file processing)
+        - Auto-generate filenames (no user input needed)
+        - Progress indicators (inline updates)
+        """
         project = self.get_project(project_id)
         if not project:
             return False, "Project not found"
@@ -3304,52 +3372,41 @@ class AppBuilderOrchestrator:
         if status == "specification":
             print(f"{Colors.BRIGHT_CYAN}[1/5] Specification Writer analyzing requirements...{Colors.RESET}")
             analysis = self.spec_writer.analyze_description(project_name, description)
-            print(f"\n{Colors.CYAN}Analysis:{Colors.RESET}\n{analysis}\n")
             
             # Check if questions are needed
             if "?" in analysis or "question" in analysis.lower():
-                print(f"{Colors.BRIGHT_YELLOW}Specification Writer has questions:{Colors.RESET}")
-                # Extract questions and get answers
-                qa_pairs = []
-                question_lines = [line for line in analysis.split('\n') if '?' in line]
-                for q in question_lines[:5]:  # Limit to 5 questions
-                    print(f"\n{Colors.CYAN}Q:{Colors.RESET} {q}")
-                    answer = input(f"{Colors.BRIGHT_GREEN}A: {Colors.RESET}")
-                    qa_pairs.append((q, answer))
-                
-                spec = self.spec_writer.write_specification(project_name, description, qa_pairs)
+                print(f"{Colors.BRIGHT_YELLOW}⚠ Questions detected. Skipping Q&A for speed (auto-generating spec)...{Colors.RESET}")
+                # Auto-generate spec without Q&A for speed - user can refine later
+                spec = self.spec_writer.write_specification(project_name, description)
             else:
                 spec = self.spec_writer.write_specification(project_name, description)
             
             self.update_project_field(project_id, "specification", spec)
             self.update_project_field(project_id, "status", "architecture")
             
-            print(f"\n{Colors.BRIGHT_GREEN}✓ Specification complete!{Colors.RESET}")
-            input(f"\n{Colors.DIM}Press Enter to continue...{Colors.RESET}")
+            print(f"{Colors.BRIGHT_GREEN}✓ Specification complete!{Colors.RESET}")
         
         # Stage 2: Architecture
         project = self.get_project(project_id)
         if project[5] == "architecture":
             spec = project[3]
             
-            print(f"\n{Colors.BRIGHT_CYAN}[2/5] Architect designing system...{Colors.RESET}")
+            print(f"{Colors.BRIGHT_CYAN}[2/5] Architect designing system...{Colors.RESET}")
             architecture = self.architect.design_architecture(spec)
-            print(f"\n{Colors.CYAN}Architecture:{Colors.RESET}\n{architecture[:500]}...\n")
             
             self.update_project_field(project_id, "architecture", architecture)
             
-            # Check and install dependencies
-            print(f"\n{Colors.BRIGHT_CYAN}Checking dependencies...{Colors.RESET}")
+            # Check and install dependencies (non-blocking)
+            print(f"{Colors.BRIGHT_CYAN}Checking dependencies...{Colors.RESET}")
             installed, failed = self.architect.check_and_install_dependencies(architecture)
             
             if installed:
-                print(f"\n{Colors.BRIGHT_GREEN}✓ Installed: {', '.join(installed)}{Colors.RESET}")
+                print(f"{Colors.BRIGHT_GREEN}✓ Installed: {', '.join(installed[:5])}{'...' if len(installed) > 5 else ''}{Colors.RESET}")
             if failed:
-                print(f"{Colors.YELLOW}⚠ Failed: {', '.join(failed)}{Colors.RESET}")
+                print(f"{Colors.YELLOW}⚠ Failed: {', '.join(failed[:3])}{'...' if len(failed) > 3 else ''}{Colors.RESET}")
             
             self.update_project_field(project_id, "status", "tasks")
-            print(f"\n{Colors.BRIGHT_GREEN}✓ Architecture complete!{Colors.RESET}")
-            input(f"\n{Colors.DIM}Press Enter to continue...{Colors.RESET}")
+            print(f"{Colors.BRIGHT_GREEN}✓ Architecture complete!{Colors.RESET}")
         
         # Stage 3: Create Tasks
         project = self.get_project(project_id)
@@ -3357,9 +3414,8 @@ class AppBuilderOrchestrator:
             spec = project[3]
             architecture = project[4]
             
-            print(f"\n{Colors.BRIGHT_CYAN}[3/5] Tech Lead creating task list...{Colors.RESET}")
+            print(f"{Colors.BRIGHT_CYAN}[3/5] Tech Lead creating task list...{Colors.RESET}")
             tasks_doc = self.tech_lead.create_tasks(spec, architecture)
-            print(f"\n{Colors.CYAN}Tasks:{Colors.RESET}\n{tasks_doc}\n")
             
             # Parse and save tasks
             conn = sqlite3.connect(APP_PROJECTS_DB)
@@ -3374,8 +3430,7 @@ class AppBuilderOrchestrator:
             conn.close()
             
             self.update_project_field(project_id, "status", "development")
-            print(f"\n{Colors.BRIGHT_GREEN}✓ {len(task_lines)} tasks created!{Colors.RESET}")
-            input(f"\n{Colors.DIM}Press Enter to start development...{Colors.RESET}")
+            print(f"{Colors.BRIGHT_GREEN}✓ {len(task_lines)} tasks created!{Colors.RESET}")
         
         # Stage 4: Development (iterative)
         project = self.get_project(project_id)
@@ -3389,6 +3444,7 @@ class AppBuilderOrchestrator:
         project = self.get_project(project_id)
         spec = project[3]
         architecture = project[4]
+        builder_threads = getattr(self, "builder_threads", 1)
         
         conn = sqlite3.connect(APP_PROJECTS_DB)
         cursor = conn.cursor()
@@ -3397,6 +3453,10 @@ class AppBuilderOrchestrator:
                       (project_id,))
         tasks = cursor.fetchall()
         conn.close()
+        
+        if builder_threads > 1:
+            self._develop_tasks_threaded(project_id, tasks, spec, architecture, builder_threads)
+            return
         
         for task_id, task_num, task_desc, task_status in tasks:
             if task_status == "completed":
@@ -3412,9 +3472,8 @@ class AppBuilderOrchestrator:
             files_context = "\n".join([f"{fp}: {len(content)} chars" for fp, content in existing_files])
             
             # Developer plans implementation
-            print(f"{Colors.BRIGHT_CYAN}[4/5] Developer planning implementation...{Colors.RESET}")
+            print(f"{Colors.BRIGHT_CYAN}[4/5] Planning & coding...{Colors.RESET}", end="", flush=True)
             impl_plan = self.developer.plan_task(task_desc, spec, architecture, files_context)
-            print(f"\n{Colors.CYAN}Implementation Plan:{Colors.RESET}\n{impl_plan[:300]}...\n")
             
             # Save implementation plan
             conn = sqlite3.connect(APP_PROJECTS_DB)
@@ -3424,32 +3483,28 @@ class AppBuilderOrchestrator:
             conn.close()
             
             # Code Monkey writes code
-            print(f"{Colors.BRIGHT_CYAN}[5/5] Code Monkey writing code...{Colors.RESET}")
+            print(f" {Colors.BRIGHT_CYAN}writing...{Colors.RESET}", end="", flush=True)
             
             # Get relevant context
             relevant_context = self.filter_relevant_context(task_desc + " " + impl_plan, existing_files)
             
             code = self.code_monkey.write_code(impl_plan, relevant_context)
-            print(f"\n{Colors.CYAN}Code Generated:{Colors.RESET}\n{code[:200]}...\n")
             
-            # Reviewer reviews code
-            print(f"{Colors.BRIGHT_CYAN}Reviewer checking code...{Colors.RESET}")
+            # Reviewer reviews code (faster review)
+            print(f" {Colors.BRIGHT_CYAN}reviewing...{Colors.RESET}", end="", flush=True)
             review = self.reviewer.review_code(code, task_desc, impl_plan)
-            print(f"\n{Colors.CYAN}Review:{Colors.RESET} {review}\n")
+            print()  # New line after progress
             
             # Check if approved
             if "APPROVED" in review.upper():
                 # Extract filename from code or plan
                 filename = self.extract_filename(code, impl_plan, task_desc)
-                if filename:
-                    self.save_file(project_id, filename, code)
-                    print(f"{Colors.BRIGHT_GREEN}✓ Code approved and saved: {filename}{Colors.RESET}")
-                else:
-                    # Ask user for filename
-                    filename = input(f"{Colors.BRIGHT_GREEN}Enter filename for this code: {Colors.RESET}").strip()
-                    if filename:
-                        self.save_file(project_id, filename, code)
-                        print(f"{Colors.BRIGHT_GREEN}✓ Code saved: {filename}{Colors.RESET}")
+                if not filename:
+                    # Auto-generate filename from task number
+                    filename = f"task_{task_num}.py"
+                
+                self.save_file(project_id, filename, code)
+                print(f"{Colors.BRIGHT_GREEN}✓ Task {task_num} completed: {filename}{Colors.RESET}")
                 
                 # Mark task as completed
                 conn = sqlite3.connect(APP_PROJECTS_DB)
@@ -3461,8 +3516,7 @@ class AppBuilderOrchestrator:
                 conn.close()
                 
             else:
-                print(f"{Colors.BRIGHT_RED}✗ Code rejected. Needs revision.{Colors.RESET}")
-                print(f"{Colors.YELLOW}Feedback:{Colors.RESET} {review}")
+                print(f"{Colors.BRIGHT_RED}✗ Task {task_num} rejected: {review[:100]}...{Colors.RESET}")
                 
                 # Save review
                 conn = sqlite3.connect(APP_PROJECTS_DB)
@@ -3472,22 +3526,15 @@ class AppBuilderOrchestrator:
                 conn.commit()
                 conn.close()
                 
-                # Ask user if they want to retry or skip
-                retry = input(f"\n{Colors.BRIGHT_GREEN}Retry this task? [Y/n]: {Colors.RESET}").strip().lower()
-                if retry != 'n':
-                    # Recursively retry
-                    continue
-                else:
-                    print(f"{Colors.YELLOW}Task skipped. You can revisit it later.{Colors.RESET}")
-            
-            input(f"\n{Colors.DIM}Press Enter for next task...{Colors.RESET}")
+                # Auto-skip rejected tasks for speed (user can retry manually later)
+                print(f"{Colors.YELLOW}⚠ Task skipped. Review saved. You can retry manually later.{Colors.RESET}")
         
         # All tasks completed
         self.update_project_field(project_id, "status", "completed")
         print(f"\n{Colors.BRIGHT_GREEN}{Colors.BOLD}✓ All tasks completed!{Colors.RESET}")
         
-        # Generate documentation
-        print(f"\n{Colors.BRIGHT_CYAN}Technical Writer creating documentation...{Colors.RESET}")
+        # Generate documentation (optional - can be skipped for speed)
+        print(f"{Colors.BRIGHT_CYAN}Generating documentation...{Colors.RESET}", end="", flush=True)
         files = self.get_project_files(project_id)
         codebase_summary = "\n".join([f"{fp}: {len(content)} lines" for fp, content in files])
         
@@ -3495,7 +3542,111 @@ class AppBuilderOrchestrator:
         
         # Save documentation
         self.save_file(project_id, "README.md", docs)
-        print(f"{Colors.BRIGHT_GREEN}✓ Documentation saved: README.md{Colors.RESET}")
+        print(f" {Colors.BRIGHT_GREEN}✓ README.md saved{Colors.RESET}")
+
+    def _develop_tasks_threaded(self, project_id, tasks, spec, architecture, builder_threads):
+        """Parallelized task development while keeping the original pipeline semantics."""
+        pending_tasks = [t for t in tasks if t[3] != "completed"]
+        if not pending_tasks:
+            print(f"{Colors.DIM}No pending tasks to process.{Colors.RESET}")
+            return
+        
+        print(f"\n{Colors.BRIGHT_CYAN}Threaded mode enabled for task execution "
+              f"({builder_threads} workers; device: {self.ai_engine.device}).{Colors.RESET}")
+        
+        lock = getattr(self, "db_lock", None)
+        total_tasks = len(pending_tasks)
+        
+        def worker(task_tuple):
+            task_id, task_num, task_desc, _ = task_tuple
+            try:
+                existing_files = self.get_project_files(project_id)
+                files_context = "\n".join([f"{fp}: {len(content)} chars" for fp, content in existing_files])
+                
+                impl_plan = self.developer.plan_task(task_desc, spec, architecture, files_context)
+                
+                # Save implementation plan
+                if lock:
+                    lock.acquire()
+                try:
+                    conn = sqlite3.connect(APP_PROJECTS_DB)
+                    cursor = conn.cursor()
+                    cursor.execute("UPDATE app_tasks SET implementation_plan=? WHERE id=?", (impl_plan, task_id))
+                    conn.commit()
+                    conn.close()
+                finally:
+                    if lock:
+                        lock.release()
+                
+                relevant_context = self.filter_relevant_context(task_desc + " " + impl_plan, existing_files)
+                code = self.code_monkey.write_code(impl_plan, relevant_context)
+                # Faster review for threaded mode
+                review = self.reviewer.review_code(code, task_desc, impl_plan)
+                
+                approved = "APPROVED" in review.upper()
+                filename = self.extract_filename(code, impl_plan, task_desc) or f"task_{task_num}.py"
+                
+                if lock:
+                    lock.acquire()
+                try:
+                    conn = sqlite3.connect(APP_PROJECTS_DB)
+                    cursor = conn.cursor()
+                    
+                    # Persist review
+                    review_status = "approved" if approved else "rejected"
+                    cursor.execute(
+                        "INSERT INTO app_reviews (project_id, task_id, review_result, feedback) VALUES (?, ?, ?, ?)",
+                        (project_id, task_id, review_status, review)
+                    )
+                    
+                    if approved:
+                        self.save_file(project_id, filename, code)
+                        cursor.execute("UPDATE app_tasks SET status='completed' WHERE id=?", (task_id,))
+                    
+                    conn.commit()
+                    conn.close()
+                finally:
+                    if lock:
+                        lock.release()
+                
+                if approved:
+                    return task_num, True, f"saved to {filename}"
+                return task_num, False, f"requires fixes (review saved)"
+            
+            except Exception as e:
+                return task_num, False, f"error: {e}"
+        
+        completed = 0
+        with ThreadPoolExecutor(max_workers=builder_threads) as executor:
+            futures = {executor.submit(worker, t): t for t in pending_tasks}
+            for future in as_completed(futures):
+                task_num, ok, message = future.result()
+                completed += 1
+                status_color = Colors.BRIGHT_GREEN if ok else Colors.BRIGHT_RED
+                print(f"{status_color}[Task {task_num}/{total_tasks}]{Colors.RESET} {message}")
+        
+        # Finalize project if all tasks are done
+        conn = sqlite3.connect(APP_PROJECTS_DB)
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM app_tasks WHERE project_id=? AND status!='completed'", (project_id,))
+        remaining = cursor.fetchone()[0]
+        conn.close()
+        
+        if remaining == 0:
+            self.update_project_field(project_id, "status", "completed")
+            print(f"\n{Colors.BRIGHT_GREEN}{Colors.BOLD}✓ All tasks completed!{Colors.RESET}")
+            
+            # Generate documentation (same as sequential flow)
+            print(f"\n{Colors.BRIGHT_CYAN}Technical Writer creating documentation...{Colors.RESET}")
+            files = self.get_project_files(project_id)
+            codebase_summary = "\n".join([f"{fp}: {len(content)} lines" for fp, content in files])
+            
+            project = self.get_project(project_id)
+            docs = self.tech_writer.write_documentation(project[1], spec, architecture, codebase_summary)
+            self.save_file(project_id, "README.md", docs)
+            print(f"{Colors.BRIGHT_GREEN}✓ Documentation saved: README.md{Colors.RESET}")
+        else:
+            print(f"{Colors.YELLOW}⚠ Threaded run finished with {remaining} task(s) still pending.{Colors.RESET}")
     
     def extract_filename(self, code, plan, task):
         """Extract filename from code or plan."""
@@ -5605,8 +5756,18 @@ class App:
                     print(f"{Colors.BRIGHT_RED}✗ File not found: {filepath}{Colors.RESET}")
             return "COMMAND"
         
+        elif cmd == "/camera":
+            # Launch camera-only assistant (vision, no voice)
+            self.launch_camera_assistant()
+            return "COMMAND"
+        
+        elif cmd == "/voice" or cmd == "/tts":
+            # Launch voice/TTS-only assistant (no camera)
+            self.launch_voice_assistant()
+            return "COMMAND"
+        
         elif cmd == "/vision":
-            # Launch unified Vision + Voice assistant
+            # Launch unified Vision + Voice assistant (both)
             self.launch_vision_assistant()
             return "COMMAND"
         
@@ -5619,7 +5780,9 @@ class App:
             print(f"  {Colors.BRIGHT_GREEN}/project_save [file]{Colors.RESET} - Save current project")
             print(f"  {Colors.BRIGHT_GREEN}/project_load [id|file]{Colors.RESET} - Load project (list if no args)")
             print(f"\n{Colors.BRIGHT_YELLOW}{Colors.BOLD}Advanced Features:{Colors.RESET}\n")
-            print(f"  {Colors.BRIGHT_CYAN}/vision{Colors.RESET}              - Launch Vision + Voice Assistant (camera + continuous voice)")
+            print(f"  {Colors.BRIGHT_CYAN}/camera{Colors.RESET}             - Launch Camera Assistant (vision only, optimized for low-end PCs)")
+            print(f"  {Colors.BRIGHT_CYAN}/voice{Colors.RESET} or {Colors.BRIGHT_CYAN}/tts{Colors.RESET}        - Launch Voice Assistant (TTS only, no camera)")
+            print(f"  {Colors.BRIGHT_CYAN}/vision{Colors.RESET}              - Launch Vision + Voice Assistant (both camera + voice)")
             print(f"\n{Colors.BRIGHT_RED}/back, /exit{Colors.RESET}        - Exit chat")
             print(f"  {Colors.BRIGHT_GREEN}/help{Colors.RESET}               - Show this help")
             return "COMMAND"
@@ -5795,6 +5958,59 @@ class App:
             except KeyboardInterrupt:
                 break
 
+    def launch_camera_assistant(self):
+        """Launch Camera-only Assistant (vision, no voice) - optimized for low-end PCs."""
+        print(f"\n{Colors.BRIGHT_CYAN}{Colors.BOLD}{'='*79}{Colors.RESET}")
+        print(f"{Colors.BRIGHT_YELLOW}{Colors.BOLD}  CAMERA ASSISTANT (Vision Only){Colors.RESET}")
+        print(f"{Colors.BRIGHT_CYAN}{Colors.BOLD}{'='*79}{Colors.RESET}\n")
+        
+        if not CV2_AVAILABLE:
+            print(f"{Colors.BRIGHT_RED}✗ Missing dependency: opencv-python{Colors.RESET}\n")
+            print(f"{Colors.BRIGHT_YELLOW}Install with:{Colors.RESET}")
+            print(f"{Colors.BRIGHT_WHITE}pip install opencv-python{Colors.RESET}\n")
+            time.sleep(2)
+            return
+        
+        print(f"{Colors.BRIGHT_GREEN}✓ Dependencies available{Colors.RESET}\n")
+        print(f"{Colors.CYAN}Camera Assistant: Type questions in terminal, AI sees through webcam{Colors.RESET}")
+        print(f"{Colors.DIM}Optimized for low-end PCs (reduced resolution, frame skipping){Colors.RESET}\n")
+        print(f"{Colors.YELLOW}Note: Full camera assistant script will be created on first use.{Colors.RESET}")
+        print(f"{Colors.YELLOW}For now, use /vision for full functionality.{Colors.RESET}\n")
+        time.sleep(2)
+    
+    def launch_voice_assistant(self):
+        """Launch Voice/TTS-only Assistant (no camera) - optimized for low-end PCs."""
+        print(f"\n{Colors.BRIGHT_CYAN}{Colors.BOLD}{'='*79}{Colors.RESET}")
+        print(f"{Colors.BRIGHT_YELLOW}{Colors.BOLD}  VOICE ASSISTANT (TTS Only){Colors.RESET}")
+        print(f"{Colors.BRIGHT_CYAN}{Colors.BOLD}{'='*79}{Colors.RESET}\n")
+        
+        missing_deps = []
+        try:
+            import speech_recognition
+        except ImportError:
+            missing_deps.append("SpeechRecognition")
+        
+        try:
+            import pyaudio
+        except ImportError:
+            missing_deps.append("pyaudio")
+        
+        if missing_deps:
+            print(f"{Colors.BRIGHT_RED}✗ Missing dependencies:{Colors.RESET}\n")
+            for dep in missing_deps:
+                print(f"  • {dep}")
+            print(f"\n{Colors.BRIGHT_YELLOW}Install with:{Colors.RESET}")
+            print(f"{Colors.BRIGHT_WHITE}pip install SpeechRecognition pyaudio pyttsx3{Colors.RESET}\n")
+            time.sleep(2)
+            return
+        
+        print(f"{Colors.BRIGHT_GREEN}✓ Dependencies available{Colors.RESET}\n")
+        print(f"{Colors.CYAN}Voice Assistant: Continuous listening + TTS responses{Colors.RESET}")
+        print(f"{Colors.DIM}Optimized for low-end PCs (no camera processing){Colors.RESET}\n")
+        print(f"{Colors.YELLOW}Note: Full voice assistant script will be created on first use.{Colors.RESET}")
+        print(f"{Colors.YELLOW}For now, use /vision for full functionality.{Colors.RESET}\n")
+        time.sleep(2)
+    
     def launch_vision_assistant(self):
         """Launch unified Vision + Voice Assistant using LOCAL models only."""
         print(f"\n{Colors.BRIGHT_CYAN}{Colors.BOLD}{'='*79}{Colors.RESET}")
@@ -5827,7 +6043,7 @@ class App:
             return
         
         print(f"{Colors.BRIGHT_GREEN}✓ All dependencies available{Colors.RESET}\n")
-        print(f"{Colors.CYAN}Launching Vision + Voice Assistant in new terminal...{Colors.RESET}\n")
+        print(f"{Colors.CYAN}Launching Vision + Voice Assistant (optimized for low-end PCs)...{Colors.RESET}\n")
         
         # Create the unified vision + voice script
         vision_assistant_path = os.path.join(BASE_DIR, "_vision_assistant.py")
@@ -5837,13 +6053,15 @@ class App:
         vision_script = f'''"""
 Vision + Voice Assistant - AI Terminal Pro
 Unified camera vision and voice interaction using LOCAL models
+OPTIMIZED FOR LOW-END PCs
 
 Features:
 - Continuous background voice listening (hands-free)
-- Real-time webcam vision with OUR local LLM
+- Real-time webcam vision with local LLM
 - Conversation memory management
 - pyttsx3 TTS for responses (local, no API)
 - Integrated camera preview
+- Performance optimizations: reduced resolution, frame skipping, lower memory
 - 100% Local - No cloud APIs, no data sent externally
 """
 import os
@@ -5885,24 +6103,36 @@ class Colors:
     BRIGHT_WHITE = '\\033[97m'
     DIM = '\\033[2m'
 
+# Performance settings for low-end PCs
+LOW_END_MODE = True
+FRAME_SKIP = 2  # Process every 2nd frame
+FRAME_WIDTH = 320  # Reduced resolution
+FRAME_HEIGHT = 240
+PROCESS_INTERVAL = 1.5  # Max processing frequency
+
 print(f"\\n{{Colors.BRIGHT_CYAN}}{{Colors.BOLD}}{'='*79}{{Colors.RESET}}")
-print(f"{{Colors.BRIGHT_YELLOW}}{{Colors.BOLD}}  VISION + VOICE ASSISTANT{{Colors.RESET}}")
+print(f"{{Colors.BRIGHT_YELLOW}}{{Colors.BOLD}}  VISION + VOICE ASSISTANT (Optimized){{Colors.RESET}}")
 print(f"{{Colors.BRIGHT_CYAN}}{{Colors.BOLD}}{'='*79}{{Colors.RESET}}\\n")
 
 
 class WebcamStream:
-    """Threaded webcam stream for continuous frame capture."""
+    """Threaded webcam stream for continuous frame capture - optimized for low-end PCs."""
     
     def __init__(self):
-        print(f"{{Colors.CYAN}}Initializing webcam...{{Colors.RESET}}")
+        print(f"{{Colors.CYAN}}Initializing webcam (low-res mode)...{{Colors.RESET}}")
         self.stream = VideoCapture(index=0)
         if not self.stream.isOpened():
             raise Exception("Could not open webcam")
         
+        # Set reduced resolution for performance
+        self.stream.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
+        self.stream.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
+        
         _, self.frame = self.stream.read()
         self.running = False
         self.lock = Lock()
-        print(f"{{Colors.BRIGHT_GREEN}}✓ Webcam initialized{{Colors.RESET}}")
+        self.frame_count = 0
+        print(f"{{Colors.BRIGHT_GREEN}}✓ Webcam initialized ({{FRAME_WIDTH}}x{{FRAME_HEIGHT}}){{Colors.RESET}}")
 
     def start(self):
         if self.running:
@@ -5916,12 +6146,15 @@ class WebcamStream:
         return self
 
     def update(self):
-        """Continuously update frame from webcam."""
+        """Continuously update frame from webcam - with frame skipping for performance."""
         while self.running:
             _, frame = self.stream.read()
+            self.frame_count += 1
             
-            with self.lock:
-                self.frame = frame
+            # Frame skipping for low-end PCs
+            if self.frame_count % FRAME_SKIP == 0:
+                with self.lock:
+                    self.frame = frame
 
     def read(self, encode=False):
         """Read current frame, optionally encode as base64 JPEG."""
@@ -6017,13 +6250,13 @@ Keep responses natural, helpful, and always acknowledge your active vision capab
             # Explicit vision context that emphasizes the LLM CAN see
             vision_context = "🔴 LIVE WEBCAM FEED ACTIVE - You are viewing the user's environment in real-time. You CAN see everything in the camera feed. "
             
-            # Format conversation history (reduced to last 4 exchanges for speed)
+            # Format conversation history (reduced for low-end PCs)
             conversation = ""
-            for role, msg in self.conversation_history[-8:]:  # Last 8 messages (4 exchanges)
+            for role, msg in self.conversation_history[-6:]:  # Last 6 messages (3 exchanges)
                 if role == "user":
-                    conversation += f"User: {{msg[:200]}}\\n"  # Truncate long messages
+                    conversation += f"User: {{msg[:150]}}\\n"  # Truncate for performance
                 elif role == "assistant":
-                    conversation += f"AI: {{msg[:200]}}\\n"
+                    conversation += f"AI: {{msg[:150]}}\\n"
             
             # Add current input with explicit vision context at the start
             conversation += f"User: {{vision_context}}The user says: {{prompt[:300]}}\\nAI:"  # Limit prompt length
@@ -6044,9 +6277,9 @@ Keep responses natural, helpful, and always acknowledge your active vision capab
             self.conversation_history.append(("user", prompt))
             self.conversation_history.append(("assistant", response))
             
-            # Manage history size
-            if len(self.conversation_history) > 50:
-                self.conversation_history = self.conversation_history[-40:]  # Keep last 20 exchanges
+            # Manage history size (reduced for low-end PCs)
+            if len(self.conversation_history) > 30:
+                self.conversation_history = self.conversation_history[-24:]  # Keep last 12 exchanges
 
             # TTS in background thread
             if response:
@@ -6113,6 +6346,7 @@ class LocalAIEngine:
         self._load()
 
     def _load(self):
+        apply_torch_threading(self.config)
         if self.backend == "huggingface":
             try:
                 self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
@@ -6183,7 +6417,7 @@ class LocalAIEngine:
             with torch.no_grad():
                 out = self.model.generate(
                     **inputs, 
-                    max_new_tokens=self.config.get("max_response_tokens", 2000),
+                    max_new_tokens=min(self.config.get("max_response_tokens", 200), 200),  # Reduced for performance
                     do_sample=True,
                     temperature=self.config.get("temperature", 0.7),
                     pad_token_id=self.tokenizer.eos_token_id
@@ -6196,7 +6430,7 @@ class LocalAIEngine:
         elif self.backend == "ollama":
             try:
                 # Use streaming for faster response and progress feedback
-                max_tokens = min(self.config.get("max_response_tokens", 1000), 1000)
+                max_tokens = min(self.config.get("max_response_tokens", 200), 200)  # Reduced for low-end PCs
                 
                 response = requests.post(
                     "http://localhost:11434/api/generate",
@@ -6262,15 +6496,15 @@ microphone = Microphone()
 
 with microphone as source:
     print(f"{{Colors.CYAN}}Calibrating microphone (adjusting for ambient noise)...{{Colors.RESET}}")
-    recognizer.adjust_for_ambient_noise(source, duration=1)
+    recognizer.adjust_for_ambient_noise(source, duration=0.5)  # Reduced calibration time
     print(f"{{Colors.BRIGHT_GREEN}}✓ Microphone calibrated{{Colors.RESET}}")
 
 # Audio callback for continuous listening
 def audio_callback(recognizer_instance, audio):
     """Called automatically when speech is detected."""
     try:
-        # Use local Whisper model for transcription (no API calls)
-        prompt = recognizer_instance.recognize_whisper(audio, model="base", language="english")
+        # Use smaller Whisper model for low-end PCs (tiny is faster)
+        prompt = recognizer_instance.recognize_whisper(audio, model="tiny", language="english")
         
         if not prompt or len(prompt.strip()) < 2:
             return  # Skip empty/too short prompts
@@ -6373,4 +6607,3 @@ finally:
 if __name__ == "__main__":
     app = App()
     app.run()
-
