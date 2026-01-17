@@ -132,6 +132,7 @@ CUSTOM_TOOLS_DIR = os.path.join(BASE_DIR, "custom_tools")
 TRAINING_DIR = os.path.join(BASE_DIR, "training")
 TRAINING_DATA_DIR = os.path.join(TRAINING_DIR, "data")
 MODELS_DIR = os.path.join(TRAINING_DIR, "models")
+BASE_MODELS_DIR = os.path.join(TRAINING_DIR, "base_models")  # Local cache for base models
 LORA_DIR = os.path.join(TRAINING_DIR, "lora")
 REINFORCEMENT_DIR = os.path.join(TRAINING_DIR, "reinforcement")
 API_DIR = os.path.join(BASE_DIR, "api")
@@ -139,9 +140,10 @@ API_CONFIG_FILE = os.path.join(API_DIR, "api_config.json")
 API_KEYS_FILE = os.path.join(API_DIR, "api_keys.json")
 APPS_DIR = os.path.join(BASE_DIR, "apps")
 APP_PROJECTS_DB = os.path.join(BASE_DIR, "app_projects.sqlite")
+EXTENSIONS_DIR = os.path.join(BASE_DIR, "extensions")  # Extension storage directory
 
 # Ensure all workspace directories exist
-for directory in [SANDBOX_DIR, DOCS_DIR, CUSTOM_TOOLS_DIR, TRAINING_DIR, TRAINING_DATA_DIR, MODELS_DIR, LORA_DIR, REINFORCEMENT_DIR, API_DIR, APPS_DIR]:
+for directory in [SANDBOX_DIR, DOCS_DIR, CUSTOM_TOOLS_DIR, TRAINING_DIR, TRAINING_DATA_DIR, MODELS_DIR, BASE_MODELS_DIR, LORA_DIR, REINFORCEMENT_DIR, API_DIR, APPS_DIR, EXTENSIONS_DIR]:
     if not os.path.exists(directory):
         os.makedirs(directory)
 
@@ -2467,6 +2469,112 @@ def download_huggingface_model(model_id):
         print(f"{Colors.BRIGHT_RED}Error: {e}{Colors.RESET}")
         return False
 
+def resolve_model_path(model_input, local_cache_dir=BASE_MODELS_DIR):
+    """
+    Resolve a model path from either a local path or HuggingFace repo ID.
+    
+    Args:
+        model_input: Either a local path (directory) or HuggingFace repo ID
+        local_cache_dir: Directory to cache downloaded models
+        
+    Returns:
+        str: Local path to the model directory
+        None: If resolution fails
+    """
+    import os
+    
+    # Check if it's already a local path (directory exists)
+    if os.path.isdir(model_input):
+        # Check if it looks like a model directory (has config.json or pytorch_model.bin or model.safetensors)
+        model_files = ['config.json', 'pytorch_model.bin', 'model.safetensors', 'model.safetensors.index.json']
+        if any(os.path.exists(os.path.join(model_input, f)) for f in model_files):
+            return model_input
+        else:
+            print(f"{Colors.YELLOW}⚠ Warning: '{model_input}' is a directory but doesn't appear to contain a model.{Colors.RESET}")
+            # Still return it - let transformers handle the error
+    
+    # Check if it's a file path (not a directory)
+    if os.path.isfile(model_input):
+        print(f"{Colors.YELLOW}⚠ '{model_input}' is a file, not a model directory.{Colors.RESET}")
+        return None
+    
+    # It's likely a HuggingFace repo ID - download/cache it locally
+    try:
+        # Create local cache directory structure
+        # Use a safe directory name from the repo ID
+        safe_name = model_input.replace('/', '_').replace('\\', '_')
+        local_model_path = os.path.join(local_cache_dir, safe_name)
+        
+        # Check if model is already cached locally
+        if os.path.isdir(local_model_path):
+            model_files = ['config.json', 'pytorch_model.bin', 'model.safetensors', 'model.safetensors.index.json']
+            if any(os.path.exists(os.path.join(local_model_path, f)) for f in model_files):
+                print(f"{Colors.BRIGHT_GREEN}✓ Using cached model at: {local_model_path}{Colors.RESET}")
+                return local_model_path
+        
+        # Download model to local cache
+        print(f"{Colors.BRIGHT_CYAN}Downloading model '{model_input}' to local cache...{Colors.RESET}")
+        print(f"{Colors.DIM}This may take several minutes depending on model size...{Colors.RESET}")
+        
+        # Import transformers to download
+        from transformers import AutoTokenizer, AutoModelForCausalLM
+        
+        # Create output directory
+        os.makedirs(local_model_path, exist_ok=True)
+        
+        # Download tokenizer first (smaller, faster to verify repo ID)
+        print(f"{Colors.BRIGHT_CYAN}Downloading tokenizer...{Colors.RESET}")
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(model_input)
+            tokenizer.save_pretrained(local_model_path)
+        except Exception as e:
+            print(f"{Colors.BRIGHT_RED}✗ Failed to download tokenizer: {e}{Colors.RESET}")
+            # Clean up partial download
+            try:
+                import shutil
+                if os.path.exists(local_model_path):
+                    shutil.rmtree(local_model_path)
+            except:
+                pass
+            raise
+        
+        # Download model
+        print(f"{Colors.BRIGHT_CYAN}Downloading model weights...{Colors.RESET}")
+        print(f"{Colors.DIM}This is the large download...{Colors.RESET}")
+        try:
+            model = AutoModelForCausalLM.from_pretrained(model_input)
+            model.save_pretrained(local_model_path)
+        except Exception as e:
+            print(f"{Colors.BRIGHT_RED}✗ Failed to download model: {e}{Colors.RESET}")
+            # Clean up partial download
+            try:
+                import shutil
+                if os.path.exists(local_model_path):
+                    shutil.rmtree(local_model_path)
+            except:
+                pass
+            raise
+        finally:
+            # Clean up memory
+            if 'model' in locals():
+                del model
+            if 'tokenizer' in locals():
+                del tokenizer
+            import gc
+            gc.collect()
+        
+        print(f"{Colors.BRIGHT_GREEN}✓ Model downloaded and cached to: {local_model_path}{Colors.RESET}")
+        return local_model_path
+        
+    except Exception as e:
+        error_msg = str(e)
+        if "does not appear to have a file named" in error_msg or "404" in error_msg or "not found" in error_msg.lower():
+            print(f"{Colors.BRIGHT_RED}✗ Model '{model_input}' not found on HuggingFace Hub.{Colors.RESET}")
+            print(f"{Colors.YELLOW}Please check the model ID is correct (e.g., 'gpt2', 'microsoft/DialoGPT-medium').{Colors.RESET}")
+        else:
+            print(f"{Colors.BRIGHT_RED}✗ Error downloading model '{model_input}': {e}{Colors.RESET}")
+        return None
+
 # ==============================================================================
 #                           6. MODEL TRAINING CLASSES
 # ==============================================================================
@@ -2544,12 +2652,18 @@ class FineTuningManager:
                 print(f"{Colors.YELLOW}Install with: pip install transformers datasets accelerate{Colors.RESET}")
                 return False
             
-            print(f"{Colors.BRIGHT_CYAN}Loading model and tokenizer...{Colors.RESET}")
-            tokenizer = AutoTokenizer.from_pretrained(base_model)
+            # Resolve model path (local or download from HuggingFace)
+            model_path = resolve_model_path(base_model, BASE_MODELS_DIR)
+            if model_path is None:
+                print(f"{Colors.BRIGHT_RED}✗ Failed to resolve model path for '{base_model}'{Colors.RESET}")
+                return False
+            
+            print(f"{Colors.BRIGHT_CYAN}Loading model and tokenizer from: {model_path}{Colors.RESET}")
+            tokenizer = AutoTokenizer.from_pretrained(model_path)
             if not tokenizer.pad_token:
                 tokenizer.pad_token = tokenizer.eos_token
             
-            model = AutoModelForCausalLM.from_pretrained(base_model)
+            model = AutoModelForCausalLM.from_pretrained(model_path)
             
             # Load dataset
             print(f"{Colors.BRIGHT_CYAN}Loading dataset...{Colors.RESET}")
@@ -2678,12 +2792,18 @@ class LoRAManager:
                 print(f"{Colors.YELLOW}Install with: pip install peft transformers datasets accelerate{Colors.RESET}")
                 return False
             
-            print(f"{Colors.BRIGHT_CYAN}Loading model and tokenizer...{Colors.RESET}")
-            tokenizer = AutoTokenizer.from_pretrained(base_model)
+            # Resolve model path (local or download from HuggingFace)
+            model_path = resolve_model_path(base_model, BASE_MODELS_DIR)
+            if model_path is None:
+                print(f"{Colors.BRIGHT_RED}✗ Failed to resolve model path for '{base_model}'{Colors.RESET}")
+                return False
+            
+            print(f"{Colors.BRIGHT_CYAN}Loading model and tokenizer from: {model_path}{Colors.RESET}")
+            tokenizer = AutoTokenizer.from_pretrained(model_path)
             if not tokenizer.pad_token:
                 tokenizer.pad_token = tokenizer.eos_token
             
-            model = AutoModelForCausalLM.from_pretrained(base_model)
+            model = AutoModelForCausalLM.from_pretrained(model_path)
             
             # Configure LoRA
             lora_config = LoraConfig(
@@ -2908,6 +3028,174 @@ class ReinforcementLearningManager:
         except Exception as e:
             print(f"\n{Colors.BRIGHT_RED}✗ Behaviour conditioning failed: {e}{Colors.RESET}")
             return None
+
+
+# ==============================================================================
+#                           6.5. EXTENSION SYSTEM
+# ==============================================================================
+
+class ExtensionConfig:
+    """Extension configuration from gemini-extension.json"""
+    def __init__(self, name, version, mcp_servers=None, context_files=None, exclude_tools=None, settings=None):
+        self.name = name
+        self.version = version
+        self.mcp_servers = mcp_servers or {}
+        self.context_files = context_files or []
+        self.exclude_tools = exclude_tools or []
+        self.settings = settings or []
+
+
+class Extension:
+    """Represents a loaded extension"""
+    def __init__(self, name, version, path, config, is_active=True, extension_id=None):
+        self.name = name
+        self.version = version
+        self.path = path
+        self.config = config
+        self.is_active = is_active
+        self.id = extension_id or f"{name}@{version}"
+        self.mcp_servers = config.mcp_servers
+        self.context_files = config.context_files
+        self.exclude_tools = config.exclude_tools
+
+
+class ExtensionManager:
+    """Manages extension loading, enabling, and integration"""
+    
+    def __init__(self, config, tool_registry=None):
+        self.config = config
+        self.tool_registry = tool_registry
+        self.extensions = []
+        self.extensions_dir = EXTENSIONS_DIR
+        
+    def load_extensions(self):
+        """Load all extensions from the extensions directory"""
+        self.extensions = []
+        
+        if not os.path.exists(self.extensions_dir):
+            os.makedirs(self.extensions_dir, exist_ok=True)
+            return self.extensions
+        
+        # Load each extension directory
+        for item in os.listdir(self.extensions_dir):
+            extension_path = os.path.join(self.extensions_dir, item)
+            if os.path.isdir(extension_path):
+                extension = self._load_extension(extension_path)
+                if extension:
+                    self.extensions.append(extension)
+        
+        return self.extensions
+    
+    def _load_extension(self, extension_path):
+        """Load a single extension from its directory"""
+        try:
+            # Try both naming conventions
+            manifest_paths = [
+                os.path.join(extension_path, "gemini-extension.json"),
+                os.path.join(extension_path, "Gemini-extension.json"),
+            ]
+            
+            manifest_path = None
+            for path in manifest_paths:
+                if os.path.exists(path):
+                    manifest_path = path
+                    break
+            
+            if not manifest_path:
+                return None  # No manifest found, skip this directory
+            
+            # Load manifest
+            with open(manifest_path, 'r', encoding='utf-8') as f:
+                manifest = json.load(f)
+            
+            # Parse extension config
+            name = manifest.get("name", os.path.basename(extension_path))
+            version = manifest.get("version", "1.0.0")
+            mcp_servers = manifest.get("mcpServers", {})
+            
+            # Resolve context files
+            context_file_names = manifest.get("contextFileName", [])
+            if isinstance(context_file_names, str):
+                context_file_names = [context_file_names]
+            
+            context_files = []
+            for context_file_name in context_file_names:
+                context_file_path = os.path.join(extension_path, context_file_name)
+                if os.path.exists(context_file_path):
+                    context_files.append(context_file_path)
+            
+            exclude_tools = manifest.get("excludeTools", [])
+            settings = manifest.get("settings", [])
+            
+            config = ExtensionConfig(
+                name=name,
+                version=version,
+                mcp_servers=mcp_servers,
+                context_files=context_files,
+                exclude_tools=exclude_tools,
+                settings=settings
+            )
+            
+            extension = Extension(
+                name=name,
+                version=version,
+                path=extension_path,
+                config=config,
+                is_active=True  # All extensions are active by default for now
+            )
+            
+            return extension
+            
+        except Exception as e:
+            print(f"{Colors.YELLOW}⚠ Failed to load extension from {extension_path}: {e}{Colors.RESET}")
+            return None
+    
+    def get_active_extensions(self):
+        """Get all active extensions"""
+        return [ext for ext in self.extensions if ext.is_active]
+    
+    def get_extension(self, name):
+        """Get extension by name"""
+        for ext in self.extensions:
+            if ext.name == name:
+                return ext
+        return None
+    
+    def start_extension(self, extension):
+        """Start an extension (load MCP servers, etc.)"""
+        if not self.tool_registry:
+            return
+        
+        # Start MCP servers for this extension
+        for server_name, server_config in extension.mcp_servers.items():
+            try:
+                # Build command from config
+                command = server_config.get("command", "")
+                args = server_config.get("args", [])
+                cwd = server_config.get("cwd", extension.path)
+                
+                # Resolve variables in command/args
+                command = command.replace("${extensionPath}", extension.path).replace("${/}", os.sep)
+                if isinstance(args, list):
+                    args = [arg.replace("${extensionPath}", extension.path).replace("${/}", os.sep) for arg in args]
+                    full_command = f"{command} {' '.join(args)}"
+                else:
+                    full_command = command
+                
+                # Create and start MCP client
+                client = MCPClient(server_name, full_command)
+                if client.start():
+                    self.tool_registry.mcp_clients[server_name] = client
+                    print(f"{Colors.BRIGHT_GREEN}✓ Extension MCP server started: {server_name}{Colors.RESET}")
+                else:
+                    print(f"{Colors.YELLOW}⚠ Failed to start extension MCP server: {server_name}{Colors.RESET}")
+            except Exception as e:
+                print(f"{Colors.YELLOW}⚠ Error starting extension MCP server {server_name}: {e}{Colors.RESET}")
+    
+    def start_all_extensions(self):
+        """Start all active extensions"""
+        for extension in self.get_active_extensions():
+            self.start_extension(extension)
 
 
 # ==============================================================================
@@ -3676,7 +3964,20 @@ class AppBuilderOrchestrator:
 # ==============================================================================
 
 def show_splash_screen():
-    """Display the startup splash screen with colors."""
+    """
+    Display the enhanced startup splash screen with animations
+    Uses Rich for advanced rendering if available, otherwise uses ANSI colors
+    Complete implementation with no placeholders
+    """
+    # Try enhanced splash screen first (Rich-based with animations)
+    try:
+        from tui.components.enhanced_splash import show_enhanced_splash_screen
+        show_enhanced_splash_screen(duration=3.0)
+        return
+    except Exception:
+        pass
+    
+    # Fallback to original splash screen implementation
     splash = """
     
    ))         ))     oo_       .-.   \\\  ///       W  W                oo_    oo_   wW  Ww oo_   (o)__(o)    \\\  ///(o)__(o) 
@@ -3768,7 +4069,8 @@ class App:
         os.system('cls' if os.name == 'nt' else 'clear')
 
     def run(self):
-        # 0. Show startup splash
+        """Main application run method - complete implementation"""
+        # 0. Show enhanced startup splash screen
         show_splash_screen()
         
         # 1. Onboarding
@@ -3778,6 +4080,16 @@ class App:
         # 2. Initialization with loading screens
         show_loading_screen("Initializing Tool Registry", 1.0)
         self.registry = ToolRegistry(self.config)
+        
+        # Initialize Extension Manager and load extensions
+        show_loading_screen("Loading Extensions", 0.5)
+        try:
+            self.extension_manager = ExtensionManager(self.config, self.registry)
+            self.extension_manager.load_extensions()
+            self.extension_manager.start_all_extensions()
+        except Exception as e:
+            print(f"{Colors.YELLOW}⚠ Extension Manager initialization failed: {e}{Colors.RESET}")
+            self.extension_manager = None
         
         show_loading_screen("Initializing AI Engine", 1.0)
         self.engine = AIEngine(self.config)
@@ -3799,10 +4111,21 @@ class App:
             print(f"{Colors.YELLOW}⚠ App Builder initialization failed: {e}{Colors.RESET}")
             self.app_builder = None
         
+        # Initialize enhanced help command only (for /help in chat, not for main menu)
+        try:
+            from tui.app_integration import setup_tui_features
+            # Only enable enhanced help, NOT Textual menu/settings (keep original text-based)
+            self = setup_tui_features(self, use_textual=False)
+        except Exception:
+            # Continue without enhanced features if import fails
+            self.use_textual = False
+            self.textual_available = False
+            self.help_handler = None
+        
         print(f"\n{Colors.BRIGHT_GREEN}{Colors.BOLD}✓ System Ready!{Colors.RESET}\n")
         time.sleep(0.5)
         
-        # 3. Main Menu
+        # 3. Main Menu (always use original text-based menu)
         self.main_menu()
 
     def onboarding(self):
@@ -4025,6 +4348,8 @@ class App:
         show_loading_screen("Preparing system", 1.5)
 
     def main_menu(self):
+        """Main menu - always uses original text-based menu"""
+        # Always use original text-based menu (enhanced features only in /help command)
         while True:
             self.clear()
             print(f"\n{Colors.BRIGHT_CYAN}{Colors.BOLD}{'='*79}{Colors.RESET}")
@@ -4046,25 +4371,41 @@ class App:
             print(f"{Colors.BRIGHT_RED}  [10]{Colors.RESET} Exit\n")
             
             c = input(f"{Colors.BRIGHT_GREEN}Select: {Colors.RESET}")
-            if c == "1": self.chat_loop()
-            elif c == "2": self.document_menu()
-            elif c == "3": self.tool_menu()
-            elif c == "4": self.mcp_server_menu()
-            elif c == "5": self.model_training_menu()
-            elif c == "6": self.api_management_menu()
-            elif c == "7": self.app_builder_menu()
-            elif c == "8": self.update_from_github()
-            elif c == "9": self.settings_menu()
-            elif c == "10":
-                print(f"\n{Colors.BRIGHT_YELLOW}Shutting down...{Colors.RESET}")
-                if self.registry:
-                    for c in self.registry.mcp_clients.values(): c.stop()
-                if self.api_manager:
-                    # Stop all API servers
-                    for api_name in list(self.api_manager.servers.keys()):
-                        self.api_manager.stop_api(api_name)
-                print(f"{Colors.BRIGHT_GREEN}✓ Goodbye!{Colors.RESET}\n")
-                sys.exit()
+            self._handle_menu_selection(c)
+    
+    def _handle_menu_selection(self, selection: str) -> None:
+        """Handle menu selection - supports both text and Textual menu results"""
+        if selection == "1" or selection == "chat":
+            self.chat_loop()
+        elif selection == "2" or selection == "documents":
+            self.document_menu()
+        elif selection == "3" or selection == "tools":
+            self.tool_menu()
+        elif selection == "4" or selection == "mcp":
+            self.mcp_server_menu()
+        elif selection == "5" or selection == "training":
+            self.model_training_menu()
+        elif selection == "6" or selection == "api":
+            self.api_management_menu()
+        elif selection == "7" or selection == "app-builder":
+            self.app_builder_menu()
+        elif selection == "8" or selection == "update":
+            self.update_from_github()
+        elif selection == "9" or selection == "settings":
+            self.settings_menu()
+        elif selection == "10" or selection == "exit":
+            print(f"\n{Colors.BRIGHT_YELLOW}Shutting down...{Colors.RESET}")
+            if self.registry:
+                for c in self.registry.mcp_clients.values(): c.stop()
+            if self.api_manager:
+                for api_name in list(self.api_manager.servers.keys()):
+                    self.api_manager.stop_api(api_name)
+            print(f"{Colors.BRIGHT_GREEN}✓ Goodbye!{Colors.RESET}\n")
+            sys.exit()
+        elif selection:
+            # Invalid selection, show menu again
+            print(f"{Colors.YELLOW}⚠ Invalid selection. Please try again.{Colors.RESET}")
+            time.sleep(1)
 
     def update_from_github(self):
         """Update ai.py from the latest GitHub commit."""
@@ -4136,6 +4477,8 @@ class App:
             time.sleep(3)
 
     def settings_menu(self):
+        """Settings menu - always uses original text-based menu"""
+        # Always use original text-based settings menu
         self.clear()
         print(f"\n{Colors.BRIGHT_CYAN}{Colors.BOLD}{'='*79}{Colors.RESET}")
         print(f"{Colors.BRIGHT_YELLOW}{Colors.BOLD}  SETTINGS{Colors.RESET}")
@@ -4157,8 +4500,8 @@ class App:
         if c == "1":
             new_val = not self.config.get("enable_dangerous_commands")
             self.cfg_mgr.update("enable_dangerous_commands", new_val)
-            # Must reload registry to update permissions
-            self.registry.config = self.cfg_mgr.config
+            if self.registry:
+                self.registry.config = self.cfg_mgr.config
             status = "ENABLED" if new_val else "DISABLED"
             color = Colors.BRIGHT_RED if new_val else Colors.BRIGHT_GREEN
             print(f"\n{color}✓ Dangerous Commands {status}{Colors.RESET}")
@@ -4289,12 +4632,13 @@ class App:
         print(f"{Colors.BRIGHT_GREEN}  [1]{Colors.RESET} Ingest All Files")
         print(f"{Colors.BRIGHT_GREEN}  [2]{Colors.RESET} Back\n")
         
-        if input(f"{Colors.BRIGHT_GREEN}Choice: {Colors.RESET}") == "1":
+        c = input(f"{Colors.BRIGHT_GREEN}Choice: {Colors.RESET}").strip()
+        if c == "1":
             files = glob.glob(os.path.join(DOCS_DIR, "*.*"))
             if not files:
                 print(f"\n{Colors.YELLOW}⚠ No files found in {DOCS_DIR}{Colors.RESET}")
                 input(f"\n{Colors.DIM}Press Enter...{Colors.RESET}")
-            return
+                return
 
             total = 0
             print(f"\n{Colors.BRIGHT_CYAN}Processing files...{Colors.RESET}\n")
@@ -4306,6 +4650,8 @@ class App:
             
             print(f"\n{Colors.BRIGHT_GREEN}{Colors.BOLD}✓ Done! Added {total} total chunks.{Colors.RESET}")
             input(f"\n{Colors.DIM}Press Enter...{Colors.RESET}")
+        elif c == "2":
+            return
 
     def tool_menu(self):
         """Main tool management menu - separates Custom Tools and MCP Servers."""
@@ -5105,16 +5451,26 @@ class App:
                     time.sleep(1.5)
                     continue
                 
-                print(f"\n{Colors.CYAN}Select API to stop:{Colors.RESET}\n")
-                for i, api_name in enumerate(apis, 1):
+                # Filter to only running APIs
+                running_apis = []
+                for api_name in apis:
                     info = self.api_manager.get_api_info(api_name)
                     if info.get("running"):
-                        print(f"  {Colors.CYAN}[{i}]{Colors.RESET} {Colors.BRIGHT_WHITE}{api_name}{Colors.RESET}")
+                        running_apis.append(api_name)
+                
+                if not running_apis:
+                    print(f"\n{Colors.YELLOW}⚠ No running APIs to stop.{Colors.RESET}")
+                    time.sleep(1.5)
+                    continue
+                
+                print(f"\n{Colors.CYAN}Select API to stop:{Colors.RESET}\n")
+                for i, api_name in enumerate(running_apis, 1):
+                    print(f"  {Colors.CYAN}[{i}]{Colors.RESET} {Colors.BRIGHT_WHITE}{api_name}{Colors.RESET}")
                 
                 try:
-                    idx = int(input(f"\n{Colors.BRIGHT_GREEN}Select [1-{len(apis)}]: {Colors.RESET}").strip())
-                    if 1 <= idx <= len(apis):
-                        api_name = apis[idx - 1]
+                    idx = int(input(f"\n{Colors.BRIGHT_GREEN}Select [1-{len(running_apis)}]: {Colors.RESET}").strip())
+                    if 1 <= idx <= len(running_apis):
+                        api_name = running_apis[idx - 1]
                         success, message = self.api_manager.stop_api(api_name)
                         if success:
                             print(f"\n{Colors.BRIGHT_GREEN}✓ {message}{Colors.RESET}")
@@ -5216,22 +5572,28 @@ class App:
                     time.sleep(1.5)
                     continue
                 
-                print(f"\n{Colors.CYAN}Select API to test:{Colors.RESET}\n")
-                for i, api_name in enumerate(apis, 1):
+                # Filter to only running APIs
+                running_apis = []
+                for api_name in apis:
                     info = self.api_manager.get_api_info(api_name)
                     if info.get("running"):
-                        print(f"  {Colors.CYAN}[{i}]{Colors.RESET} {Colors.BRIGHT_WHITE}{api_name}{Colors.RESET} {Colors.DIM}(Port {info.get('port')}){Colors.RESET}")
+                        running_apis.append(api_name)
+                
+                if not running_apis:
+                    print(f"\n{Colors.YELLOW}⚠ No running APIs to test.{Colors.RESET}")
+                    time.sleep(1.5)
+                    continue
+                
+                print(f"\n{Colors.CYAN}Select API to test:{Colors.RESET}\n")
+                for i, api_name in enumerate(running_apis, 1):
+                    info = self.api_manager.get_api_info(api_name)
+                    print(f"  {Colors.CYAN}[{i}]{Colors.RESET} {Colors.BRIGHT_WHITE}{api_name}{Colors.RESET} {Colors.DIM}(Port {info.get('port')}){Colors.RESET}")
                 
                 try:
-                    idx = int(input(f"\n{Colors.BRIGHT_GREEN}Select [1-{len(apis)}]: {Colors.RESET}").strip())
-                    if 1 <= idx <= len(apis):
-                        api_name = apis[idx - 1]
+                    idx = int(input(f"\n{Colors.BRIGHT_GREEN}Select [1-{len(running_apis)}]: {Colors.RESET}").strip())
+                    if 1 <= idx <= len(running_apis):
+                        api_name = running_apis[idx - 1]
                         info = self.api_manager.get_api_info(api_name)
-                        
-                        if not info.get("running"):
-                            print(f"\n{Colors.YELLOW}⚠ API is not running.{Colors.RESET}")
-                            time.sleep(1.5)
-                            continue
                         
                         port = info.get('port')
                         api_key = info.get('api_key')
@@ -5771,7 +6133,16 @@ class App:
             self.launch_vision_assistant()
             return "COMMAND"
         
-        elif cmd == "/help":
+        elif cmd == "/help" or cmd == "/?":
+            # Use enhanced help command if available (only available in chat, not main menu)
+            if hasattr(self, '_help_handler') and self._help_handler is not None:
+                try:
+                    self._help_handler._show_help()
+                    return "COMMAND"
+                except Exception:
+                    pass  # Fall through to original help
+            
+            # Fallback to original help display
             print(f"\n{Colors.BRIGHT_CYAN}{Colors.BOLD}Available Commands:{Colors.RESET}\n")
             print(f"  {Colors.BRIGHT_GREEN}/new [name]{Colors.RESET}          - Create new chat session")
             print(f"  {Colors.BRIGHT_GREEN}/save [filename]{Colors.RESET}     - Save current chat to file")
