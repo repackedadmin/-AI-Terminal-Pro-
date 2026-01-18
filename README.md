@@ -259,6 +259,10 @@ ACTION: TOOL_NAME arg1 arg2 ...
 - 📋 GPU + CPU compatibility optimizations
 ---
 
+<img width="655" height="969" alt="Ai Terminal Pro - Code reviewer concerns" src="https://github.com/user-attachments/assets/d909b4bb-f6b2-461e-861a-24858dad0799" />
+<img width="662" height="389" alt="AI Terminal Pro - menu " src="https://github.com/user-attachments/assets/29a7d44a-5c89-4129-8557-a03b73c219b2" />
+<img width="971" height="949" alt="AI Terminal Pro - menu in chat " src="https://github.com/user-attachments/assets/45f0ed87-332e-4524-884b-6291a4881333" />
+<img width="1281" height="947" alt="AI Terminal Pro - menu in chat1 " src="https://github.com/user-attachments/assets/4189b475-e392-4503-bc49-1347951c45e9" />
 <img width="1296" height="576" alt="FMJ9J61" src="https://github.com/user-attachments/assets/fbbc5ea5-451d-40b9-942a-8d0af8986478" />
 <img width="1296" height="576" alt="xjGMhsH" src="https://github.com/user-attachments/assets/8f42fc81-b09b-4ed4-b081-1e5881a09d0b" />
 <img width="1296" height="576" alt="xN0yKbW" src="https://github.com/user-attachments/assets/d3db41d6-d751-4f1f-a072-2aaab3e5af40" />
