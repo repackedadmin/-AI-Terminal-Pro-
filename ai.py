@@ -81,6 +81,16 @@ try:
 except ImportError:
     AUDIO_AVAILABLE = False
 
+# System Info and Status Widget
+try:
+    from tui.components.system_info import (
+        SystemInfo, StatusWidget, get_system_info, get_status_widget,
+        is_windows, is_macos, is_linux
+    )
+    SYSTEM_INFO_AVAILABLE = True
+except ImportError:
+    SYSTEM_INFO_AVAILABLE = False
+
 # ANSI Color Codes for cross-platform terminal colors
 class Colors:
     RESET = '\033[0m'
@@ -6157,26 +6167,1265 @@ class App:
             print(f"\n{Colors.BRIGHT_RED}/back, /exit{Colors.RESET}        - Exit chat")
             print(f"  {Colors.BRIGHT_GREEN}/help{Colors.RESET}               - Show this help")
             return "COMMAND"
-        
+
+        elif cmd == "/clear":
+            # Clear the screen
+            self.clear()
+            print(f"\n{Colors.BRIGHT_CYAN}{Colors.BOLD}{'='*79}{Colors.RESET}")
+            print(f"{Colors.BRIGHT_YELLOW}{Colors.BOLD}  CHAT MODE ACTIVE{Colors.RESET}")
+            print(f"{Colors.BRIGHT_CYAN}{Colors.BOLD}{'='*79}{Colors.RESET}")
+            if self.current_session_id:
+                session = self.memory.get_session(self.current_session_id)
+                if session:
+                    print(f"{Colors.CYAN}Session:{Colors.RESET} {Colors.BRIGHT_WHITE}{session[1]}{Colors.RESET}")
+            if self.current_project_id:
+                project = self.memory.get_project(self.current_project_id)
+                if project:
+                    print(f"{Colors.CYAN}Project:{Colors.RESET} {Colors.BRIGHT_WHITE}{project[1]}{Colors.RESET}")
+            print(f"{Colors.DIM}Type '/help' for commands, '/back' to exit{Colors.RESET}\n")
+            return "COMMAND"
+
+        elif cmd == "/status":
+            # Show system status
+            print(f"\n{Colors.BRIGHT_CYAN}{Colors.BOLD}System Status{Colors.RESET}")
+            print(f"{Colors.DIM}{'─'*50}{Colors.RESET}")
+
+            # Model info
+            backend = self.config.get('backend', 'unknown')
+            model = self.config.get('model_name', 'unknown')
+            print(f"  {Colors.CYAN}Backend:{Colors.RESET} {Colors.BRIGHT_WHITE}{backend}{Colors.RESET}")
+            print(f"  {Colors.CYAN}Model:{Colors.RESET} {Colors.BRIGHT_WHITE}{model}{Colors.RESET}")
+
+            # Session info
+            if self.current_session_id:
+                session = self.memory.get_session(self.current_session_id)
+                print(f"  {Colors.CYAN}Session:{Colors.RESET} {Colors.BRIGHT_WHITE}{session[1] if session else 'None'}{Colors.RESET}")
+
+            # Project info
+            if self.current_project_id:
+                project = self.memory.get_project(self.current_project_id)
+                print(f"  {Colors.CYAN}Project:{Colors.RESET} {Colors.BRIGHT_WHITE}{project[1] if project else 'None'}{Colors.RESET}")
+
+            # Config info
+            print(f"  {Colors.CYAN}Temperature:{Colors.RESET} {Colors.BRIGHT_WHITE}{self.config.get('temperature', 0.7)}{Colors.RESET}")
+            print(f"  {Colors.CYAN}Max Tokens:{Colors.RESET} {Colors.BRIGHT_WHITE}{self.config.get('max_response_tokens', 2000)}{Colors.RESET}")
+            print(f"  {Colors.CYAN}Context Window:{Colors.RESET} {Colors.BRIGHT_WHITE}{self.config.get('max_context_window', 32768)}{Colors.RESET}")
+
+            # MCP server status
+            if hasattr(self, 'registry') and self.registry:
+                mcp_count = len(self.registry.mcp_clients) if hasattr(self.registry, 'mcp_clients') else 0
+                print(f"  {Colors.CYAN}MCP Servers:{Colors.RESET} {Colors.BRIGHT_WHITE}{mcp_count} configured{Colors.RESET}")
+
+            print()
+            return "COMMAND"
+
+        elif cmd == "/model":
+            # Show or change model
+            if not args:
+                # Show current model
+                backend = self.config.get('backend', 'unknown')
+                model = self.config.get('model_name', 'unknown')
+                print(f"\n{Colors.BRIGHT_CYAN}Current Model Configuration:{Colors.RESET}")
+                print(f"  {Colors.CYAN}Backend:{Colors.RESET} {Colors.BRIGHT_WHITE}{backend}{Colors.RESET}")
+                print(f"  {Colors.CYAN}Model:{Colors.RESET} {Colors.BRIGHT_WHITE}{model}{Colors.RESET}")
+                print(f"\n{Colors.DIM}Use /model [name] to switch models{Colors.RESET}")
+            else:
+                # Change model
+                new_model = args.strip()
+                old_model = self.config.get('model_name', 'unknown')
+                self.cfg_mgr.update('model_name', new_model)
+                print(f"\n{Colors.BRIGHT_GREEN}✓ Model changed:{Colors.RESET} {Colors.DIM}{old_model}{Colors.RESET} → {Colors.BRIGHT_WHITE}{new_model}{Colors.RESET}")
+                print(f"{Colors.YELLOW}Note: Model change will take effect on next message or after reload{Colors.RESET}")
+            return "COMMAND"
+
+        elif cmd == "/config":
+            # Show or change configuration
+            if not args:
+                # Show all config
+                print(f"\n{Colors.BRIGHT_CYAN}{Colors.BOLD}Current Configuration:{Colors.RESET}")
+                print(f"{Colors.DIM}{'─'*50}{Colors.RESET}")
+                for key, value in self.config.items():
+                    if key != 'system_prompt':  # Don't show long system prompt
+                        print(f"  {Colors.CYAN}{key}:{Colors.RESET} {Colors.BRIGHT_WHITE}{value}{Colors.RESET}")
+                print(f"\n{Colors.DIM}Use /config [key] [value] to change settings{Colors.RESET}")
+            else:
+                # Change config
+                parts = args.split(" ", 1)
+                key = parts[0].strip()
+                if len(parts) > 1:
+                    value = parts[1].strip()
+                    # Try to convert to appropriate type
+                    try:
+                        if value.lower() in ('true', 'false'):
+                            value = value.lower() == 'true'
+                        elif '.' in value:
+                            value = float(value)
+                        else:
+                            value = int(value)
+                    except ValueError:
+                        pass  # Keep as string
+
+                    old_value = self.config.get(key, 'not set')
+                    self.cfg_mgr.update(key, value)
+                    print(f"\n{Colors.BRIGHT_GREEN}✓ Config updated:{Colors.RESET} {key}: {Colors.DIM}{old_value}{Colors.RESET} → {Colors.BRIGHT_WHITE}{value}{Colors.RESET}")
+                else:
+                    # Show specific config value
+                    if key in self.config:
+                        print(f"\n{Colors.CYAN}{key}:{Colors.RESET} {Colors.BRIGHT_WHITE}{self.config[key]}{Colors.RESET}")
+                    else:
+                        print(f"\n{Colors.YELLOW}Unknown config key: {key}{Colors.RESET}")
+            return "COMMAND"
+
+        elif cmd == "/rag":
+            # RAG management commands
+            subcmd = args.split()[0].lower() if args else ""
+            subargs = " ".join(args.split()[1:]) if args and len(args.split()) > 1 else ""
+
+            if not subcmd:
+                # Show RAG status
+                print(f"\n{Colors.BRIGHT_CYAN}{Colors.BOLD}RAG Status{Colors.RESET}")
+                print(f"{Colors.DIM}{'─'*50}{Colors.RESET}")
+                try:
+                    # Get document count from memory
+                    cursor = self.memory.conn.cursor()
+                    cursor.execute("SELECT COUNT(*) FROM documents")
+                    doc_count = cursor.fetchone()[0]
+                    cursor.execute("SELECT COUNT(DISTINCT source) FROM documents")
+                    source_count = cursor.fetchone()[0]
+                    print(f"  {Colors.CYAN}Documents:{Colors.RESET} {Colors.BRIGHT_WHITE}{source_count} files{Colors.RESET}")
+                    print(f"  {Colors.CYAN}Chunks:{Colors.RESET} {Colors.BRIGHT_WHITE}{doc_count} chunks{Colors.RESET}")
+                    if self.current_project_id:
+                        cursor.execute("SELECT COUNT(*) FROM documents WHERE project_id = ?", (self.current_project_id,))
+                        proj_count = cursor.fetchone()[0]
+                        print(f"  {Colors.CYAN}Project Chunks:{Colors.RESET} {Colors.BRIGHT_WHITE}{proj_count}{Colors.RESET}")
+                except Exception as e:
+                    print(f"  {Colors.RED}Error getting RAG status: {e}{Colors.RESET}")
+                print(f"\n{Colors.DIM}Commands: /rag add, /rag search, /rag list, /rag clear{Colors.RESET}")
+
+            elif subcmd == "list":
+                # List documents
+                print(f"\n{Colors.BRIGHT_CYAN}Ingested Documents:{Colors.RESET}")
+                try:
+                    cursor = self.memory.conn.cursor()
+                    cursor.execute("SELECT DISTINCT source FROM documents ORDER BY source")
+                    sources = cursor.fetchall()
+                    if sources:
+                        for src in sources[:20]:  # Limit to 20
+                            print(f"  {Colors.DIM}•{Colors.RESET} {Colors.BRIGHT_WHITE}{src[0]}{Colors.RESET}")
+                        if len(sources) > 20:
+                            print(f"  {Colors.DIM}... and {len(sources) - 20} more{Colors.RESET}")
+                    else:
+                        print(f"  {Colors.YELLOW}No documents loaded{Colors.RESET}")
+                except Exception as e:
+                    print(f"  {Colors.RED}Error: {e}{Colors.RESET}")
+
+            elif subcmd == "search":
+                # Search documents
+                if not subargs:
+                    print(f"{Colors.YELLOW}Usage: /rag search [query]{Colors.RESET}")
+                else:
+                    print(f"\n{Colors.BRIGHT_CYAN}Searching for: {Colors.BRIGHT_WHITE}{subargs}{Colors.RESET}")
+                    results = self.memory.retrieve_context(subargs, self.current_project_id)
+                    if results:
+                        print(f"\n{Colors.BRIGHT_GREEN}Found context:{Colors.RESET}")
+                        # Show truncated results
+                        display = results[:500] + "..." if len(results) > 500 else results
+                        print(f"{Colors.DIM}{display}{Colors.RESET}")
+                    else:
+                        print(f"{Colors.YELLOW}No relevant documents found{Colors.RESET}")
+
+            elif subcmd == "add":
+                # Add document - redirect to document loader
+                print(f"\n{Colors.BRIGHT_CYAN}Document Loading{Colors.RESET}")
+                if subargs:
+                    path = subargs.strip()
+                    if os.path.exists(path):
+                        print(f"{Colors.YELLOW}Use the Document Loader from main menu for full functionality{Colors.RESET}")
+                        print(f"{Colors.DIM}Path: {path}{Colors.RESET}")
+                    else:
+                        print(f"{Colors.RED}Path not found: {path}{Colors.RESET}")
+                else:
+                    print(f"{Colors.YELLOW}Use the Document Loader (option 2) from main menu{Colors.RESET}")
+
+            elif subcmd == "clear":
+                # Clear documents
+                confirm = input(f"{Colors.BRIGHT_RED}Clear all RAG documents? This cannot be undone. [y/N]: {Colors.RESET}").strip().lower()
+                if confirm == 'y':
+                    try:
+                        cursor = self.memory.conn.cursor()
+                        cursor.execute("DELETE FROM documents")
+                        self.memory.conn.commit()
+                        print(f"{Colors.BRIGHT_GREEN}✓ All documents cleared{Colors.RESET}")
+                    except Exception as e:
+                        print(f"{Colors.RED}Error: {e}{Colors.RESET}")
+                else:
+                    print(f"{Colors.DIM}Cancelled{Colors.RESET}")
+
+            else:
+                print(f"{Colors.YELLOW}Unknown RAG command: {subcmd}{Colors.RESET}")
+                print(f"{Colors.DIM}Available: /rag, /rag list, /rag search, /rag add, /rag clear{Colors.RESET}")
+
+            return "COMMAND"
+
+        elif cmd == "/mcp":
+            # MCP server management
+            subcmd = args.split()[0].lower() if args else ""
+            subargs = " ".join(args.split()[1:]) if args and len(args.split()) > 1 else ""
+
+            if not subcmd:
+                # Show MCP status
+                print(f"\n{Colors.BRIGHT_CYAN}{Colors.BOLD}MCP Server Status{Colors.RESET}")
+                print(f"{Colors.DIM}{'─'*50}{Colors.RESET}")
+                if hasattr(self, 'registry') and self.registry and hasattr(self.registry, 'mcp_clients'):
+                    clients = self.registry.mcp_clients
+                    if clients:
+                        for name, client in clients.items():
+                            status = f"{Colors.BRIGHT_GREEN}running{Colors.RESET}" if client.process else f"{Colors.YELLOW}stopped{Colors.RESET}"
+                            tool_count = len(client.tools) if hasattr(client, 'tools') else 0
+                            print(f"  {Colors.CYAN}{name}:{Colors.RESET} {status} ({tool_count} tools)")
+                    else:
+                        print(f"  {Colors.YELLOW}No MCP servers configured{Colors.RESET}")
+                else:
+                    print(f"  {Colors.YELLOW}MCP not available{Colors.RESET}")
+                print(f"\n{Colors.DIM}Commands: /mcp list, /mcp start, /mcp stop, /mcp tools{Colors.RESET}")
+
+            elif subcmd == "list":
+                # List all MCP servers and tools
+                print(f"\n{Colors.BRIGHT_CYAN}MCP Servers and Tools:{Colors.RESET}")
+                if hasattr(self, 'registry') and self.registry and hasattr(self.registry, 'mcp_clients'):
+                    for name, client in self.registry.mcp_clients.items():
+                        status = f"{Colors.BRIGHT_GREEN}●{Colors.RESET}" if client.process else f"{Colors.RED}○{Colors.RESET}"
+                        print(f"\n  {status} {Colors.BRIGHT_WHITE}{name}{Colors.RESET}")
+                        if hasattr(client, 'tools') and client.tools:
+                            for tool in list(client.tools.keys())[:5]:
+                                print(f"      {Colors.DIM}• {tool}{Colors.RESET}")
+                            if len(client.tools) > 5:
+                                print(f"      {Colors.DIM}... and {len(client.tools) - 5} more{Colors.RESET}")
+                else:
+                    print(f"  {Colors.YELLOW}No MCP servers available{Colors.RESET}")
+
+            elif subcmd == "tools":
+                # List tools from specific server
+                if not subargs:
+                    print(f"{Colors.YELLOW}Usage: /mcp tools [server_name]{Colors.RESET}")
+                elif hasattr(self, 'registry') and self.registry and hasattr(self.registry, 'mcp_clients'):
+                    if subargs in self.registry.mcp_clients:
+                        client = self.registry.mcp_clients[subargs]
+                        print(f"\n{Colors.BRIGHT_CYAN}Tools from {subargs}:{Colors.RESET}")
+                        if hasattr(client, 'tools') and client.tools:
+                            for tool_name, tool_info in client.tools.items():
+                                desc = tool_info.get('description', 'No description')[:60]
+                                print(f"  {Colors.BRIGHT_GREEN}{tool_name}{Colors.RESET}: {Colors.DIM}{desc}{Colors.RESET}")
+                        else:
+                            print(f"  {Colors.YELLOW}No tools available{Colors.RESET}")
+                    else:
+                        print(f"{Colors.RED}Server not found: {subargs}{Colors.RESET}")
+                else:
+                    print(f"{Colors.YELLOW}MCP not available{Colors.RESET}")
+
+            elif subcmd == "start":
+                # Start MCP server
+                if not subargs:
+                    print(f"{Colors.YELLOW}Usage: /mcp start [server_name]{Colors.RESET}")
+                elif hasattr(self, 'registry') and self.registry:
+                    print(f"{Colors.CYAN}Starting MCP server: {subargs}...{Colors.RESET}")
+                    # This would need implementation in ToolRegistry
+                    print(f"{Colors.YELLOW}Use MCP Server Management from main menu for full control{Colors.RESET}")
+                else:
+                    print(f"{Colors.YELLOW}MCP not available{Colors.RESET}")
+
+            elif subcmd == "stop":
+                # Stop MCP server
+                if not subargs:
+                    print(f"{Colors.YELLOW}Usage: /mcp stop [server_name]{Colors.RESET}")
+                elif hasattr(self, 'registry') and self.registry and hasattr(self.registry, 'mcp_clients'):
+                    if subargs in self.registry.mcp_clients:
+                        try:
+                            self.registry.mcp_clients[subargs].stop()
+                            print(f"{Colors.BRIGHT_GREEN}✓ Stopped: {subargs}{Colors.RESET}")
+                        except Exception as e:
+                            print(f"{Colors.RED}Error stopping server: {e}{Colors.RESET}")
+                    else:
+                        print(f"{Colors.RED}Server not found: {subargs}{Colors.RESET}")
+                else:
+                    print(f"{Colors.YELLOW}MCP not available{Colors.RESET}")
+
+            else:
+                print(f"{Colors.YELLOW}Unknown MCP command: {subcmd}{Colors.RESET}")
+                print(f"{Colors.DIM}Available: /mcp, /mcp list, /mcp tools, /mcp start, /mcp stop{Colors.RESET}")
+
+            return "COMMAND"
+
+        elif cmd == "/tools" or cmd == "/tool":
+            # Tool management
+            if cmd == "/tools" or not args:
+                # List all tools
+                print(f"\n{Colors.BRIGHT_CYAN}{Colors.BOLD}Available Tools{Colors.RESET}")
+                print(f"{Colors.DIM}{'─'*50}{Colors.RESET}")
+
+                if hasattr(self, 'registry') and self.registry:
+                    # Native tools
+                    if hasattr(self.registry, 'native_tools'):
+                        print(f"\n  {Colors.BRIGHT_GREEN}Native Tools:{Colors.RESET}")
+                        for name in list(self.registry.native_tools.keys())[:10]:
+                            print(f"    {Colors.DIM}•{Colors.RESET} {name}")
+
+                    # Custom tools
+                    if hasattr(self.registry, 'custom_tool_manager'):
+                        ctm = self.registry.custom_tool_manager
+                        if hasattr(ctm, 'tools') and ctm.tools:
+                            print(f"\n  {Colors.BRIGHT_YELLOW}Custom Tools:{Colors.RESET}")
+                            for name in list(ctm.tools.keys())[:10]:
+                                print(f"    {Colors.DIM}•{Colors.RESET} {name}")
+
+                    # MCP tools
+                    if hasattr(self.registry, 'mcp_clients'):
+                        mcp_tools = []
+                        for client in self.registry.mcp_clients.values():
+                            if hasattr(client, 'tools'):
+                                mcp_tools.extend(client.tools.keys())
+                        if mcp_tools:
+                            print(f"\n  {Colors.BRIGHT_MAGENTA}MCP Tools:{Colors.RESET}")
+                            for name in mcp_tools[:10]:
+                                print(f"    {Colors.DIM}•{Colors.RESET} {name}")
+                            if len(mcp_tools) > 10:
+                                print(f"    {Colors.DIM}... and {len(mcp_tools) - 10} more{Colors.RESET}")
+                else:
+                    print(f"  {Colors.YELLOW}Tool registry not available{Colors.RESET}")
+
+                print(f"\n{Colors.DIM}Use /tool [name] for details, ACTION: TOOL_NAME args to execute{Colors.RESET}")
+
+            else:
+                # Show specific tool details
+                subcmd = args.split()[0].lower()
+                subargs = " ".join(args.split()[1:]) if len(args.split()) > 1 else ""
+
+                if subcmd == "run" and subargs:
+                    # Execute tool directly
+                    tool_parts = subargs.split(" ", 1)
+                    tool_name = tool_parts[0]
+                    tool_args = tool_parts[1] if len(tool_parts) > 1 else ""
+                    print(f"\n{Colors.CYAN}Executing tool: {tool_name}{Colors.RESET}")
+                    print(f"{Colors.YELLOW}Use ACTION: {tool_name} {tool_args} in your message for tool execution{Colors.RESET}")
+                else:
+                    # Show tool details
+                    tool_name = subcmd
+                    print(f"\n{Colors.BRIGHT_CYAN}Tool: {tool_name}{Colors.RESET}")
+                    found = False
+
+                    if hasattr(self, 'registry') and self.registry:
+                        # Check native tools
+                        if hasattr(self.registry, 'native_tools') and tool_name in self.registry.native_tools:
+                            tool = self.registry.native_tools[tool_name]
+                            print(f"  {Colors.CYAN}Type:{Colors.RESET} Native")
+                            if callable(tool):
+                                print(f"  {Colors.CYAN}Function:{Colors.RESET} {tool.__name__}")
+                            found = True
+
+                        # Check custom tools
+                        if hasattr(self.registry, 'custom_tool_manager'):
+                            ctm = self.registry.custom_tool_manager
+                            if hasattr(ctm, 'tools') and tool_name in ctm.tools:
+                                tool = ctm.tools[tool_name]
+                                print(f"  {Colors.CYAN}Type:{Colors.RESET} Custom")
+                                if isinstance(tool, dict):
+                                    print(f"  {Colors.CYAN}Description:{Colors.RESET} {tool.get('description', 'N/A')}")
+                                found = True
+
+                        # Check MCP tools
+                        if hasattr(self.registry, 'mcp_clients'):
+                            for server_name, client in self.registry.mcp_clients.items():
+                                if hasattr(client, 'tools') and tool_name in client.tools:
+                                    tool_info = client.tools[tool_name]
+                                    print(f"  {Colors.CYAN}Type:{Colors.RESET} MCP ({server_name})")
+                                    print(f"  {Colors.CYAN}Description:{Colors.RESET} {tool_info.get('description', 'N/A')}")
+                                    found = True
+                                    break
+
+                    if not found:
+                        print(f"  {Colors.YELLOW}Tool not found: {tool_name}{Colors.RESET}")
+
+            return "COMMAND"
+
+        elif cmd == "/browser":
+            # Browser automation
+            if not args:
+                print(f"{Colors.YELLOW}Usage: /browser [url]{Colors.RESET}")
+                print(f"{Colors.DIM}Opens URL in Playwright browser for automation{Colors.RESET}")
+            else:
+                url = args.strip()
+                if not url.startswith(('http://', 'https://')):
+                    url = 'https://' + url
+                print(f"\n{Colors.CYAN}Opening browser: {url}{Colors.RESET}")
+                if hasattr(self, 'registry') and self.registry and hasattr(self.registry, 'browser_manager'):
+                    try:
+                        self.registry.browser_manager.navigate(url)
+                        print(f"{Colors.BRIGHT_GREEN}✓ Browser opened{Colors.RESET}")
+                    except Exception as e:
+                        print(f"{Colors.RED}Error: {e}{Colors.RESET}")
+                else:
+                    print(f"{Colors.YELLOW}Browser manager not available{Colors.RESET}")
+            return "COMMAND"
+
+        elif cmd == "/memory":
+            # Memory management
+            subcmd = args.split()[0].lower() if args else ""
+
+            if not subcmd:
+                # Show memory status
+                print(f"\n{Colors.BRIGHT_CYAN}{Colors.BOLD}Memory Status{Colors.RESET}")
+                print(f"{Colors.DIM}{'─'*50}{Colors.RESET}")
+                try:
+                    history = self.memory.get_recent_history(self.current_session_id, limit=1000)
+                    print(f"  {Colors.CYAN}Messages in session:{Colors.RESET} {Colors.BRIGHT_WHITE}{len(history)}{Colors.RESET}")
+                    if self.context_mgr:
+                        # Estimate token usage
+                        total_chars = sum(len(h[1]) for h in history)
+                        est_tokens = total_chars // 4  # Rough estimate
+                        print(f"  {Colors.CYAN}Estimated tokens:{Colors.RESET} {Colors.BRIGHT_WHITE}{est_tokens}{Colors.RESET}")
+                        print(f"  {Colors.CYAN}Max context:{Colors.RESET} {Colors.BRIGHT_WHITE}{self.config.get('max_context_window', 32768)}{Colors.RESET}")
+                except Exception as e:
+                    print(f"  {Colors.RED}Error: {e}{Colors.RESET}")
+                print(f"\n{Colors.DIM}Use /memory clear to clear conversation memory{Colors.RESET}")
+
+            elif subcmd == "clear":
+                confirm = input(f"{Colors.BRIGHT_RED}Clear conversation memory for this session? [y/N]: {Colors.RESET}").strip().lower()
+                if confirm == 'y':
+                    try:
+                        cursor = self.memory.conn.cursor()
+                        cursor.execute("DELETE FROM history WHERE session_id = ?", (self.current_session_id,))
+                        self.memory.conn.commit()
+                        print(f"{Colors.BRIGHT_GREEN}✓ Conversation memory cleared{Colors.RESET}")
+                    except Exception as e:
+                        print(f"{Colors.RED}Error: {e}{Colors.RESET}")
+                else:
+                    print(f"{Colors.DIM}Cancelled{Colors.RESET}")
+
+            else:
+                print(f"{Colors.YELLOW}Unknown memory command: {subcmd}{Colors.RESET}")
+                print(f"{Colors.DIM}Available: /memory, /memory clear{Colors.RESET}")
+
+            return "COMMAND"
+
+        elif cmd == "/history":
+            # Conversation history
+            subcmd = args.split()[0].lower() if args else ""
+
+            if not subcmd:
+                # Show recent history
+                print(f"\n{Colors.BRIGHT_CYAN}{Colors.BOLD}Conversation History{Colors.RESET}")
+                print(f"{Colors.DIM}{'─'*50}{Colors.RESET}")
+                try:
+                    history = self.memory.get_recent_history(self.current_session_id, limit=10)
+                    if history:
+                        for role, content in history:
+                            role_color = Colors.BRIGHT_GREEN if role == 'user' else Colors.BRIGHT_CYAN
+                            truncated = content[:100] + "..." if len(content) > 100 else content
+                            print(f"  {role_color}{role}:{Colors.RESET} {Colors.DIM}{truncated}{Colors.RESET}")
+                    else:
+                        print(f"  {Colors.YELLOW}No history in this session{Colors.RESET}")
+                except Exception as e:
+                    print(f"  {Colors.RED}Error: {e}{Colors.RESET}")
+                print(f"\n{Colors.DIM}Use /history [n] for last n messages, /history clear to clear{Colors.RESET}")
+
+            elif subcmd == "clear":
+                confirm = input(f"{Colors.BRIGHT_RED}Clear conversation history? [y/N]: {Colors.RESET}").strip().lower()
+                if confirm == 'y':
+                    try:
+                        cursor = self.memory.conn.cursor()
+                        cursor.execute("DELETE FROM history WHERE session_id = ?", (self.current_session_id,))
+                        self.memory.conn.commit()
+                        print(f"{Colors.BRIGHT_GREEN}✓ History cleared{Colors.RESET}")
+                    except Exception as e:
+                        print(f"{Colors.RED}Error: {e}{Colors.RESET}")
+                else:
+                    print(f"{Colors.DIM}Cancelled{Colors.RESET}")
+
+            else:
+                # Try to parse as number
+                try:
+                    n = int(subcmd)
+                    history = self.memory.get_recent_history(self.current_session_id, limit=n)
+                    print(f"\n{Colors.BRIGHT_CYAN}Last {n} messages:{Colors.RESET}")
+                    for role, content in history:
+                        role_color = Colors.BRIGHT_GREEN if role == 'user' else Colors.BRIGHT_CYAN
+                        truncated = content[:150] + "..." if len(content) > 150 else content
+                        print(f"  {role_color}{role}:{Colors.RESET} {Colors.DIM}{truncated}{Colors.RESET}")
+                except ValueError:
+                    print(f"{Colors.YELLOW}Invalid argument: {subcmd}{Colors.RESET}")
+
+            return "COMMAND"
+
+        elif cmd == "/export":
+            # Export conversation
+            format_type = args.strip().lower() if args else "json"
+
+            print(f"\n{Colors.BRIGHT_CYAN}Exporting conversation...{Colors.RESET}")
+            try:
+                history = self.memory.get_recent_history(self.current_session_id, limit=10000)
+                timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+
+                if format_type == "json":
+                    filename = f"export_{timestamp}.json"
+                    filepath = os.path.join(SANDBOX_DIR, filename)
+                    import json
+                    with open(filepath, 'w') as f:
+                        json.dump([{"role": r, "content": c} for r, c in history], f, indent=2)
+                    print(f"{Colors.BRIGHT_GREEN}✓ Exported to: {filepath}{Colors.RESET}")
+
+                elif format_type == "md" or format_type == "markdown":
+                    filename = f"export_{timestamp}.md"
+                    filepath = os.path.join(SANDBOX_DIR, filename)
+                    with open(filepath, 'w') as f:
+                        f.write(f"# Chat Export - {timestamp}\n\n")
+                        for role, content in history:
+                            f.write(f"## {role.title()}\n\n{content}\n\n---\n\n")
+                    print(f"{Colors.BRIGHT_GREEN}✓ Exported to: {filepath}{Colors.RESET}")
+
+                elif format_type == "txt" or format_type == "text":
+                    filename = f"export_{timestamp}.txt"
+                    filepath = os.path.join(SANDBOX_DIR, filename)
+                    with open(filepath, 'w') as f:
+                        for role, content in history:
+                            f.write(f"[{role.upper()}]\n{content}\n\n")
+                    print(f"{Colors.BRIGHT_GREEN}✓ Exported to: {filepath}{Colors.RESET}")
+
+                else:
+                    print(f"{Colors.YELLOW}Unknown format: {format_type}{Colors.RESET}")
+                    print(f"{Colors.DIM}Available: json, md, txt{Colors.RESET}")
+
+            except Exception as e:
+                print(f"{Colors.RED}Export failed: {e}{Colors.RESET}")
+
+            return "COMMAND"
+
+        elif cmd == "/persona":
+            # Persona management
+            subcmd = args.split()[0].lower() if args else ""
+            subargs = " ".join(args.split()[1:]) if args and len(args.split()) > 1 else ""
+
+            if not subcmd:
+                print(f"\n{Colors.BRIGHT_CYAN}{Colors.BOLD}Persona Management{Colors.RESET}")
+                print(f"{Colors.DIM}{'─'*50}{Colors.RESET}")
+                print(f"\n{Colors.DIM}Create tailored AI personas based on project analysis{Colors.RESET}")
+                print(f"\n{Colors.BRIGHT_WHITE}Subcommands:{Colors.RESET}")
+                print(f"  {Colors.CYAN}/persona create{Colors.RESET}      - Generate persona from project")
+                print(f"  {Colors.CYAN}/persona load [file]{Colors.RESET} - Load persona from file")
+                print(f"  {Colors.CYAN}/persona save [file]{Colors.RESET} - Save current persona")
+                print(f"  {Colors.CYAN}/persona clear{Colors.RESET}       - Clear active persona")
+
+            elif subcmd == "create":
+                print(f"\n{Colors.CYAN}Analyzing project to create persona...{Colors.RESET}")
+                print(f"{Colors.YELLOW}This feature creates a customized system prompt based on your project.{Colors.RESET}")
+                print(f"{Colors.DIM}Use the Document Loader to add project files first.{Colors.RESET}")
+
+            elif subcmd == "load":
+                if subargs:
+                    filepath = subargs if os.path.isabs(subargs) else os.path.join(SANDBOX_DIR, subargs)
+                    if os.path.exists(filepath):
+                        try:
+                            with open(filepath, 'r') as f:
+                                persona = f.read()
+                            self.cfg_mgr.update('system_prompt', persona)
+                            print(f"{Colors.BRIGHT_GREEN}✓ Persona loaded from: {filepath}{Colors.RESET}")
+                        except Exception as e:
+                            print(f"{Colors.RED}Error: {e}{Colors.RESET}")
+                    else:
+                        print(f"{Colors.RED}File not found: {filepath}{Colors.RESET}")
+                else:
+                    print(f"{Colors.YELLOW}Usage: /persona load [filename]{Colors.RESET}")
+
+            elif subcmd == "save":
+                filename = subargs if subargs else f"persona_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+                filepath = os.path.join(SANDBOX_DIR, filename)
+                try:
+                    with open(filepath, 'w') as f:
+                        f.write(self.config.get('system_prompt', ''))
+                    print(f"{Colors.BRIGHT_GREEN}✓ Persona saved to: {filepath}{Colors.RESET}")
+                except Exception as e:
+                    print(f"{Colors.RED}Error: {e}{Colors.RESET}")
+
+            elif subcmd == "clear":
+                # Reset to default system prompt
+                default_prompt = "You are a helpful AI assistant."
+                self.cfg_mgr.update('system_prompt', default_prompt)
+                print(f"{Colors.BRIGHT_GREEN}✓ Persona cleared, reset to default{Colors.RESET}")
+
+            else:
+                print(f"{Colors.YELLOW}Unknown persona command: {subcmd}{Colors.RESET}")
+
+            return "COMMAND"
+
+        elif cmd == "/analyze":
+            # Analyze codebase
+            path = args.strip() if args else "."
+            print(f"\n{Colors.BRIGHT_CYAN}Analyzing: {path}{Colors.RESET}")
+
+            if os.path.exists(path):
+                print(f"{Colors.DIM}Scanning directory structure...{Colors.RESET}")
+                file_count = 0
+                for root, dirs, files in os.walk(path):
+                    # Skip hidden and common non-source directories
+                    dirs[:] = [d for d in dirs if not d.startswith('.') and d not in ['node_modules', '__pycache__', 'venv', '.git']]
+                    file_count += len([f for f in files if not f.startswith('.')])
+                print(f"  {Colors.CYAN}Files found:{Colors.RESET} {Colors.BRIGHT_WHITE}{file_count}{Colors.RESET}")
+                print(f"\n{Colors.YELLOW}Use Document Loader (main menu option 2) to ingest files for RAG{Colors.RESET}")
+            else:
+                print(f"{Colors.RED}Path not found: {path}{Colors.RESET}")
+
+            return "COMMAND"
+
+        elif cmd == "/chat":
+            # Legacy load command
+            if args:
+                print(f"{Colors.CYAN}Loading session: {args}{Colors.RESET}")
+                return self.handle_chat_command(f"/load {args}")
+            else:
+                return self.handle_chat_command("/load")
+
+        elif cmd == "/app":
+            # App Builder access
+            subcmd = args.split()[0].lower() if args else ""
+            subargs = " ".join(args.split()[1:]) if args and len(args.split()) > 1 else ""
+
+            if not subcmd:
+                print(f"\n{Colors.BRIGHT_CYAN}{Colors.BOLD}App Builder{Colors.RESET}")
+                print(f"{Colors.DIM}{'─'*50}{Colors.RESET}")
+                print(f"{Colors.DIM}Multi-agent development system{Colors.RESET}")
+                print(f"\n{Colors.BRIGHT_WHITE}Subcommands:{Colors.RESET}")
+                print(f"  {Colors.CYAN}/app new [name]{Colors.RESET}    - Create new app project")
+                print(f"  {Colors.CYAN}/app list{Colors.RESET}          - List app projects")
+                print(f"  {Colors.CYAN}/app open [id]{Colors.RESET}     - Open existing project")
+                print(f"  {Colors.CYAN}/app status{Colors.RESET}        - Show current status")
+                print(f"\n{Colors.DIM}Or use App Builder from main menu (option 7){Colors.RESET}")
+
+            elif subcmd == "list":
+                if hasattr(self, 'app_builder') and self.app_builder:
+                    try:
+                        projects = self.app_builder.list_projects()
+                        if projects:
+                            print(f"\n{Colors.BRIGHT_CYAN}App Projects:{Colors.RESET}")
+                            for p in projects[:10]:
+                                print(f"  {Colors.CYAN}[{p[0]}]{Colors.RESET} {Colors.BRIGHT_WHITE}{p[1]}{Colors.RESET}")
+                        else:
+                            print(f"{Colors.YELLOW}No app projects found{Colors.RESET}")
+                    except Exception as e:
+                        print(f"{Colors.RED}Error: {e}{Colors.RESET}")
+                else:
+                    print(f"{Colors.YELLOW}App Builder not available{Colors.RESET}")
+
+            elif subcmd == "new":
+                if subargs:
+                    print(f"{Colors.CYAN}Creating app project: {subargs}{Colors.RESET}")
+                    print(f"{Colors.YELLOW}Use App Builder menu (option 7) for full project creation{Colors.RESET}")
+                else:
+                    print(f"{Colors.YELLOW}Usage: /app new [project_name]{Colors.RESET}")
+
+            elif subcmd == "status":
+                print(f"\n{Colors.BRIGHT_CYAN}App Builder Status{Colors.RESET}")
+                if hasattr(self, 'app_builder') and self.app_builder:
+                    print(f"  {Colors.BRIGHT_GREEN}Available{Colors.RESET}")
+                else:
+                    print(f"  {Colors.YELLOW}Not initialized{Colors.RESET}")
+
+            else:
+                print(f"{Colors.YELLOW}Unknown app command: {subcmd}{Colors.RESET}")
+
+            return "COMMAND"
+
+        elif cmd == "/train":
+            # Training access
+            subcmd = args.strip().lower() if args else ""
+
+            print(f"\n{Colors.BRIGHT_CYAN}{Colors.BOLD}Model Training{Colors.RESET}")
+            print(f"{Colors.DIM}{'─'*50}{Colors.RESET}")
+
+            if not subcmd:
+                print(f"\n{Colors.BRIGHT_WHITE}Training Options:{Colors.RESET}")
+                print(f"  {Colors.CYAN}/train finetune{Colors.RESET}  - Fine-tune model on dataset")
+                print(f"  {Colors.CYAN}/train lora{Colors.RESET}      - LoRA parameter-efficient training")
+                print(f"  {Colors.CYAN}/train rlhf{Colors.RESET}      - RLHF training mode")
+                print(f"  {Colors.CYAN}/train status{Colors.RESET}    - Show training status")
+                print(f"\n{Colors.DIM}Or use Model Training from main menu (option 5){Colors.RESET}")
+
+            elif subcmd == "status":
+                print(f"\n{Colors.BRIGHT_WHITE}Training Status:{Colors.RESET}")
+                print(f"  {Colors.DIM}No active training jobs{Colors.RESET}")
+
+            else:
+                print(f"\n{Colors.YELLOW}Use Model Training menu (option 5) for {subcmd}{Colors.RESET}")
+
+            return "COMMAND"
+
+        elif cmd == "/api":
+            # API management
+            subcmd = args.split()[0].lower() if args else ""
+            subargs = " ".join(args.split()[1:]) if args and len(args.split()) > 1 else ""
+
+            if not subcmd:
+                print(f"\n{Colors.BRIGHT_CYAN}{Colors.BOLD}API Server{Colors.RESET}")
+                print(f"{Colors.DIM}{'─'*50}{Colors.RESET}")
+                if hasattr(self, 'api_manager') and self.api_manager:
+                    servers = self.api_manager.list_servers() if hasattr(self.api_manager, 'list_servers') else []
+                    if servers:
+                        print(f"  {Colors.CYAN}Running servers:{Colors.RESET} {Colors.BRIGHT_WHITE}{len(servers)}{Colors.RESET}")
+                    else:
+                        print(f"  {Colors.DIM}No servers running{Colors.RESET}")
+                else:
+                    print(f"  {Colors.YELLOW}API Manager not available{Colors.RESET}")
+                print(f"\n{Colors.BRIGHT_WHITE}Subcommands:{Colors.RESET}")
+                print(f"  {Colors.CYAN}/api start [port]{Colors.RESET} - Start server")
+                print(f"  {Colors.CYAN}/api stop{Colors.RESET}         - Stop server")
+                print(f"  {Colors.CYAN}/api status{Colors.RESET}       - Detailed status")
+                print(f"  {Colors.CYAN}/api key{Colors.RESET}          - Show API key")
+
+            elif subcmd == "status":
+                print(f"\n{Colors.BRIGHT_CYAN}API Server Status{Colors.RESET}")
+                if hasattr(self, 'api_manager') and self.api_manager:
+                    print(f"  {Colors.BRIGHT_GREEN}Manager available{Colors.RESET}")
+                else:
+                    print(f"  {Colors.YELLOW}Not initialized{Colors.RESET}")
+
+            elif subcmd == "key":
+                print(f"\n{Colors.BRIGHT_CYAN}API Key{Colors.RESET}")
+                print(f"{Colors.YELLOW}Use API Management menu (option 6) to view/generate keys{Colors.RESET}")
+
+            elif subcmd == "start":
+                port = subargs if subargs else "5000"
+                print(f"{Colors.CYAN}Starting API server on port {port}...{Colors.RESET}")
+                print(f"{Colors.YELLOW}Use API Management menu (option 6) for full control{Colors.RESET}")
+
+            elif subcmd == "stop":
+                print(f"{Colors.CYAN}Stopping API server...{Colors.RESET}")
+                print(f"{Colors.YELLOW}Use API Management menu (option 6) for full control{Colors.RESET}")
+
+            else:
+                print(f"{Colors.YELLOW}Unknown API command: {subcmd}{Colors.RESET}")
+
+            return "COMMAND"
+
+        elif cmd == "/quit":
+            # Quit entire application
+            confirm = input(f"{Colors.BRIGHT_RED}Exit AI Terminal Pro? [y/N]: {Colors.RESET}").strip().lower()
+            if confirm == 'y':
+                print(f"\n{Colors.BRIGHT_CYAN}Goodbye!{Colors.RESET}\n")
+                sys.exit(0)
+            else:
+                print(f"{Colors.DIM}Cancelled{Colors.RESET}")
+            return "COMMAND"
+
+        elif cmd == "/settings":
+            # Open settings
+            print(f"\n{Colors.BRIGHT_CYAN}{Colors.BOLD}Settings{Colors.RESET}")
+            print(f"{Colors.DIM}{'─'*50}{Colors.RESET}")
+            print(f"\n{Colors.DIM}Use Settings from main menu (option 9) for full settings{Colors.RESET}")
+            print(f"\n{Colors.BRIGHT_WHITE}Quick Settings:{Colors.RESET}")
+            print(f"  {Colors.CYAN}/config{Colors.RESET}          - View/edit configuration")
+            print(f"  {Colors.CYAN}/model{Colors.RESET}           - Change model")
+            print(f"  {Colors.CYAN}/theme{Colors.RESET}           - Change theme (if available)")
+            return "COMMAND"
+
+        elif cmd == "/theme":
+            # Theme management
+            theme = args.strip().lower() if args else ""
+
+            if not theme:
+                print(f"\n{Colors.BRIGHT_CYAN}Theme{Colors.RESET}")
+                print(f"{Colors.DIM}Current: default{Colors.RESET}")
+                print(f"\n{Colors.DIM}Available: dark, light{Colors.RESET}")
+            else:
+                print(f"{Colors.YELLOW}Theme '{theme}' - Theme switching not yet implemented{Colors.RESET}")
+                print(f"{Colors.DIM}Using default terminal colors{Colors.RESET}")
+
+            return "COMMAND"
+
+        elif cmd == "/whisper":
+            # Speech to text
+            print(f"\n{Colors.BRIGHT_CYAN}Whisper Speech-to-Text{Colors.RESET}")
+            print(f"{Colors.DIM}{'─'*50}{Colors.RESET}")
+            print(f"\n{Colors.DIM}Voice input using Whisper ASR{Colors.RESET}")
+            print(f"{Colors.YELLOW}Use /voice command for voice assistant{Colors.RESET}")
+            return "COMMAND"
+
+        elif cmd == "/sysinfo":
+            # Show full system information
+            print(f"\n{Colors.BRIGHT_CYAN}{Colors.BOLD}System Information{Colors.RESET}")
+            print(f"{Colors.DIM}{'─'*60}{Colors.RESET}")
+
+            if SYSTEM_INFO_AVAILABLE:
+                sys_info = get_system_info()
+                status_widget = get_status_widget()
+
+                # Full system info box
+                print(status_widget.render_box())
+
+                # Additional details
+                print(f"\n{Colors.BRIGHT_WHITE}Additional Details:{Colors.RESET}")
+                print(f"  {Colors.CYAN}OS Type:{Colors.RESET}      {Colors.BRIGHT_WHITE}{sys_info.os_type}{Colors.RESET}")
+                print(f"  {Colors.CYAN}OS Version:{Colors.RESET}   {Colors.BRIGHT_WHITE}{sys_info.os_version}{Colors.RESET}")
+                print(f"  {Colors.CYAN}Platform:{Colors.RESET}     {Colors.BRIGHT_WHITE}{platform.platform()}{Colors.RESET}")
+                print(f"  {Colors.CYAN}Python:{Colors.RESET}       {Colors.BRIGHT_WHITE}{platform.python_version()}{Colors.RESET}")
+                print(f"  {Colors.CYAN}Machine:{Colors.RESET}      {Colors.BRIGHT_WHITE}{platform.machine()}{Colors.RESET}")
+                print(f"  {Colors.CYAN}Home Dir:{Colors.RESET}     {Colors.BRIGHT_WHITE}{sys_info.home_directory}{Colors.RESET}")
+
+                # Working directory
+                if hasattr(self, 'working_directory') and self.working_directory:
+                    print(f"  {Colors.CYAN}Working Dir:{Colors.RESET}  {Colors.BRIGHT_WHITE}{self.working_directory}{Colors.RESET}")
+
+                # Common directories that exist
+                print(f"\n{Colors.BRIGHT_WHITE}Quick Access Directories:{Colors.RESET}")
+                for name, path in sys_info.get_common_directories().items():
+                    exists_icon = f"{Colors.BRIGHT_GREEN}[OK]{Colors.RESET}" if os.path.exists(path) else f"{Colors.DIM}[--]{Colors.RESET}"
+                    print(f"  {exists_icon} {Colors.CYAN}{name}:{Colors.RESET} {Colors.DIM}{path}{Colors.RESET}")
+            else:
+                # Fallback
+                import getpass
+                import socket
+                print(f"  {Colors.CYAN}OS:{Colors.RESET}       {Colors.BRIGHT_WHITE}{platform.system()} {platform.release()}{Colors.RESET}")
+                print(f"  {Colors.CYAN}User:{Colors.RESET}     {Colors.BRIGHT_WHITE}{getpass.getuser()}{Colors.RESET}")
+                print(f"  {Colors.CYAN}Host:{Colors.RESET}     {Colors.BRIGHT_WHITE}{socket.gethostname()}{Colors.RESET}")
+                print(f"  {Colors.CYAN}Platform:{Colors.RESET} {Colors.BRIGHT_WHITE}{platform.platform()}{Colors.RESET}")
+                print(f"  {Colors.CYAN}Python:{Colors.RESET}   {Colors.BRIGHT_WHITE}{platform.python_version()}{Colors.RESET}")
+
+            return "COMMAND"
+
+        elif cmd == "/traverse":
+            # Directory navigation / file browser
+            target_path = args.strip() if args else ""
+
+            # Initialize current working directory if not set
+            if not hasattr(self, 'working_directory') or not self.working_directory:
+                self.working_directory = os.getcwd()
+
+            if target_path:
+                # Direct path navigation
+                if target_path == "~":
+                    new_path = os.path.expanduser("~")
+                elif target_path == "..":
+                    new_path = os.path.dirname(self.working_directory)
+                elif target_path.startswith("~"):
+                    new_path = os.path.expanduser(target_path)
+                elif os.path.isabs(target_path):
+                    new_path = target_path
+                else:
+                    new_path = os.path.join(self.working_directory, target_path)
+
+                # Normalize and validate
+                new_path = os.path.normpath(new_path)
+
+                if os.path.isdir(new_path):
+                    self.working_directory = new_path
+                    print(f"\n{Colors.BRIGHT_GREEN}✓ Changed directory to:{Colors.RESET}")
+                    print(f"  {Colors.BRIGHT_WHITE}{self.working_directory}{Colors.RESET}")
+
+                    # Show directory contents preview
+                    try:
+                        items = os.listdir(new_path)
+                        dirs = [d for d in items if os.path.isdir(os.path.join(new_path, d)) and not d.startswith('.')]
+                        files = [f for f in items if os.path.isfile(os.path.join(new_path, f)) and not f.startswith('.')]
+                        print(f"\n  {Colors.CYAN}Contains:{Colors.RESET} {len(dirs)} folders, {len(files)} files")
+                    except PermissionError:
+                        print(f"  {Colors.YELLOW}(Permission denied to list contents){Colors.RESET}")
+                else:
+                    print(f"{Colors.RED}Directory not found: {new_path}{Colors.RESET}")
+
+            else:
+                # Interactive directory browser
+                self._traverse_interactive()
+
+            return "COMMAND"
+
+        elif cmd == "/pwd":
+            # Print working directory
+            if not hasattr(self, 'working_directory') or not self.working_directory:
+                self.working_directory = os.getcwd()
+
+            print(f"\n{Colors.BRIGHT_CYAN}Current Working Directory:{Colors.RESET}")
+            print(f"  {Colors.BRIGHT_WHITE}{self.working_directory}{Colors.RESET}")
+            return "COMMAND"
+
+        elif cmd == "/ls":
+            # List directory contents
+            if not hasattr(self, 'working_directory') or not self.working_directory:
+                self.working_directory = os.getcwd()
+
+            target_path = args.strip() if args else self.working_directory
+
+            # Handle special paths
+            if target_path == "~":
+                target_path = os.path.expanduser("~")
+            elif target_path == "..":
+                target_path = os.path.dirname(self.working_directory)
+            elif target_path.startswith("~"):
+                target_path = os.path.expanduser(target_path)
+            elif not os.path.isabs(target_path):
+                target_path = os.path.join(self.working_directory, target_path)
+
+            target_path = os.path.normpath(target_path)
+
+            if os.path.isdir(target_path):
+                print(f"\n{Colors.BRIGHT_CYAN}Contents of:{Colors.RESET} {Colors.BRIGHT_WHITE}{target_path}{Colors.RESET}")
+                print(f"{Colors.DIM}{'─'*60}{Colors.RESET}")
+
+                try:
+                    items = os.listdir(target_path)
+                    items.sort(key=lambda x: (not os.path.isdir(os.path.join(target_path, x)), x.lower()))
+
+                    dirs = []
+                    files = []
+
+                    for item in items:
+                        if item.startswith('.'):
+                            continue  # Skip hidden files
+                        full_path = os.path.join(target_path, item)
+                        if os.path.isdir(full_path):
+                            dirs.append(item)
+                        else:
+                            files.append(item)
+
+                    # Show directories first
+                    if dirs:
+                        print(f"\n  {Colors.BRIGHT_YELLOW}Folders ({len(dirs)}):{Colors.RESET}")
+                        for d in dirs[:20]:
+                            print(f"    {Colors.CYAN}/{Colors.RESET}{Colors.BRIGHT_WHITE}{d}{Colors.RESET}")
+                        if len(dirs) > 20:
+                            print(f"    {Colors.DIM}... and {len(dirs) - 20} more folders{Colors.RESET}")
+
+                    # Show files
+                    if files:
+                        print(f"\n  {Colors.BRIGHT_YELLOW}Files ({len(files)}):{Colors.RESET}")
+                        for f in files[:20]:
+                            # Get file size
+                            try:
+                                size = os.path.getsize(os.path.join(target_path, f))
+                                if size < 1024:
+                                    size_str = f"{size} B"
+                                elif size < 1024 * 1024:
+                                    size_str = f"{size // 1024} KB"
+                                else:
+                                    size_str = f"{size // (1024 * 1024)} MB"
+                                print(f"    {Colors.BRIGHT_WHITE}{f}{Colors.RESET} {Colors.DIM}({size_str}){Colors.RESET}")
+                            except:
+                                print(f"    {Colors.BRIGHT_WHITE}{f}{Colors.RESET}")
+                        if len(files) > 20:
+                            print(f"    {Colors.DIM}... and {len(files) - 20} more files{Colors.RESET}")
+
+                    if not dirs and not files:
+                        print(f"  {Colors.DIM}(empty directory){Colors.RESET}")
+
+                except PermissionError:
+                    print(f"  {Colors.RED}Permission denied{Colors.RESET}")
+                except Exception as e:
+                    print(f"  {Colors.RED}Error: {e}{Colors.RESET}")
+            else:
+                print(f"{Colors.RED}Not a directory: {target_path}{Colors.RESET}")
+
+            return "COMMAND"
+
+        elif cmd == "/cd":
+            # Alias for traverse
+            return self.handle_chat_command(f"/traverse {args}")
+
         else:
             print(f"{Colors.YELLOW}⚠ Unknown command: {cmd}. Type {Colors.BRIGHT_WHITE}/help{Colors.YELLOW} for available commands.{Colors.RESET}")
             return "COMMAND"
-    
+
+    def _traverse_interactive(self):
+        """Interactive directory browser for selecting project folders - Cross-platform"""
+        if not hasattr(self, 'working_directory') or not self.working_directory:
+            self.working_directory = os.getcwd()
+
+        # Get system info for cross-platform support
+        sys_info = None
+        status_widget = None
+        if SYSTEM_INFO_AVAILABLE:
+            sys_info = get_system_info()
+            status_widget = get_status_widget()
+
+        current_path = self.working_directory
+        show_quick_access = True  # Show quick access on first view
+
+        while True:
+            self.clear()
+
+            # ═══════════════════════════════════════════════════════════════════
+            # HEADER WITH STATUS WIDGET
+            # ═══════════════════════════════════════════════════════════════════
+            print(f"\n{Colors.BRIGHT_CYAN}{Colors.BOLD}{'='*79}{Colors.RESET}")
+            print(f"{Colors.BRIGHT_YELLOW}{Colors.BOLD}  DIRECTORY BROWSER{Colors.RESET}")
+            print(f"{Colors.BRIGHT_CYAN}{Colors.BOLD}{'='*79}{Colors.RESET}")
+
+            # Status Widget - OS, Time, Date, Network, Username
+            if status_widget:
+                print(f"\n{status_widget.render_compact()}")
+            else:
+                # Fallback if system info not available
+                import getpass
+                user = getpass.getuser()
+                os_name = platform.system()
+                time_str = datetime.now().strftime("%H:%M")
+                date_str = datetime.now().strftime("%Y-%m-%d")
+                print(f"\n{Colors.DIM}[{os_name}] {date_str} {time_str} | @{user}{Colors.RESET}")
+
+            print(f"\n{Colors.CYAN}Current:{Colors.RESET} {Colors.BRIGHT_WHITE}{current_path}{Colors.RESET}")
+            print(f"{Colors.DIM}{'─'*79}{Colors.RESET}")
+
+            try:
+                # ═══════════════════════════════════════════════════════════════════
+                # QUICK ACCESS DIRECTORIES (First time or when requested)
+                # ═══════════════════════════════════════════════════════════════════
+                if show_quick_access and sys_info:
+                    print(f"\n  {Colors.BRIGHT_MAGENTA}{Colors.BOLD}Quick Access:{Colors.RESET}")
+
+                    # Common directories
+                    common_dirs = sys_info.get_common_directories()
+                    quick_keys = ['h', 'd', 'o', 'w', 'p', 'c']  # home, desktop, documents, downloads, projects, code
+                    quick_idx = 0
+
+                    for name, path in common_dirs.items():
+                        if os.path.exists(path) and quick_idx < len(quick_keys):
+                            key = quick_keys[quick_idx]
+                            print(f"    {Colors.MAGENTA}[{key}]{Colors.RESET} {Colors.BRIGHT_WHITE}{name}{Colors.RESET} {Colors.DIM}({path}){Colors.RESET}")
+                            quick_idx += 1
+
+                    # Windows drives
+                    if sys_info.is_windows:
+                        print(f"\n  {Colors.BRIGHT_MAGENTA}Drives:{Colors.RESET}")
+                        for drive in sys_info.get_root_directories()[:5]:
+                            print(f"    {Colors.DIM}{drive}{Colors.RESET}")
+
+                    print()
+
+                # ═══════════════════════════════════════════════════════════════════
+                # NAVIGATION OPTIONS
+                # ═══════════════════════════════════════════════════════════════════
+                print(f"  {Colors.CYAN}[0]{Colors.RESET} {Colors.DIM}..{Colors.RESET} (Parent directory)")
+                print(f"  {Colors.CYAN}[~]{Colors.RESET} {Colors.DIM}Home directory{Colors.RESET}")
+
+                # Windows: show root/drives option
+                if sys_info and sys_info.is_windows:
+                    print(f"  {Colors.CYAN}[/]{Colors.RESET} {Colors.DIM}Show drives{Colors.RESET}")
+
+                print()
+
+                # ═══════════════════════════════════════════════════════════════════
+                # DIRECTORY LISTING
+                # ═══════════════════════════════════════════════════════════════════
+                items = os.listdir(current_path)
+                items.sort(key=lambda x: (not os.path.isdir(os.path.join(current_path, x)), x.lower()))
+
+                dirs = []
+                files = []
+                for item in items:
+                    # Skip hidden files (cross-platform)
+                    if item.startswith('.'):
+                        continue
+                    # Windows hidden files check
+                    if sys_info and sys_info.is_windows:
+                        try:
+                            import stat
+                            full_path = os.path.join(current_path, item)
+                            if os.stat(full_path).st_file_attributes & stat.FILE_ATTRIBUTE_HIDDEN:
+                                continue
+                        except:
+                            pass
+
+                    full_path = os.path.join(current_path, item)
+                    if os.path.isdir(full_path):
+                        dirs.append(item)
+                    else:
+                        files.append(item)
+
+                # Show directories with numbers
+                if dirs:
+                    print(f"  {Colors.BRIGHT_YELLOW}Folders:{Colors.RESET}")
+                    for i, d in enumerate(dirs[:25], 1):
+                        subpath = os.path.join(current_path, d)
+                        try:
+                            has_subdirs = any(os.path.isdir(os.path.join(subpath, x)) for x in os.listdir(subpath) if not x.startswith('.'))
+                            indicator = f"{Colors.CYAN}>{Colors.RESET}" if has_subdirs else " "
+                        except:
+                            indicator = " "
+                        print(f"  {Colors.CYAN}[{i}]{Colors.RESET} {indicator} {Colors.BRIGHT_WHITE}{d}{Colors.DIM}/{Colors.RESET}")
+
+                    if len(dirs) > 25:
+                        print(f"      {Colors.DIM}... and {len(dirs) - 25} more folders{Colors.RESET}")
+                else:
+                    print(f"  {Colors.DIM}(No subdirectories){Colors.RESET}")
+
+                if files:
+                    print(f"\n  {Colors.DIM}({len(files)} files in this directory){Colors.RESET}")
+
+                # ═══════════════════════════════════════════════════════════════════
+                # INSTRUCTIONS
+                # ═══════════════════════════════════════════════════════════════════
+                print(f"\n{Colors.DIM}{'─'*79}{Colors.RESET}")
+                print(f"{Colors.DIM}[num] navigate | [s] select | [q] cancel | [?] quick access | type path to jump{Colors.RESET}")
+
+                choice = input(f"\n{Colors.BRIGHT_GREEN}Navigate: {Colors.RESET}").strip()
+
+                if not choice:
+                    show_quick_access = False
+                    continue
+
+                show_quick_access = False  # Hide quick access after first input
+
+                # ═══════════════════════════════════════════════════════════════════
+                # HANDLE INPUT
+                # ═══════════════════════════════════════════════════════════════════
+
+                # Quit
+                if choice.lower() in ('q', 'quit', 'exit'):
+                    print(f"\n{Colors.DIM}Cancelled{Colors.RESET}")
+                    break
+
+                # Select current
+                if choice.lower() in ('s', 'select'):
+                    self.working_directory = current_path
+                    print(f"\n{Colors.BRIGHT_GREEN}✓ Selected directory:{Colors.RESET}")
+                    print(f"  {Colors.BRIGHT_WHITE}{self.working_directory}{Colors.RESET}")
+                    time.sleep(1)
+                    break
+
+                # Show quick access
+                if choice == '?':
+                    show_quick_access = True
+                    continue
+
+                # Parent directory
+                if choice == '0':
+                    parent = os.path.dirname(current_path)
+                    if parent and parent != current_path:
+                        current_path = parent
+                    elif sys_info and sys_info.is_windows:
+                        # On Windows, show drives if at root
+                        pass
+                    continue
+
+                # Home directory
+                if choice == '~':
+                    current_path = os.path.expanduser("~")
+                    continue
+
+                # Windows drives
+                if choice == '/' and sys_info and sys_info.is_windows:
+                    print(f"\n{Colors.BRIGHT_CYAN}Available Drives:{Colors.RESET}")
+                    for drive in sys_info.get_root_directories():
+                        print(f"  {Colors.BRIGHT_WHITE}{drive}{Colors.RESET}")
+                    drive_choice = input(f"\n{Colors.BRIGHT_GREEN}Enter drive (e.g., C:): {Colors.RESET}").strip()
+                    if drive_choice:
+                        if not drive_choice.endswith(':'):
+                            drive_choice += ':'
+                        if not drive_choice.endswith('\\'):
+                            drive_choice += '\\'
+                        if os.path.exists(drive_choice):
+                            current_path = drive_choice
+                    continue
+
+                # Quick access shortcuts
+                if sys_info and choice.lower() in ['h', 'd', 'o', 'w', 'p', 'c']:
+                    common_dirs = sys_info.get_common_directories()
+                    dir_map = {'h': 'Home', 'd': 'Desktop', 'o': 'Documents', 'w': 'Downloads', 'p': 'Projects', 'c': 'Code'}
+                    target_name = dir_map.get(choice.lower())
+                    if target_name and target_name in common_dirs:
+                        target_path = common_dirs[target_name]
+                        if os.path.exists(target_path):
+                            current_path = target_path
+                            continue
+
+                # Numeric selection
+                try:
+                    idx = int(choice)
+                    if 1 <= idx <= len(dirs):
+                        current_path = os.path.join(current_path, dirs[idx - 1])
+                        continue
+                    else:
+                        print(f"{Colors.YELLOW}Invalid selection{Colors.RESET}")
+                        time.sleep(0.5)
+                        continue
+                except ValueError:
+                    pass
+
+                # Direct path (absolute)
+                # Handle Windows paths (C:\...) and Unix paths (/...)
+                is_absolute = False
+                if sys_info and sys_info.is_windows:
+                    # Windows: check for drive letter or UNC path
+                    is_absolute = (len(choice) >= 2 and choice[1] == ':') or choice.startswith('\\\\')
+                else:
+                    is_absolute = choice.startswith('/')
+
+                if is_absolute or choice.startswith('~'):
+                    test_path = os.path.expanduser(choice)
+                    test_path = os.path.normpath(test_path)
+                    if os.path.isdir(test_path):
+                        current_path = test_path
+                        continue
+                    else:
+                        print(f"{Colors.RED}Directory not found: {choice}{Colors.RESET}")
+                        time.sleep(1)
+                        continue
+
+                # Relative path
+                test_path = os.path.join(current_path, choice)
+                test_path = os.path.normpath(test_path)
+                if os.path.isdir(test_path):
+                    current_path = test_path
+                    continue
+
+                print(f"{Colors.YELLOW}Unknown command or path: {choice}{Colors.RESET}")
+                time.sleep(0.5)
+
+            except PermissionError:
+                print(f"\n{Colors.RED}Permission denied for this directory{Colors.RESET}")
+                print(f"{Colors.DIM}Press Enter to go back...{Colors.RESET}")
+                input()
+                current_path = os.path.dirname(current_path)
+            except Exception as e:
+                print(f"\n{Colors.RED}Error: {e}{Colors.RESET}")
+                print(f"{Colors.DIM}Press Enter to continue...{Colors.RESET}")
+                input()
+
     def chat_loop(self):
         self.clear()
         # Create default session if none exists
         if not self.current_session_id:
-            self.current_session_id = self.memory.create_session(f"Chat {datetime.now().strftime('%H:%M')}", 
+            self.current_session_id = self.memory.create_session(f"Chat {datetime.now().strftime('%H:%M')}",
                                                                   self.current_project_id)
-        
+
+        # ═══════════════════════════════════════════════════════════════════════
+        # CHAT HEADER WITH STATUS WIDGET
+        # ═══════════════════════════════════════════════════════════════════════
         print(f"\n{Colors.BRIGHT_CYAN}{Colors.BOLD}{'='*79}{Colors.RESET}")
         print(f"{Colors.BRIGHT_YELLOW}{Colors.BOLD}  CHAT MODE ACTIVE{Colors.RESET}")
         print(f"{Colors.BRIGHT_CYAN}{Colors.BOLD}{'='*79}{Colors.RESET}")
+
+        # Status Widget - OS, Time, Date, Network, Username
+        if SYSTEM_INFO_AVAILABLE:
+            status_widget = get_status_widget()
+            print(f"\n{status_widget.render_compact()}")
+        else:
+            # Fallback status display
+            import getpass
+            user = getpass.getuser()
+            os_name = platform.system()
+            time_str = datetime.now().strftime("%H:%M")
+            date_str = datetime.now().strftime("%Y-%m-%d")
+            print(f"\n{Colors.DIM}[{os_name}] {date_str} {time_str} | @{user}{Colors.RESET}")
+
+        print(f"{Colors.DIM}{'─'*79}{Colors.RESET}")
+
+        # Session and Project info
         print(f"{Colors.CYAN}Session:{Colors.RESET} {Colors.BRIGHT_WHITE}{self.memory.get_session(self.current_session_id)[1]}{Colors.RESET}")
         if self.current_project_id:
             project = self.memory.get_project(self.current_project_id)
             print(f"{Colors.CYAN}Project:{Colors.RESET} {Colors.BRIGHT_WHITE}{project[1]}{Colors.RESET}")
-        print(f"{Colors.DIM}Type '/help' for commands, '/back' to exit{Colors.RESET}\n")
+
+        # Working directory (if set)
+        if hasattr(self, 'working_directory') and self.working_directory:
+            print(f"{Colors.CYAN}Directory:{Colors.RESET} {Colors.DIM}{self.working_directory}{Colors.RESET}")
+
+        print(f"\n{Colors.DIM}Type '/help' for commands, '/back' to exit{Colors.RESET}\n")
         
         while True:
             try:
