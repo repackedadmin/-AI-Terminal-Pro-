@@ -2425,7 +2425,7 @@ class AIEngine:
                 sys.exit(1)
         elif self.backend == "ollama":
             try:
-                requests.get("http://localhost:11434")
+                requests.get("http://127.0.01:11434")
                 print(f"{Colors.BRIGHT_GREEN}[SYSTEM]{Colors.RESET} Ollama connection established.")
             except:
                 print(f"{Colors.YELLOW}[WARNING]{Colors.RESET} Ollama is not running on localhost:11434.")
@@ -2453,7 +2453,7 @@ class AIEngine:
                 # Use resilient request with self-healing
                 res = resilient_request(
                     'post',
-                    "http://localhost:11434/api/generate",
+                    "http://127.0.0.1:11434/api/generate",
                     json={
                         "model": self.model_name,
                         "prompt": prompt,
@@ -2484,7 +2484,7 @@ class AIEngine:
 def get_ollama_models():
     """Get list of available Ollama models."""
     try:
-        response = requests.get("http://localhost:11434/api/tags", timeout=3)
+        response = requests.get("http://127.0.0.1:11434/api/tags", timeout=3)
         if response.status_code == 200:
             data = response.json()
             return [model['name'] for model in data.get('models', [])]
@@ -2495,7 +2495,7 @@ def get_ollama_models():
 def check_ollama_running():
     """Check if Ollama is running."""
     try:
-        response = requests.get("http://localhost:11434/api/tags", timeout=2)
+        response = requests.get("http://127.0.0.1:11434/api/tags", timeout=2)
         return response.status_code == 200
     except:
         return False
@@ -10269,12 +10269,12 @@ class LocalAIEngine:
         elif self.backend == "ollama":
             try:
                 # 1. Check if Ollama is running with resilient request
-                resilient_request('get', "http://localhost:11434", timeout=2, max_retries=3, retry_delay=1.0)
+                resilient_request('get', "http://127.0.0.1:11434", timeout=2, max_retries=3, retry_delay=1.0)
                 print(f"{Colors.BRIGHT_GREEN}✓ Ollama connection established{Colors.RESET}")
 
                 # 2. Fetch available models for Auto-Detection
                 print(f"{Colors.CYAN}Detecting available models...{Colors.RESET}")
-                resp = resilient_request('get', "http://localhost:11434/api/tags", timeout=5, max_retries=2, retry_delay=1.0)
+                resp = resilient_request('get', "http://127.0.0.1:11434/api/tags", timeout=5, max_retries=2, retry_delay=1.0)
                 if resp.status_code == 200:
                     available = [m['name'] for m in resp.json().get('models', [])]
 
@@ -10337,7 +10337,7 @@ class LocalAIEngine:
                 # Use resilient_request with self-healing for better reliability
                 response = resilient_request(
                     'post',
-                    "http://localhost:11434/api/generate",
+                    "http://127.0.0.1:11434/api/generate",
                     json={
                         "model": self.model_name,
                         "prompt": prompt,
