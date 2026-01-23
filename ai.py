@@ -2425,7 +2425,7 @@ class AIEngine:
                 sys.exit(1)
         elif self.backend == "ollama":
             try:
-                requests.get("http://127.0.01:11434")
+                requests.get("http://localhost:11434")
                 print(f"{Colors.BRIGHT_GREEN}[SYSTEM]{Colors.RESET} Ollama connection established.")
             except:
                 print(f"{Colors.YELLOW}[WARNING]{Colors.RESET} Ollama is not running on localhost:11434.")
@@ -2453,7 +2453,7 @@ class AIEngine:
                 # Use resilient request with self-healing
                 res = resilient_request(
                     'post',
-                    "http://127.0.0.1:11434/api/generate",
+                    "http://localhost:11434/api/generate",
                     json={
                         "model": self.model_name,
                         "prompt": prompt,
@@ -2484,7 +2484,7 @@ class AIEngine:
 def get_ollama_models():
     """Get list of available Ollama models."""
     try:
-        response = requests.get("http://127.0.0.1:11434/api/tags", timeout=3)
+        response = requests.get("http://localhost:11434/api/tags", timeout=3)
         if response.status_code == 200:
             data = response.json()
             return [model['name'] for model in data.get('models', [])]
@@ -2495,7 +2495,7 @@ def get_ollama_models():
 def check_ollama_running():
     """Check if Ollama is running."""
     try:
-        response = requests.get("http://127.0.0.1:11434/api/tags", timeout=2)
+        response = requests.get("http://localhost:11434/api/tags", timeout=2)
         return response.status_code == 200
     except:
         return False
@@ -6024,19 +6024,64 @@ class App:
             elif c == "6":
                 break
 
+    def _select_ollama_model(self):
+        """Let user select an Ollama model from available models."""
+        if self.engine.backend != "ollama":
+            print(f"{Colors.YELLOW}⚠ Model selection only available for Ollama backend.{Colors.RESET}")
+            print(f"{Colors.DIM}Current backend: {self.engine.backend}{Colors.RESET}")
+            return False
+
+        models = get_ollama_models()
+        if not models:
+            print(f"\n{Colors.BRIGHT_RED}✗ No Ollama models found!{Colors.RESET}")
+            print(f"{Colors.YELLOW}Please install a model first:{Colors.RESET}")
+            print(f"{Colors.DIM}  ollama pull llama3.2{Colors.RESET}")
+            print(f"{Colors.DIM}  ollama pull qwen2.5-coder{Colors.RESET}")
+            print(f"{Colors.DIM}  ollama pull codellama{Colors.RESET}")
+            return False
+
+        print(f"\n{Colors.BRIGHT_CYAN}Available Ollama Models:{Colors.RESET}\n")
+        current_model = self.engine.model_name
+        for i, model in enumerate(models, 1):
+            marker = f"{Colors.BRIGHT_GREEN}◀ current{Colors.RESET}" if model == current_model else ""
+            print(f"  {Colors.CYAN}[{i}]{Colors.RESET} {Colors.BRIGHT_WHITE}{model}{Colors.RESET} {marker}")
+
+        print(f"\n  {Colors.DIM}[0] Cancel{Colors.RESET}")
+
+        try:
+            choice = input(f"\n{Colors.BRIGHT_GREEN}Select model [1-{len(models)}]: {Colors.RESET}").strip()
+            if choice == "0" or not choice:
+                return True  # User cancelled, but not an error
+
+            idx = int(choice)
+            if 1 <= idx <= len(models):
+                selected_model = models[idx - 1]
+                self.engine.model_name = selected_model
+                self.engine.config['model_name'] = selected_model
+                print(f"\n{Colors.BRIGHT_GREEN}✓ Model changed to: {selected_model}{Colors.RESET}")
+                return True
+            else:
+                print(f"{Colors.YELLOW}⚠ Invalid selection.{Colors.RESET}")
+                return False
+        except ValueError:
+            print(f"{Colors.YELLOW}⚠ Invalid input.{Colors.RESET}")
+            return False
+
     def app_builder_menu(self):
         """App Builder menu - multi-agent development system."""
         if not self.app_builder:
             print(f"\n{Colors.BRIGHT_RED}✗ App Builder not initialized.{Colors.RESET}")
             input(f"\n{Colors.DIM}Press Enter...{Colors.RESET}")
             return
-        
+
         while True:
             self.clear()
             print(f"\n{Colors.BRIGHT_CYAN}{Colors.BOLD}{'='*79}{Colors.RESET}")
             print(f"{Colors.BRIGHT_YELLOW}{Colors.BOLD}  APP BUILDER - Multi-Agent Development{Colors.RESET}")
             print(f"{Colors.BRIGHT_CYAN}{Colors.BOLD}{'='*79}{Colors.RESET}\n")
-            
+
+            # Show current model
+            print(f"{Colors.CYAN}AI Model:{Colors.RESET} {Colors.BRIGHT_WHITE}{self.engine.model_name}{Colors.RESET} {Colors.DIM}({self.engine.backend}){Colors.RESET}")
             print(f"{Colors.CYAN}Apps Directory:{Colors.RESET} {Colors.BRIGHT_WHITE}{APPS_DIR}{Colors.RESET}\n")
             
             # List existing projects
@@ -6068,8 +6113,9 @@ class App:
             print(f"{Colors.BRIGHT_GREEN}  [4]{Colors.RESET} Add Feature to Existing App")
             print(f"{Colors.BRIGHT_GREEN}  [5]{Colors.RESET} Debug App")
             print(f"{Colors.BRIGHT_GREEN}  [6]{Colors.RESET} Generate Documentation")
-            print(f"{Colors.BRIGHT_GREEN}  [7]{Colors.RESET} Back\n")
-            
+            print(f"{Colors.BRIGHT_GREEN}  [7]{Colors.RESET} Change AI Model")
+            print(f"{Colors.BRIGHT_GREEN}  [8]{Colors.RESET} Back\n")
+
             c = input(f"{Colors.BRIGHT_GREEN}Choice: {Colors.RESET}")
             
             if c == "1":
@@ -6078,35 +6124,55 @@ class App:
                 print(f"\n{Colors.BRIGHT_CYAN}{Colors.BOLD}{'='*79}{Colors.RESET}")
                 print(f"{Colors.BRIGHT_YELLOW}{Colors.BOLD}  CREATE NEW APP{Colors.RESET}")
                 print(f"{Colors.BRIGHT_CYAN}{Colors.BOLD}{'='*79}{Colors.RESET}\n")
-                
+
+                # Verify model is available before proceeding
+                if self.engine.backend == "ollama":
+                    models = get_ollama_models()
+                    if not models:
+                        print(f"{Colors.BRIGHT_RED}✗ No Ollama models installed!{Colors.RESET}")
+                        print(f"{Colors.YELLOW}Please install a model first:{Colors.RESET}")
+                        print(f"{Colors.DIM}  ollama pull llama3.2{Colors.RESET}")
+                        print(f"{Colors.DIM}  ollama pull qwen2.5-coder{Colors.RESET}")
+                        input(f"\n{Colors.DIM}Press Enter...{Colors.RESET}")
+                        continue
+
+                    if self.engine.model_name not in models:
+                        print(f"{Colors.YELLOW}⚠ Current model '{self.engine.model_name}' not found.{Colors.RESET}")
+                        print(f"{Colors.CYAN}Please select an available model:{Colors.RESET}")
+                        if not self._select_ollama_model():
+                            input(f"\n{Colors.DIM}Press Enter...{Colors.RESET}")
+                            continue
+                        print()
+
                 print(f"{Colors.CYAN}The AI team will help you build this app step by step.{Colors.RESET}")
-                print(f"{Colors.DIM}Agents involved: Spec Writer, Architect, Tech Lead, Developer, Code Monkey, Reviewer{Colors.RESET}\n")
-                
+                print(f"{Colors.DIM}Agents involved: Spec Writer, Architect, Tech Lead, Developer, Code Monkey, Reviewer{Colors.RESET}")
+                print(f"{Colors.DIM}Using model: {self.engine.model_name}{Colors.RESET}\n")
+
                 app_name = input(f"{Colors.BRIGHT_GREEN}App Name: {Colors.RESET}").strip()
                 if not app_name:
                     print(f"{Colors.YELLOW}⚠ Name cannot be empty.{Colors.RESET}")
                     time.sleep(1)
                     continue
-                
+
                 description = input(f"{Colors.BRIGHT_GREEN}Description {Colors.DIM}(what should this app do?): {Colors.RESET}").strip()
                 if not description:
                     print(f"{Colors.YELLOW}⚠ Description cannot be empty.{Colors.RESET}")
                     time.sleep(1)
                     continue
-                
+
                 print(f"\n{Colors.BRIGHT_CYAN}Creating project...{Colors.RESET}")
                 project_id = self.app_builder.create_project(app_name, description)
-                
+
                 if project_id:
                     print(f"{Colors.BRIGHT_GREEN}✓ Project '{app_name}' created!{Colors.RESET}")
                     print(f"{Colors.DIM}Project ID: {project_id}{Colors.RESET}\n")
-                    
+
                     start_now = input(f"{Colors.BRIGHT_GREEN}Start building now? [Y/n]: {Colors.RESET}").strip().lower()
                     if start_now != 'n':
                         self.app_builder.build_app(project_id)
                 else:
                     print(f"{Colors.BRIGHT_RED}✗ Failed to create project.{Colors.RESET}")
-                
+
                 input(f"\n{Colors.DIM}Press Enter...{Colors.RESET}")
             
             elif c == "2":
@@ -6115,12 +6181,29 @@ class App:
                     print(f"\n{Colors.YELLOW}⚠ No projects to continue.{Colors.RESET}")
                     time.sleep(1.5)
                     continue
-                
+
+                # Verify model is available before proceeding
+                if self.engine.backend == "ollama":
+                    models = get_ollama_models()
+                    if not models:
+                        print(f"\n{Colors.BRIGHT_RED}✗ No Ollama models installed!{Colors.RESET}")
+                        print(f"{Colors.YELLOW}Please install a model first:{Colors.RESET}")
+                        print(f"{Colors.DIM}  ollama pull llama3.2{Colors.RESET}")
+                        input(f"\n{Colors.DIM}Press Enter...{Colors.RESET}")
+                        continue
+
+                    if self.engine.model_name not in models:
+                        print(f"\n{Colors.YELLOW}⚠ Current model '{self.engine.model_name}' not found.{Colors.RESET}")
+                        print(f"{Colors.CYAN}Please select an available model:{Colors.RESET}")
+                        if not self._select_ollama_model():
+                            input(f"\n{Colors.DIM}Press Enter...{Colors.RESET}")
+                            continue
+
                 print(f"\n{Colors.CYAN}Select project to continue:{Colors.RESET}\n")
                 for i, (pid, name, desc, status) in enumerate(projects, 1):
                     if status != "completed":
                         print(f"  {Colors.CYAN}[{i}]{Colors.RESET} {Colors.BRIGHT_WHITE}{name}{Colors.RESET} {Colors.YELLOW}({status}){Colors.RESET}")
-                
+
                 try:
                     idx = int(input(f"\n{Colors.BRIGHT_GREEN}Select [1-{len(projects)}]: {Colors.RESET}").strip())
                     if 1 <= idx <= len(projects):
@@ -6132,7 +6215,7 @@ class App:
                 except ValueError:
                     print(f"{Colors.YELLOW}⚠ Invalid input.{Colors.RESET}")
                     time.sleep(1)
-                
+
                 input(f"\n{Colors.DIM}Press Enter...{Colors.RESET}")
             
             elif c == "3":
@@ -6341,8 +6424,26 @@ class App:
                     time.sleep(1)
                 
                 input(f"\n{Colors.DIM}Press Enter...{Colors.RESET}")
-            
+
             elif c == "7":
+                # Change AI Model
+                self.clear()
+                print(f"\n{Colors.BRIGHT_CYAN}{Colors.BOLD}{'='*79}{Colors.RESET}")
+                print(f"{Colors.BRIGHT_YELLOW}{Colors.BOLD}  CHANGE AI MODEL{Colors.RESET}")
+                print(f"{Colors.BRIGHT_CYAN}{Colors.BOLD}{'='*79}{Colors.RESET}\n")
+
+                print(f"{Colors.CYAN}Current model:{Colors.RESET} {Colors.BRIGHT_WHITE}{self.engine.model_name}{Colors.RESET}")
+                print(f"{Colors.CYAN}Backend:{Colors.RESET} {Colors.BRIGHT_WHITE}{self.engine.backend}{Colors.RESET}\n")
+
+                if self.engine.backend == "ollama":
+                    self._select_ollama_model()
+                else:
+                    print(f"{Colors.YELLOW}Model selection is only available for Ollama backend.{Colors.RESET}")
+                    print(f"{Colors.DIM}To switch backends, use Settings from the main menu.{Colors.RESET}")
+
+                input(f"\n{Colors.DIM}Press Enter...{Colors.RESET}")
+
+            elif c == "8":
                 break
 
     def handle_chat_command(self, cmd_line):
@@ -10269,12 +10370,12 @@ class LocalAIEngine:
         elif self.backend == "ollama":
             try:
                 # 1. Check if Ollama is running with resilient request
-                resilient_request('get', "http://127.0.0.1:11434", timeout=2, max_retries=3, retry_delay=1.0)
+                resilient_request('get', "http://localhost:11434", timeout=2, max_retries=3, retry_delay=1.0)
                 print(f"{Colors.BRIGHT_GREEN}✓ Ollama connection established{Colors.RESET}")
 
                 # 2. Fetch available models for Auto-Detection
                 print(f"{Colors.CYAN}Detecting available models...{Colors.RESET}")
-                resp = resilient_request('get', "http://127.0.0.1:11434/api/tags", timeout=5, max_retries=2, retry_delay=1.0)
+                resp = resilient_request('get', "http://localhost:11434/api/tags", timeout=5, max_retries=2, retry_delay=1.0)
                 if resp.status_code == 200:
                     available = [m['name'] for m in resp.json().get('models', [])]
 
@@ -10337,7 +10438,7 @@ class LocalAIEngine:
                 # Use resilient_request with self-healing for better reliability
                 response = resilient_request(
                     'post',
-                    "http://127.0.0.1:11434/api/generate",
+                    "http://localhost:11434/api/generate",
                     json={
                         "model": self.model_name,
                         "prompt": prompt,
