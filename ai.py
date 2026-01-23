@@ -3872,9 +3872,20 @@ class AppBuilderOrchestrator:
         
         return context
     
+    def _is_ai_error(self, response):
+        """Check if AI response is an error message."""
+        if not response or len(response.strip()) < 20:
+            return True
+        error_indicators = [
+            "connection error", "cannot connect", "error:", "ollama error",
+            "request timed out", "failed to", "exception", "traceback"
+        ]
+        response_lower = response.lower()
+        return any(indicator in response_lower for indicator in error_indicators)
+
     def build_app(self, project_id):
         """Main app building workflow - optimized for speed.
-        
+
         Optimizations applied:
         - Reduced token limits for intermediate steps (faster generation)
         - Removed blocking user input prompts (auto-continue)
@@ -3887,20 +3898,37 @@ class AppBuilderOrchestrator:
         project = self.get_project(project_id)
         if not project:
             return False, "Project not found"
-        
+
         project_name = project[1]
         description = project[2]
         status = project[5]
-        
+
         print(f"\n{Colors.BRIGHT_CYAN}{Colors.BOLD}{'='*79}{Colors.RESET}")
         print(f"{Colors.BRIGHT_YELLOW}{Colors.BOLD}  BUILDING APP: {project_name}{Colors.RESET}")
         print(f"{Colors.BRIGHT_CYAN}{Colors.BOLD}{'='*79}{Colors.RESET}\n")
-        
+
+        # Quick AI backend check before starting
+        print(f"{Colors.DIM}Verifying AI backend...{Colors.RESET}", end="", flush=True)
+        test_response = self.ai_engine.generate("Say 'ready' if you can respond.")
+        if self._is_ai_error(test_response):
+            print(f" {Colors.BRIGHT_RED}FAILED{Colors.RESET}")
+            print(f"\n{Colors.BRIGHT_RED}✗ AI Backend Error: {test_response[:100]}{Colors.RESET}")
+            print(f"{Colors.YELLOW}Please ensure your AI backend (Ollama/HuggingFace) is running properly.{Colors.RESET}")
+            print(f"{Colors.YELLOW}For Ollama, run: ollama serve{Colors.RESET}")
+            return False, "AI backend not available"
+        print(f" {Colors.BRIGHT_GREEN}OK{Colors.RESET}\n")
+
         # Stage 1: Specification
         if status == "specification":
             print(f"{Colors.BRIGHT_CYAN}[1/5] Specification Writer analyzing requirements...{Colors.RESET}")
             analysis = self.spec_writer.analyze_description(project_name, description)
-            
+
+            # Check for AI errors
+            if self._is_ai_error(analysis):
+                print(f"{Colors.BRIGHT_RED}✗ AI Error: {analysis[:100]}...{Colors.RESET}")
+                print(f"{Colors.YELLOW}Please check your AI backend (Ollama/HuggingFace) is running.{Colors.RESET}")
+                return False, "AI generation failed"
+
             # Check if questions are needed
             if "?" in analysis or "question" in analysis.lower():
                 print(f"{Colors.BRIGHT_YELLOW}⚠ Questions detected. Skipping Q&A for speed (auto-generating spec)...{Colors.RESET}")
@@ -3908,31 +3936,53 @@ class AppBuilderOrchestrator:
                 spec = self.spec_writer.write_specification(project_name, description)
             else:
                 spec = self.spec_writer.write_specification(project_name, description)
-            
+
+            # Validate spec
+            if self._is_ai_error(spec):
+                print(f"{Colors.BRIGHT_RED}✗ AI Error generating specification: {spec[:100]}...{Colors.RESET}")
+                return False, "Failed to generate specification"
+
+            # Show what was generated
+            print(f"{Colors.DIM}Generated specification ({len(spec)} chars):{Colors.RESET}")
+            print(f"{Colors.DIM}{spec[:200]}...{Colors.RESET}\n")
+
             self.update_project_field(project_id, "specification", spec)
             self.update_project_field(project_id, "status", "architecture")
-            
+
             print(f"{Colors.BRIGHT_GREEN}✓ Specification complete!{Colors.RESET}")
         
         # Stage 2: Architecture
         project = self.get_project(project_id)
         if project[5] == "architecture":
             spec = project[3]
-            
+
+            if not spec or len(spec.strip()) < 50:
+                print(f"{Colors.BRIGHT_RED}✗ No valid specification found. Cannot proceed with architecture.{Colors.RESET}")
+                return False, "Missing specification"
+
             print(f"{Colors.BRIGHT_CYAN}[2/5] Architect designing system...{Colors.RESET}")
             architecture = self.architect.design_architecture(spec)
-            
+
+            # Validate architecture
+            if self._is_ai_error(architecture):
+                print(f"{Colors.BRIGHT_RED}✗ AI Error generating architecture: {architecture[:100]}...{Colors.RESET}")
+                return False, "Failed to generate architecture"
+
+            # Show what was generated
+            print(f"{Colors.DIM}Generated architecture ({len(architecture)} chars):{Colors.RESET}")
+            print(f"{Colors.DIM}{architecture[:200]}...{Colors.RESET}\n")
+
             self.update_project_field(project_id, "architecture", architecture)
-            
+
             # Check and install dependencies (non-blocking)
             print(f"{Colors.BRIGHT_CYAN}Checking dependencies...{Colors.RESET}")
             installed, failed = self.architect.check_and_install_dependencies(architecture)
-            
+
             if installed:
                 print(f"{Colors.BRIGHT_GREEN}✓ Installed: {', '.join(installed[:5])}{'...' if len(installed) > 5 else ''}{Colors.RESET}")
             if failed:
                 print(f"{Colors.YELLOW}⚠ Failed: {', '.join(failed[:3])}{'...' if len(failed) > 3 else ''}{Colors.RESET}")
-            
+
             self.update_project_field(project_id, "status", "tasks")
             print(f"{Colors.BRIGHT_GREEN}✓ Architecture complete!{Colors.RESET}")
         
@@ -3941,22 +3991,59 @@ class AppBuilderOrchestrator:
         if project[5] == "tasks":
             spec = project[3]
             architecture = project[4]
-            
+
+            if not architecture or len(architecture.strip()) < 50:
+                print(f"{Colors.BRIGHT_RED}✗ No valid architecture found. Cannot create tasks.{Colors.RESET}")
+                return False, "Missing architecture"
+
             print(f"{Colors.BRIGHT_CYAN}[3/5] Tech Lead creating task list...{Colors.RESET}")
             tasks_doc = self.tech_lead.create_tasks(spec, architecture)
-            
-            # Parse and save tasks
+
+            # Validate tasks document
+            if self._is_ai_error(tasks_doc):
+                print(f"{Colors.BRIGHT_RED}✗ AI Error generating tasks: {tasks_doc[:100]}...{Colors.RESET}")
+                return False, "Failed to generate tasks"
+
+            # Show what was generated
+            print(f"{Colors.DIM}Generated task document ({len(tasks_doc)} chars):{Colors.RESET}")
+            print(f"{Colors.DIM}{tasks_doc[:300]}...{Colors.RESET}\n")
+
+            # Parse and save tasks - improved parsing to handle more formats
             conn = sqlite3.connect(APP_PROJECTS_DB)
             cursor = conn.cursor()
-            
-            task_lines = [line.strip() for line in tasks_doc.split('\n') if line.strip() and (line.strip()[0].isdigit() or line.strip().startswith('-'))]
+
+            # Enhanced task parsing - handle multiple formats
+            task_lines = []
+            for line in tasks_doc.split('\n'):
+                line = line.strip()
+                if not line:
+                    continue
+                # Match: digits, dashes, bullets, asterisks, "Task X:", etc.
+                if (line[0].isdigit() or
+                    line.startswith('-') or
+                    line.startswith('*') or
+                    line.startswith('•') or
+                    line.lower().startswith('task')):
+                    # Clean up the line
+                    clean_line = line.lstrip('0123456789.-*•) \t')
+                    if clean_line and len(clean_line) > 5:  # Minimum task description length
+                        task_lines.append(clean_line)
+
+            if not task_lines:
+                print(f"{Colors.BRIGHT_RED}✗ Failed to parse tasks from AI output.{Colors.RESET}")
+                print(f"{Colors.YELLOW}Raw output:{Colors.RESET}")
+                print(f"{Colors.DIM}{tasks_doc}{Colors.RESET}")
+                print(f"\n{Colors.YELLOW}Please try again or manually add tasks.{Colors.RESET}")
+                return False, "No tasks could be parsed"
+
             for i, task_line in enumerate(task_lines, 1):
                 cursor.execute("INSERT INTO app_tasks (project_id, task_number, description, status) VALUES (?, ?, ?, ?)",
                               (project_id, i, task_line, "pending"))
-            
+                print(f"{Colors.DIM}  Task {i}: {task_line[:60]}...{Colors.RESET}")
+
             conn.commit()
             conn.close()
-            
+
             self.update_project_field(project_id, "status", "development")
             print(f"{Colors.BRIGHT_GREEN}✓ {len(task_lines)} tasks created!{Colors.RESET}")
         
@@ -3973,19 +4060,35 @@ class AppBuilderOrchestrator:
         spec = project[3]
         architecture = project[4]
         builder_threads = getattr(self, "builder_threads", 1)
-        
+
         conn = sqlite3.connect(APP_PROJECTS_DB)
         cursor = conn.cursor()
-        
-        cursor.execute("SELECT id, task_number, description, status FROM app_tasks WHERE project_id=? ORDER BY task_number", 
+
+        cursor.execute("SELECT id, task_number, description, status FROM app_tasks WHERE project_id=? ORDER BY task_number",
                       (project_id,))
         tasks = cursor.fetchall()
         conn.close()
-        
+
+        # Check if there are any tasks to develop
+        if not tasks:
+            print(f"\n{Colors.BRIGHT_RED}✗ No tasks found for this project!{Colors.RESET}")
+            print(f"{Colors.YELLOW}The task creation stage may have failed.{Colors.RESET}")
+            print(f"{Colors.YELLOW}Please go back and check the project status or try again.{Colors.RESET}")
+            return
+
+        pending_tasks = [t for t in tasks if t[3] != "completed"]
+        if not pending_tasks:
+            print(f"\n{Colors.BRIGHT_GREEN}All {len(tasks)} tasks are already completed!{Colors.RESET}")
+            self.update_project_field(project_id, "status", "completed")
+            return
+
+        print(f"\n{Colors.BRIGHT_CYAN}[4/5] Development Phase{Colors.RESET}")
+        print(f"{Colors.DIM}Total tasks: {len(tasks)}, Pending: {len(pending_tasks)}{Colors.RESET}\n")
+
         if builder_threads > 1:
             self._develop_tasks_threaded(project_id, tasks, spec, architecture, builder_threads)
             return
-        
+
         for task_id, task_num, task_desc, task_status in tasks:
             if task_status == "completed":
                 print(f"{Colors.DIM}[Task {task_num}] Already completed: {task_desc[:50]}...{Colors.RESET}")
@@ -3998,42 +4101,60 @@ class AppBuilderOrchestrator:
             # Get existing files
             existing_files = self.get_project_files(project_id)
             files_context = "\n".join([f"{fp}: {len(content)} chars" for fp, content in existing_files])
-            
+
             # Developer plans implementation
-            print(f"{Colors.BRIGHT_CYAN}[4/5] Planning & coding...{Colors.RESET}", end="", flush=True)
+            print(f"{Colors.BRIGHT_CYAN}Planning...{Colors.RESET}", end="", flush=True)
             impl_plan = self.developer.plan_task(task_desc, spec, architecture, files_context)
-            
+
+            # Validate plan
+            if self._is_ai_error(impl_plan):
+                print(f"\n{Colors.BRIGHT_RED}✗ AI Error generating plan: {impl_plan[:80]}...{Colors.RESET}")
+                print(f"{Colors.YELLOW}⚠ Skipping task due to AI error.{Colors.RESET}")
+                continue
+
+            print(f" {Colors.BRIGHT_GREEN}✓{Colors.RESET}")
+            print(f"{Colors.DIM}Plan: {impl_plan[:100]}...{Colors.RESET}")
+
             # Save implementation plan
             conn = sqlite3.connect(APP_PROJECTS_DB)
             cursor = conn.cursor()
             cursor.execute("UPDATE app_tasks SET implementation_plan=? WHERE id=?", (impl_plan, task_id))
             conn.commit()
             conn.close()
-            
+
             # Code Monkey writes code
-            print(f" {Colors.BRIGHT_CYAN}writing...{Colors.RESET}", end="", flush=True)
-            
+            print(f"{Colors.BRIGHT_CYAN}Writing code...{Colors.RESET}", end="", flush=True)
+
             # Get relevant context
             relevant_context = self.filter_relevant_context(task_desc + " " + impl_plan, existing_files)
-            
+
             code = self.code_monkey.write_code(impl_plan, relevant_context)
-            
+
+            # Validate code
+            if self._is_ai_error(code) or len(code.strip()) < 20:
+                print(f"\n{Colors.BRIGHT_RED}✗ AI Error generating code: {code[:80]}...{Colors.RESET}")
+                print(f"{Colors.YELLOW}⚠ Skipping task due to AI error.{Colors.RESET}")
+                continue
+
+            print(f" {Colors.BRIGHT_GREEN}✓{Colors.RESET}")
+            print(f"{Colors.DIM}Code: {len(code)} chars generated{Colors.RESET}")
+
             # Reviewer reviews code (faster review)
-            print(f" {Colors.BRIGHT_CYAN}reviewing...{Colors.RESET}", end="", flush=True)
+            print(f"{Colors.BRIGHT_CYAN}Reviewing...{Colors.RESET}", end="", flush=True)
             review = self.reviewer.review_code(code, task_desc, impl_plan)
-            print()  # New line after progress
-            
+            print(f" {Colors.BRIGHT_GREEN}✓{Colors.RESET}")
+
             # Check if approved
-            if "APPROVED" in review.upper():
+            if "APPROVED" in review.upper() or not self._is_ai_error(review):
                 # Extract filename from code or plan
                 filename = self.extract_filename(code, impl_plan, task_desc)
                 if not filename:
                     # Auto-generate filename from task number
                     filename = f"task_{task_num}.py"
-                
+
                 self.save_file(project_id, filename, code)
                 print(f"{Colors.BRIGHT_GREEN}✓ Task {task_num} completed: {filename}{Colors.RESET}")
-                
+
                 # Mark task as completed
                 conn = sqlite3.connect(APP_PROJECTS_DB)
                 cursor = conn.cursor()
@@ -4042,10 +4163,10 @@ class AppBuilderOrchestrator:
                               (project_id, task_id, "approved", review))
                 conn.commit()
                 conn.close()
-                
+
             else:
                 print(f"{Colors.BRIGHT_RED}✗ Task {task_num} rejected: {review[:100]}...{Colors.RESET}")
-                
+
                 # Save review
                 conn = sqlite3.connect(APP_PROJECTS_DB)
                 cursor = conn.cursor()
@@ -4053,24 +4174,51 @@ class AppBuilderOrchestrator:
                               (project_id, task_id, "rejected", review))
                 conn.commit()
                 conn.close()
-                
+
                 # Auto-skip rejected tasks for speed (user can retry manually later)
                 print(f"{Colors.YELLOW}⚠ Task skipped. Review saved. You can retry manually later.{Colors.RESET}")
         
-        # All tasks completed
+        # Check final status
+        conn = sqlite3.connect(APP_PROJECTS_DB)
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM app_tasks WHERE project_id=? AND status='completed'", (project_id,))
+        completed_count = cursor.fetchone()[0]
+        cursor.execute("SELECT COUNT(*) FROM app_tasks WHERE project_id=?", (project_id,))
+        total_count = cursor.fetchone()[0]
+        conn.close()
+
+        print(f"\n{Colors.BRIGHT_CYAN}{'='*79}{Colors.RESET}")
+        print(f"{Colors.BRIGHT_GREEN}{Colors.BOLD}[5/5] Development Complete!{Colors.RESET}")
+        print(f"{Colors.CYAN}Tasks completed: {completed_count}/{total_count}{Colors.RESET}")
+
+        if completed_count == 0:
+            print(f"{Colors.BRIGHT_RED}⚠ No tasks were completed successfully.{Colors.RESET}")
+            print(f"{Colors.YELLOW}Please check your AI backend and try again.{Colors.RESET}")
+            return
+
         self.update_project_field(project_id, "status", "completed")
-        print(f"\n{Colors.BRIGHT_GREEN}{Colors.BOLD}✓ All tasks completed!{Colors.RESET}")
-        
-        # Generate documentation (optional - can be skipped for speed)
-        print(f"{Colors.BRIGHT_CYAN}Generating documentation...{Colors.RESET}", end="", flush=True)
+
+        # Generate documentation
+        print(f"\n{Colors.BRIGHT_CYAN}Generating documentation...{Colors.RESET}", end="", flush=True)
         files = self.get_project_files(project_id)
+
+        if not files:
+            print(f"\n{Colors.YELLOW}⚠ No files generated, skipping documentation.{Colors.RESET}")
+            return
+
         codebase_summary = "\n".join([f"{fp}: {len(content)} lines" for fp, content in files])
-        
+
         docs = self.tech_writer.write_documentation(project[1], spec, architecture, codebase_summary)
-        
+
         # Save documentation
-        self.save_file(project_id, "README.md", docs)
-        print(f" {Colors.BRIGHT_GREEN}✓ README.md saved{Colors.RESET}")
+        if not self._is_ai_error(docs):
+            self.save_file(project_id, "README.md", docs)
+            print(f" {Colors.BRIGHT_GREEN}✓ README.md saved{Colors.RESET}")
+        else:
+            print(f"\n{Colors.YELLOW}⚠ Failed to generate documentation.{Colors.RESET}")
+
+        print(f"\n{Colors.BRIGHT_GREEN}{Colors.BOLD}✓ App building complete!{Colors.RESET}")
+        print(f"{Colors.CYAN}Project files saved to: {APPS_DIR}/{project[1]}/{Colors.RESET}")
 
     def _develop_tasks_threaded(self, project_id, tasks, spec, architecture, builder_threads):
         """Parallelized task development while keeping the original pipeline semantics."""
