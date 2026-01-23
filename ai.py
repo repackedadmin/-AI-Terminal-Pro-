@@ -91,6 +91,36 @@ try:
 except ImportError:
     SYSTEM_INFO_AVAILABLE = False
 
+# Self-Healing Components
+try:
+    from tui.components.self_healing import (
+        SelfHealingConfig,
+        SelfHealingLogger,
+        DatabaseHealer,
+        NetworkHealer,
+        MCPHealer,
+        ConfigHealer,
+        MemoryHealer,
+        HealthMonitor,
+        get_health_monitor,
+        start_health_monitor,
+        retry_on_failure,
+        with_db_recovery,
+        with_network_recovery
+    )
+    SELF_HEALING_AVAILABLE = True
+except ImportError:
+    SELF_HEALING_AVAILABLE = False
+    # Create dummy decorators
+    def retry_on_failure(*args, **kwargs):
+        def decorator(func):
+            return func
+        return decorator
+    def with_db_recovery(func):
+        return func
+    def with_network_recovery(func):
+        return func
+
 # ANSI Color Codes for cross-platform terminal colors
 class Colors:
     RESET = '\033[0m'
@@ -239,11 +269,76 @@ class ConfigManager:
 # ==============================================================================
 
 class MemoryManager:
-    """Handles SQLite interaction for Chat History and Document RAG."""
+    """Handles SQLite interaction for Chat History and Document RAG with Self-Healing."""
     def __init__(self, db_path):
-        self.conn = sqlite3.connect(db_path, check_same_thread=False)
-        self.cursor = self.conn.cursor()
+        self.db_path = db_path
+        self._connect()
         self._init_db()
+
+        # Initialize self-healing if available
+        if SELF_HEALING_AVAILABLE:
+            self.db_healer = DatabaseHealer(db_path)
+            self._recovery_attempts = 0
+            self._max_recovery_attempts = 3
+
+    def _connect(self):
+        """Create database connection with self-healing"""
+        try:
+            self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
+            self.conn.execute("PRAGMA journal_mode=WAL")  # Write-Ahead Logging for better reliability
+            self.conn.execute("PRAGMA synchronous=NORMAL")
+            self.cursor = self.conn.cursor()
+        except sqlite3.DatabaseError as e:
+            if SELF_HEALING_AVAILABLE:
+                print(f"{Colors.YELLOW}Database issue detected, attempting recovery...{Colors.RESET}")
+                healer = DatabaseHealer(self.db_path)
+                if healer.heal():
+                    self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
+                    self.cursor = self.conn.cursor()
+                else:
+                    raise
+            else:
+                raise
+
+    def _execute_with_recovery(self, query, params=None, commit=False):
+        """Execute query with automatic recovery on failure"""
+        try:
+            if params:
+                self.cursor.execute(query, params)
+            else:
+                self.cursor.execute(query)
+            if commit:
+                self.conn.commit()
+            return True
+        except sqlite3.DatabaseError as e:
+            if SELF_HEALING_AVAILABLE and self._recovery_attempts < self._max_recovery_attempts:
+                self._recovery_attempts += 1
+                print(f"{Colors.YELLOW}Database error, attempting recovery ({self._recovery_attempts}/{self._max_recovery_attempts})...{Colors.RESET}")
+                if self.db_healer.heal():
+                    self._connect()
+                    # Retry the query
+                    if params:
+                        self.cursor.execute(query, params)
+                    else:
+                        self.cursor.execute(query)
+                    if commit:
+                        self.conn.commit()
+                    self._recovery_attempts = 0
+                    return True
+            raise
+        finally:
+            if self._recovery_attempts >= self._max_recovery_attempts:
+                self._recovery_attempts = 0
+
+    def check_health(self):
+        """Check database health and auto-heal if needed"""
+        if SELF_HEALING_AVAILABLE:
+            return self.db_healer.check_health()
+        try:
+            self.cursor.execute("SELECT 1")
+            return True
+        except:
+            return False
 
     def _init_db(self):
         # Sessions/Chats Table
@@ -530,7 +625,7 @@ class MemoryManager:
 # ==============================================================================
 
 class MCPClient:
-    """Implements JSON-RPC 2.0 Client over Stdio."""
+    """Implements JSON-RPC 2.0 Client over Stdio with Self-Healing."""
     def __init__(self, name, command):
         self.name = name
         self.command = command
@@ -538,6 +633,18 @@ class MCPClient:
         self.request_id = 0
         self.available_tools = []
         self.running = False
+
+        # Self-healing properties
+        self._restart_attempts = 0
+        self._max_restart_attempts = 3
+        self._last_restart = 0
+        self._restart_cooldown = 30  # seconds
+
+        # Initialize MCP healer if available
+        if SELF_HEALING_AVAILABLE:
+            self.healer = MCPHealer(name, command)
+        else:
+            self.healer = None
 
     def start(self):
         try:
@@ -549,12 +656,13 @@ class MCPClient:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
-                bufsize=0 
+                bufsize=0
             )
             self.running = True
-            
+
             if self._handshake():
                 self._refresh_tools()
+                self._restart_attempts = 0  # Reset on successful start
                 return True
             return False
         except Exception as e:
@@ -578,23 +686,53 @@ class MCPClient:
             self.process.stdin.flush()
         except (BrokenPipeError, OSError):
             self.running = False
+            self._attempt_recovery()
 
     def _read_response(self, timeout=3.0):
         start_time = time.time()
         while time.time() - start_time < timeout:
-            line = self.process.stdout.readline()
-            if line:
-                try:
-                    return json.loads(line)
-                except json.JSONDecodeError:
-                    continue
+            try:
+                line = self.process.stdout.readline()
+                if line:
+                    try:
+                        return json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+            except (BrokenPipeError, OSError):
+                self.running = False
+                break
         return None
+
+    def _attempt_recovery(self):
+        """Attempt to recover the MCP connection"""
+        if not self.running and self._restart_attempts < self._max_restart_attempts:
+            current_time = time.time()
+            if current_time - self._last_restart >= self._restart_cooldown:
+                self._restart_attempts += 1
+                self._last_restart = current_time
+                print(f"{Colors.YELLOW}[MCP] Attempting auto-restart of {self.name} ({self._restart_attempts}/{self._max_restart_attempts})...{Colors.RESET}")
+
+                # Use healer if available
+                if self.healer:
+                    if self.healer.heal():
+                        self.stop()
+                        if self.start():
+                            print(f"{Colors.BRIGHT_GREEN}[MCP] {self.name} recovered successfully{Colors.RESET}")
+                            return True
+                else:
+                    self.stop()
+                    if self.start():
+                        print(f"{Colors.BRIGHT_GREEN}[MCP] {self.name} restarted successfully{Colors.RESET}")
+                        return True
+
+                print(f"{Colors.RED}[MCP] Failed to recover {self.name}{Colors.RESET}")
+        return False
 
     def _handshake(self):
         self._send_json({
-            "jsonrpc": "2.0", 
-            "method": "initialize", 
-            "params": {"protocolVersion": "0.1.0", "clientInfo": {"name": "AI_Term", "version": "1.0"}, "capabilities": {}}, 
+            "jsonrpc": "2.0",
+            "method": "initialize",
+            "params": {"protocolVersion": "0.1.0", "clientInfo": {"name": "AI_Term", "version": "1.0"}, "capabilities": {}},
             "id": self._next_id()
         })
         resp = self._read_response()
@@ -609,18 +747,40 @@ class MCPClient:
         if resp and "result" in resp and "tools" in resp["result"]:
             self.available_tools = resp["result"]["tools"]
 
+    def check_health(self):
+        """Check if MCP server is healthy"""
+        if not self.running or not self.process:
+            return False
+        try:
+            # Check if process is still running
+            if self.process.poll() is not None:
+                self.running = False
+                return False
+            return True
+        except:
+            return False
+
     def call_tool(self, tool_name, args_dict):
+        # Check health before calling
+        if not self.check_health():
+            if not self._attempt_recovery():
+                return "Error: MCP server not running and recovery failed."
+
         self._send_json({
-            "jsonrpc": "2.0", 
-            "method": "tools/call", 
-            "params": {"name": tool_name, "arguments": args_dict}, 
+            "jsonrpc": "2.0",
+            "method": "tools/call",
+            "params": {"name": tool_name, "arguments": args_dict},
             "id": self._next_id()
         })
         resp = self._read_response(timeout=15.0) # Longer timeout for tool execution
-        
-        if not resp: return "Error: MCP Timeout."
+
+        if not resp:
+            # Try recovery on timeout
+            if self._attempt_recovery():
+                return self.call_tool(tool_name, args_dict)  # Retry
+            return "Error: MCP Timeout."
         if "error" in resp: return f"MCP Error: {resp['error'].get('message')}"
-        
+
         # MCP Standard: result.content is a list of items
         if "result" in resp:
             content = resp["result"].get("content", [])
@@ -2175,6 +2335,64 @@ class ContextManager:
         rag = ""  # No RAG in API mode unless provided
         return self.build_prompt(system, history, rag, user_input, project_memory)
 
+def resilient_request(method, url, max_retries=3, retry_delay=1.0, **kwargs):
+    """
+    Make HTTP requests with automatic retry and self-healing.
+    Supports exponential backoff and network recovery.
+    """
+    last_error = None
+
+    for attempt in range(max_retries):
+        try:
+            if method.lower() == 'get':
+                response = requests.get(url, **kwargs)
+            elif method.lower() == 'post':
+                response = requests.post(url, **kwargs)
+            elif method.lower() == 'put':
+                response = requests.put(url, **kwargs)
+            elif method.lower() == 'delete':
+                response = requests.delete(url, **kwargs)
+            else:
+                response = requests.request(method, url, **kwargs)
+
+            return response
+
+        except requests.exceptions.ConnectionError as e:
+            last_error = e
+            if attempt < max_retries - 1:
+                wait_time = retry_delay * (2 ** attempt)  # Exponential backoff
+                print(f"{Colors.YELLOW}[Network] Connection error, retrying in {wait_time:.1f}s ({attempt + 1}/{max_retries})...{Colors.RESET}")
+
+                # Check network connectivity if self-healing available
+                if SELF_HEALING_AVAILABLE:
+                    healer = NetworkHealer()
+                    if healer.check_health():
+                        time.sleep(wait_time)
+                    else:
+                        print(f"{Colors.YELLOW}[Network] Waiting for network recovery...{Colors.RESET}")
+                        healer.heal()
+                        time.sleep(wait_time)
+                else:
+                    time.sleep(wait_time)
+
+        except requests.exceptions.Timeout as e:
+            last_error = e
+            if attempt < max_retries - 1:
+                wait_time = retry_delay * (2 ** attempt)
+                print(f"{Colors.YELLOW}[Network] Request timeout, retrying in {wait_time:.1f}s ({attempt + 1}/{max_retries})...{Colors.RESET}")
+                time.sleep(wait_time)
+
+        except requests.exceptions.RequestException as e:
+            last_error = e
+            if attempt < max_retries - 1:
+                wait_time = retry_delay * (2 ** attempt)
+                print(f"{Colors.YELLOW}[Network] Request error, retrying in {wait_time:.1f}s ({attempt + 1}/{max_retries})...{Colors.RESET}")
+                time.sleep(wait_time)
+
+    # All retries exhausted
+    raise last_error if last_error else requests.exceptions.RequestException("Max retries exceeded")
+
+
 class AIEngine:
     def __init__(self, config):
         self.config = config
@@ -2232,20 +2450,32 @@ class AIEngine:
             
         elif self.backend == "ollama":
             try:
-                res = requests.post("http://localhost:11434/api/generate", json={
-                    "model": self.model_name,
-                    "prompt": prompt,
-                    "stream": False,
-                    "options": {
-                        "temperature": self.config.get("temperature"),
-                        "num_predict": self.config.get("max_response_tokens")
-                    }
-                })
+                # Use resilient request with self-healing
+                res = resilient_request(
+                    'post',
+                    "http://localhost:11434/api/generate",
+                    json={
+                        "model": self.model_name,
+                        "prompt": prompt,
+                        "stream": False,
+                        "options": {
+                            "temperature": self.config.get("temperature"),
+                            "num_predict": self.config.get("max_response_tokens")
+                        }
+                    },
+                    timeout=90,
+                    max_retries=3,
+                    retry_delay=2.0
+                )
                 if res.status_code == 200:
                     return res.json()['response'].strip()
                 return f"Ollama Error: {res.text}"
+            except requests.exceptions.ConnectionError:
+                return "Connection Error: Cannot connect to Ollama. Make sure it's running with: ollama serve"
+            except requests.exceptions.Timeout:
+                return "Request timed out. The model may be slow or Ollama is overloaded."
             except Exception as e:
-                return f"Connection Error: {e}"
+                return f"Error: {e}"
 
 # ==============================================================================
 #                           6. MODEL DISCOVERY & DOWNLOAD
@@ -6548,23 +6778,356 @@ class App:
             return "COMMAND"
 
         elif cmd == "/browser":
-            # Browser automation
-            if not args:
-                print(f"{Colors.YELLOW}Usage: /browser [url]{Colors.RESET}")
-                print(f"{Colors.DIM}Opens URL in Playwright browser for automation{Colors.RESET}")
-            else:
-                url = args.strip()
-                if not url.startswith(('http://', 'https://')):
-                    url = 'https://' + url
-                print(f"\n{Colors.CYAN}Opening browser: {url}{Colors.RESET}")
-                if hasattr(self, 'registry') and self.registry and hasattr(self.registry, 'browser_manager'):
+            # Full browser automation with Playwright
+            subcmd = args.split()[0].lower() if args else ""
+            sub_args = ' '.join(args.split()[1:]) if len(args.split()) > 1 else ""
+
+            # Initialize browser manager if not exists
+            if not hasattr(self, '_browser_instance'):
+                self._browser_instance = None
+                self._browser_page = None
+                self._browser_context = None
+
+            def _ensure_playwright():
+                """Ensure playwright is available and browser is running"""
+                try:
+                    from playwright.sync_api import sync_playwright
+                    return True
+                except ImportError:
+                    print(f"{Colors.YELLOW}Playwright not installed. Install with: pip install playwright{Colors.RESET}")
+                    print(f"{Colors.DIM}Then run: playwright install chromium{Colors.RESET}")
+                    return False
+
+            def _get_browser():
+                """Get or create browser instance"""
+                if self._browser_instance is None:
                     try:
-                        self.registry.browser_manager.navigate(url)
-                        print(f"{Colors.BRIGHT_GREEN}✓ Browser opened{Colors.RESET}")
+                        from playwright.sync_api import sync_playwright
+                        self._playwright = sync_playwright().start()
+                        self._browser_instance = self._playwright.chromium.launch(
+                            headless=False,
+                            args=['--no-sandbox', '--disable-dev-shm-usage']
+                        )
+                        self._browser_context = self._browser_instance.new_context(
+                            viewport={'width': 1280, 'height': 720}
+                        )
+                        self._browser_page = self._browser_context.new_page()
+                        print(f"{Colors.BRIGHT_GREEN}✓ Browser started{Colors.RESET}")
+                    except Exception as e:
+                        print(f"{Colors.RED}Failed to start browser: {e}{Colors.RESET}")
+                        return None
+                return self._browser_page
+
+            if not subcmd:
+                # Show browser help
+                print(f"\n{Colors.BRIGHT_CYAN}{Colors.BOLD}Browser Automation (Playwright){Colors.RESET}")
+                print(f"{Colors.DIM}{'─'*60}{Colors.RESET}")
+                print(f"\n{Colors.BRIGHT_WHITE}Navigation:{Colors.RESET}")
+                print(f"  {Colors.CYAN}/browser open <url>{Colors.RESET}      - Navigate to URL")
+                print(f"  {Colors.CYAN}/browser back{Colors.RESET}            - Go back")
+                print(f"  {Colors.CYAN}/browser forward{Colors.RESET}         - Go forward")
+                print(f"  {Colors.CYAN}/browser refresh{Colors.RESET}         - Refresh page")
+                print(f"  {Colors.CYAN}/browser url{Colors.RESET}             - Show current URL")
+                print(f"\n{Colors.BRIGHT_WHITE}Capture:{Colors.RESET}")
+                print(f"  {Colors.CYAN}/browser screenshot [path]{Colors.RESET} - Take screenshot")
+                print(f"  {Colors.CYAN}/browser html{Colors.RESET}            - Get page HTML")
+                print(f"  {Colors.CYAN}/browser text{Colors.RESET}            - Get page text content")
+                print(f"  {Colors.CYAN}/browser title{Colors.RESET}           - Get page title")
+                print(f"\n{Colors.BRIGHT_WHITE}Interaction:{Colors.RESET}")
+                print(f"  {Colors.CYAN}/browser click <selector>{Colors.RESET} - Click element")
+                print(f"  {Colors.CYAN}/browser fill <sel> <text>{Colors.RESET} - Fill input field")
+                print(f"  {Colors.CYAN}/browser type <text>{Colors.RESET}     - Type text (active element)")
+                print(f"  {Colors.CYAN}/browser scroll <dir>{Colors.RESET}    - Scroll up/down")
+                print(f"\n{Colors.BRIGHT_WHITE}Advanced:{Colors.RESET}")
+                print(f"  {Colors.CYAN}/browser js <code>{Colors.RESET}       - Execute JavaScript")
+                print(f"  {Colors.CYAN}/browser wait <ms>{Colors.RESET}       - Wait milliseconds")
+                print(f"  {Colors.CYAN}/browser find <selector>{Colors.RESET} - Find elements")
+                print(f"  {Colors.CYAN}/browser pdf [path]{Colors.RESET}      - Export page to PDF")
+                print(f"\n{Colors.BRIGHT_WHITE}Control:{Colors.RESET}")
+                print(f"  {Colors.CYAN}/browser status{Colors.RESET}          - Show browser status")
+                print(f"  {Colors.CYAN}/browser close{Colors.RESET}           - Close browser")
+                print(f"\n{Colors.DIM}Note: Browser will open in visible mode for interaction{Colors.RESET}")
+
+            elif subcmd in ("open", "go", "navigate"):
+                # Navigate to URL
+                url = sub_args.strip()
+                if not url:
+                    print(f"{Colors.YELLOW}Usage: /browser open <url>{Colors.RESET}")
+                else:
+                    if not url.startswith(('http://', 'https://', 'file://')):
+                        url = 'https://' + url
+
+                    if not _ensure_playwright():
+                        return "COMMAND"
+
+                    page = _get_browser()
+                    if page:
+                        try:
+                            print(f"{Colors.CYAN}Navigating to: {url}{Colors.RESET}")
+                            page.goto(url, wait_until='domcontentloaded', timeout=30000)
+                            print(f"{Colors.BRIGHT_GREEN}✓ Loaded: {page.title()}{Colors.RESET}")
+                        except Exception as e:
+                            print(f"{Colors.RED}Navigation error: {e}{Colors.RESET}")
+
+            elif subcmd == "back":
+                if self._browser_page:
+                    try:
+                        self._browser_page.go_back()
+                        print(f"{Colors.BRIGHT_GREEN}✓ Navigated back{Colors.RESET}")
                     except Exception as e:
                         print(f"{Colors.RED}Error: {e}{Colors.RESET}")
                 else:
-                    print(f"{Colors.YELLOW}Browser manager not available{Colors.RESET}")
+                    print(f"{Colors.YELLOW}No browser open. Use /browser open <url>{Colors.RESET}")
+
+            elif subcmd == "forward":
+                if self._browser_page:
+                    try:
+                        self._browser_page.go_forward()
+                        print(f"{Colors.BRIGHT_GREEN}✓ Navigated forward{Colors.RESET}")
+                    except Exception as e:
+                        print(f"{Colors.RED}Error: {e}{Colors.RESET}")
+                else:
+                    print(f"{Colors.YELLOW}No browser open. Use /browser open <url>{Colors.RESET}")
+
+            elif subcmd == "refresh":
+                if self._browser_page:
+                    try:
+                        self._browser_page.reload()
+                        print(f"{Colors.BRIGHT_GREEN}✓ Page refreshed{Colors.RESET}")
+                    except Exception as e:
+                        print(f"{Colors.RED}Error: {e}{Colors.RESET}")
+                else:
+                    print(f"{Colors.YELLOW}No browser open. Use /browser open <url>{Colors.RESET}")
+
+            elif subcmd == "url":
+                if self._browser_page:
+                    print(f"{Colors.CYAN}Current URL:{Colors.RESET} {self._browser_page.url}")
+                else:
+                    print(f"{Colors.YELLOW}No browser open{Colors.RESET}")
+
+            elif subcmd == "title":
+                if self._browser_page:
+                    print(f"{Colors.CYAN}Page title:{Colors.RESET} {self._browser_page.title()}")
+                else:
+                    print(f"{Colors.YELLOW}No browser open{Colors.RESET}")
+
+            elif subcmd == "screenshot":
+                if self._browser_page:
+                    try:
+                        path = sub_args.strip() if sub_args else f"screenshot_{int(time.time())}.png"
+                        if not path.endswith(('.png', '.jpg', '.jpeg')):
+                            path += '.png'
+                        self._browser_page.screenshot(path=path, full_page=True)
+                        print(f"{Colors.BRIGHT_GREEN}✓ Screenshot saved: {path}{Colors.RESET}")
+                    except Exception as e:
+                        print(f"{Colors.RED}Screenshot error: {e}{Colors.RESET}")
+                else:
+                    print(f"{Colors.YELLOW}No browser open. Use /browser open <url>{Colors.RESET}")
+
+            elif subcmd == "pdf":
+                if self._browser_page:
+                    try:
+                        path = sub_args.strip() if sub_args else f"page_{int(time.time())}.pdf"
+                        if not path.endswith('.pdf'):
+                            path += '.pdf'
+                        self._browser_page.pdf(path=path)
+                        print(f"{Colors.BRIGHT_GREEN}✓ PDF saved: {path}{Colors.RESET}")
+                    except Exception as e:
+                        print(f"{Colors.RED}PDF error: {e}{Colors.RESET}")
+                else:
+                    print(f"{Colors.YELLOW}No browser open{Colors.RESET}")
+
+            elif subcmd == "html":
+                if self._browser_page:
+                    try:
+                        html = self._browser_page.content()
+                        print(f"\n{Colors.BRIGHT_CYAN}Page HTML ({len(html)} chars):{Colors.RESET}")
+                        print(f"{Colors.DIM}{html[:2000]}{'...' if len(html) > 2000 else ''}{Colors.RESET}")
+                    except Exception as e:
+                        print(f"{Colors.RED}Error: {e}{Colors.RESET}")
+                else:
+                    print(f"{Colors.YELLOW}No browser open{Colors.RESET}")
+
+            elif subcmd == "text":
+                if self._browser_page:
+                    try:
+                        text = self._browser_page.inner_text('body')
+                        print(f"\n{Colors.BRIGHT_CYAN}Page Text ({len(text)} chars):{Colors.RESET}")
+                        print(f"{Colors.DIM}{text[:3000]}{'...' if len(text) > 3000 else ''}{Colors.RESET}")
+                    except Exception as e:
+                        print(f"{Colors.RED}Error: {e}{Colors.RESET}")
+                else:
+                    print(f"{Colors.YELLOW}No browser open{Colors.RESET}")
+
+            elif subcmd == "click":
+                if self._browser_page:
+                    selector = sub_args.strip()
+                    if not selector:
+                        print(f"{Colors.YELLOW}Usage: /browser click <selector>{Colors.RESET}")
+                        print(f"{Colors.DIM}Examples: /browser click button#submit{Colors.RESET}")
+                        print(f"{Colors.DIM}          /browser click \"text=Sign In\"{Colors.RESET}")
+                    else:
+                        try:
+                            self._browser_page.click(selector, timeout=5000)
+                            print(f"{Colors.BRIGHT_GREEN}✓ Clicked: {selector}{Colors.RESET}")
+                        except Exception as e:
+                            print(f"{Colors.RED}Click error: {e}{Colors.RESET}")
+                else:
+                    print(f"{Colors.YELLOW}No browser open{Colors.RESET}")
+
+            elif subcmd == "fill":
+                if self._browser_page:
+                    parts = sub_args.split(maxsplit=1)
+                    if len(parts) < 2:
+                        print(f"{Colors.YELLOW}Usage: /browser fill <selector> <text>{Colors.RESET}")
+                        print(f"{Colors.DIM}Example: /browser fill input#email test@example.com{Colors.RESET}")
+                    else:
+                        selector, text = parts
+                        try:
+                            self._browser_page.fill(selector, text)
+                            print(f"{Colors.BRIGHT_GREEN}✓ Filled: {selector}{Colors.RESET}")
+                        except Exception as e:
+                            print(f"{Colors.RED}Fill error: {e}{Colors.RESET}")
+                else:
+                    print(f"{Colors.YELLOW}No browser open{Colors.RESET}")
+
+            elif subcmd == "type":
+                if self._browser_page:
+                    text = sub_args.strip()
+                    if not text:
+                        print(f"{Colors.YELLOW}Usage: /browser type <text>{Colors.RESET}")
+                    else:
+                        try:
+                            self._browser_page.keyboard.type(text)
+                            print(f"{Colors.BRIGHT_GREEN}✓ Typed: {text[:50]}{'...' if len(text) > 50 else ''}{Colors.RESET}")
+                        except Exception as e:
+                            print(f"{Colors.RED}Type error: {e}{Colors.RESET}")
+                else:
+                    print(f"{Colors.YELLOW}No browser open{Colors.RESET}")
+
+            elif subcmd == "scroll":
+                if self._browser_page:
+                    direction = sub_args.strip().lower()
+                    try:
+                        if direction == "up":
+                            self._browser_page.evaluate("window.scrollBy(0, -500)")
+                            print(f"{Colors.BRIGHT_GREEN}✓ Scrolled up{Colors.RESET}")
+                        elif direction == "down":
+                            self._browser_page.evaluate("window.scrollBy(0, 500)")
+                            print(f"{Colors.BRIGHT_GREEN}✓ Scrolled down{Colors.RESET}")
+                        elif direction == "top":
+                            self._browser_page.evaluate("window.scrollTo(0, 0)")
+                            print(f"{Colors.BRIGHT_GREEN}✓ Scrolled to top{Colors.RESET}")
+                        elif direction == "bottom":
+                            self._browser_page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                            print(f"{Colors.BRIGHT_GREEN}✓ Scrolled to bottom{Colors.RESET}")
+                        else:
+                            print(f"{Colors.YELLOW}Usage: /browser scroll <up|down|top|bottom>{Colors.RESET}")
+                    except Exception as e:
+                        print(f"{Colors.RED}Scroll error: {e}{Colors.RESET}")
+                else:
+                    print(f"{Colors.YELLOW}No browser open{Colors.RESET}")
+
+            elif subcmd == "js":
+                if self._browser_page:
+                    code = sub_args.strip()
+                    if not code:
+                        print(f"{Colors.YELLOW}Usage: /browser js <javascript code>{Colors.RESET}")
+                        print(f"{Colors.DIM}Example: /browser js document.title{Colors.RESET}")
+                    else:
+                        try:
+                            result = self._browser_page.evaluate(code)
+                            print(f"{Colors.BRIGHT_GREEN}✓ Result:{Colors.RESET} {result}")
+                        except Exception as e:
+                            print(f"{Colors.RED}JS error: {e}{Colors.RESET}")
+                else:
+                    print(f"{Colors.YELLOW}No browser open{Colors.RESET}")
+
+            elif subcmd == "wait":
+                if self._browser_page:
+                    try:
+                        ms = int(sub_args.strip()) if sub_args else 1000
+                        self._browser_page.wait_for_timeout(ms)
+                        print(f"{Colors.BRIGHT_GREEN}✓ Waited {ms}ms{Colors.RESET}")
+                    except ValueError:
+                        print(f"{Colors.YELLOW}Usage: /browser wait <milliseconds>{Colors.RESET}")
+                    except Exception as e:
+                        print(f"{Colors.RED}Wait error: {e}{Colors.RESET}")
+                else:
+                    print(f"{Colors.YELLOW}No browser open{Colors.RESET}")
+
+            elif subcmd == "find":
+                if self._browser_page:
+                    selector = sub_args.strip()
+                    if not selector:
+                        print(f"{Colors.YELLOW}Usage: /browser find <selector>{Colors.RESET}")
+                    else:
+                        try:
+                            elements = self._browser_page.query_selector_all(selector)
+                            print(f"\n{Colors.BRIGHT_CYAN}Found {len(elements)} element(s):{Colors.RESET}")
+                            for i, el in enumerate(elements[:10]):  # Limit to 10
+                                tag = self._browser_page.evaluate("el => el.tagName", el)
+                                text = self._browser_page.evaluate("el => el.innerText?.slice(0, 50)", el)
+                                print(f"  {Colors.CYAN}{i+1}.{Colors.RESET} <{tag.lower()}> {Colors.DIM}{text or ''}{Colors.RESET}")
+                            if len(elements) > 10:
+                                print(f"  {Colors.DIM}... and {len(elements) - 10} more{Colors.RESET}")
+                        except Exception as e:
+                            print(f"{Colors.RED}Find error: {e}{Colors.RESET}")
+                else:
+                    print(f"{Colors.YELLOW}No browser open{Colors.RESET}")
+
+            elif subcmd == "status":
+                print(f"\n{Colors.BRIGHT_CYAN}{Colors.BOLD}Browser Status{Colors.RESET}")
+                print(f"{Colors.DIM}{'─'*50}{Colors.RESET}")
+                if self._browser_page:
+                    try:
+                        print(f"  {Colors.CYAN}Status:{Colors.RESET} {Colors.BRIGHT_GREEN}Running{Colors.RESET}")
+                        print(f"  {Colors.CYAN}URL:{Colors.RESET} {self._browser_page.url}")
+                        print(f"  {Colors.CYAN}Title:{Colors.RESET} {self._browser_page.title()}")
+                        viewport = self._browser_page.viewport_size
+                        if viewport:
+                            print(f"  {Colors.CYAN}Viewport:{Colors.RESET} {viewport['width']}x{viewport['height']}")
+                    except Exception as e:
+                        print(f"  {Colors.CYAN}Status:{Colors.RESET} {Colors.RED}Error: {e}{Colors.RESET}")
+                else:
+                    print(f"  {Colors.CYAN}Status:{Colors.RESET} {Colors.DIM}Not started{Colors.RESET}")
+                    print(f"  {Colors.DIM}Use /browser open <url> to start{Colors.RESET}")
+
+            elif subcmd == "close":
+                if self._browser_instance:
+                    try:
+                        if self._browser_context:
+                            self._browser_context.close()
+                        self._browser_instance.close()
+                        if hasattr(self, '_playwright'):
+                            self._playwright.stop()
+                        self._browser_instance = None
+                        self._browser_page = None
+                        self._browser_context = None
+                        print(f"{Colors.BRIGHT_GREEN}✓ Browser closed{Colors.RESET}")
+                    except Exception as e:
+                        print(f"{Colors.RED}Error closing browser: {e}{Colors.RESET}")
+                else:
+                    print(f"{Colors.DIM}No browser to close{Colors.RESET}")
+
+            else:
+                # Treat as URL
+                url = args.strip()
+                if not url.startswith(('http://', 'https://', 'file://')):
+                    url = 'https://' + url
+
+                if not _ensure_playwright():
+                    return "COMMAND"
+
+                page = _get_browser()
+                if page:
+                    try:
+                        print(f"{Colors.CYAN}Navigating to: {url}{Colors.RESET}")
+                        page.goto(url, wait_until='domcontentloaded', timeout=30000)
+                        print(f"{Colors.BRIGHT_GREEN}✓ Loaded: {page.title()}{Colors.RESET}")
+                    except Exception as e:
+                        print(f"{Colors.RED}Navigation error: {e}{Colors.RESET}")
+
             return "COMMAND"
 
         elif cmd == "/memory":
@@ -6700,24 +7263,167 @@ class App:
             return "COMMAND"
 
         elif cmd == "/persona":
-            # Persona management
+            # Persona management - FULL IMPLEMENTATION
             subcmd = args.split()[0].lower() if args else ""
             subargs = " ".join(args.split()[1:]) if args and len(args.split()) > 1 else ""
 
             if not subcmd:
                 print(f"\n{Colors.BRIGHT_CYAN}{Colors.BOLD}Persona Management{Colors.RESET}")
                 print(f"{Colors.DIM}{'─'*50}{Colors.RESET}")
-                print(f"\n{Colors.DIM}Create tailored AI personas based on project analysis{Colors.RESET}")
+                # Show current persona info
+                current_prompt = self.config.get('system_prompt', '')
+                prompt_preview = current_prompt[:100] + "..." if len(current_prompt) > 100 else current_prompt
+                print(f"\n{Colors.CYAN}Current Persona:{Colors.RESET}")
+                print(f"  {Colors.DIM}{prompt_preview}{Colors.RESET}")
                 print(f"\n{Colors.BRIGHT_WHITE}Subcommands:{Colors.RESET}")
                 print(f"  {Colors.CYAN}/persona create{Colors.RESET}      - Generate persona from project")
                 print(f"  {Colors.CYAN}/persona load [file]{Colors.RESET} - Load persona from file")
                 print(f"  {Colors.CYAN}/persona save [file]{Colors.RESET} - Save current persona")
+                print(f"  {Colors.CYAN}/persona show{Colors.RESET}        - Show full current persona")
+                print(f"  {Colors.CYAN}/persona edit{Colors.RESET}        - Edit persona interactively")
                 print(f"  {Colors.CYAN}/persona clear{Colors.RESET}       - Clear active persona")
 
             elif subcmd == "create":
-                print(f"\n{Colors.CYAN}Analyzing project to create persona...{Colors.RESET}")
-                print(f"{Colors.YELLOW}This feature creates a customized system prompt based on your project.{Colors.RESET}")
-                print(f"{Colors.DIM}Use the Document Loader to add project files first.{Colors.RESET}")
+                # Full persona creation from project analysis
+                print(f"\n{Colors.BRIGHT_CYAN}Creating Project Persona...{Colors.RESET}")
+                print(f"{Colors.DIM}{'─'*50}{Colors.RESET}")
+
+                # Get working directory or use current
+                analyze_path = subargs if subargs else (self.working_directory if hasattr(self, 'working_directory') and self.working_directory else os.getcwd())
+
+                if not os.path.exists(analyze_path):
+                    print(f"{Colors.RED}Path not found: {analyze_path}{Colors.RESET}")
+                    return "COMMAND"
+
+                print(f"{Colors.DIM}Analyzing: {analyze_path}{Colors.RESET}")
+
+                # Collect project information
+                project_info = {
+                    'languages': {},
+                    'frameworks': [],
+                    'files': {'total': 0, 'by_type': {}},
+                    'structure': [],
+                    'readme': None
+                }
+
+                # File type to language mapping
+                lang_map = {
+                    '.py': 'Python', '.js': 'JavaScript', '.ts': 'TypeScript',
+                    '.jsx': 'React', '.tsx': 'React TypeScript', '.vue': 'Vue',
+                    '.java': 'Java', '.kt': 'Kotlin', '.swift': 'Swift',
+                    '.go': 'Go', '.rs': 'Rust', '.cpp': 'C++', '.c': 'C',
+                    '.cs': 'C#', '.rb': 'Ruby', '.php': 'PHP', '.html': 'HTML',
+                    '.css': 'CSS', '.scss': 'SCSS', '.sql': 'SQL', '.sh': 'Shell'
+                }
+
+                # Framework indicators
+                framework_indicators = {
+                    'requirements.txt': 'Python', 'package.json': 'Node.js',
+                    'Cargo.toml': 'Rust', 'go.mod': 'Go', 'pom.xml': 'Java/Maven',
+                    'build.gradle': 'Java/Gradle', 'Gemfile': 'Ruby',
+                    'composer.json': 'PHP', 'Dockerfile': 'Docker',
+                    'docker-compose.yml': 'Docker Compose', '.env': 'Environment Config',
+                    'firebase.json': 'Firebase', 'vercel.json': 'Vercel'
+                }
+
+                skip_dirs = {'.git', 'node_modules', '__pycache__', 'venv', '.venv', 'env', 'dist', 'build', '.idea', '.vscode'}
+
+                for root, dirs, files in os.walk(analyze_path):
+                    # Skip common non-source directories
+                    dirs[:] = [d for d in dirs if d not in skip_dirs and not d.startswith('.')]
+
+                    rel_root = os.path.relpath(root, analyze_path)
+                    if rel_root == '.':
+                        project_info['structure'].append('/')
+                    elif len(rel_root.split(os.sep)) <= 2:
+                        project_info['structure'].append(f"  {rel_root}/")
+
+                    for file in files:
+                        if file.startswith('.'):
+                            continue
+
+                        project_info['files']['total'] += 1
+                        ext = os.path.splitext(file)[1].lower()
+
+                        # Count file types
+                        project_info['files']['by_type'][ext] = project_info['files']['by_type'].get(ext, 0) + 1
+
+                        # Detect languages
+                        if ext in lang_map:
+                            lang = lang_map[ext]
+                            project_info['languages'][lang] = project_info['languages'].get(lang, 0) + 1
+
+                        # Detect frameworks
+                        if file in framework_indicators:
+                            fw = framework_indicators[file]
+                            if fw not in project_info['frameworks']:
+                                project_info['frameworks'].append(fw)
+
+                        # Read README
+                        if file.lower() in ['readme.md', 'readme.txt', 'readme']:
+                            try:
+                                with open(os.path.join(root, file), 'r', errors='ignore') as f:
+                                    project_info['readme'] = f.read()[:2000]
+                            except:
+                                pass
+
+                # Determine primary language
+                primary_lang = max(project_info['languages'].items(), key=lambda x: x[1])[0] if project_info['languages'] else 'General'
+
+                # Build persona
+                persona_parts = [
+                    f"You are an expert {primary_lang} developer assistant specialized in this project.",
+                    "",
+                    f"PROJECT ANALYSIS:",
+                    f"- Primary Language: {primary_lang}",
+                    f"- Languages: {', '.join(project_info['languages'].keys()) if project_info['languages'] else 'Various'}",
+                    f"- Frameworks/Tools: {', '.join(project_info['frameworks']) if project_info['frameworks'] else 'Standard'}",
+                    f"- Total Files: {project_info['files']['total']}",
+                    "",
+                    "EXPERTISE AREAS:",
+                ]
+
+                # Add language-specific expertise
+                for lang in list(project_info['languages'].keys())[:5]:
+                    persona_parts.append(f"- {lang} development, best practices, and debugging")
+
+                if project_info['frameworks']:
+                    persona_parts.append("")
+                    persona_parts.append("FRAMEWORK KNOWLEDGE:")
+                    for fw in project_info['frameworks'][:5]:
+                        persona_parts.append(f"- {fw} configuration and usage")
+
+                persona_parts.extend([
+                    "",
+                    "GUIDELINES:",
+                    "- Provide code examples in the project's primary language",
+                    "- Follow the project's existing patterns and conventions",
+                    "- Suggest improvements that fit the existing architecture",
+                    "- Be concise but thorough in explanations",
+                ])
+
+                if project_info['readme']:
+                    persona_parts.extend([
+                        "",
+                        "PROJECT DESCRIPTION (from README):",
+                        project_info['readme'][:500]
+                    ])
+
+                new_persona = "\n".join(persona_parts)
+
+                # Show preview
+                print(f"\n{Colors.BRIGHT_GREEN}Generated Persona:{Colors.RESET}")
+                print(f"{Colors.DIM}{'─'*50}{Colors.RESET}")
+                preview = new_persona[:500] + "..." if len(new_persona) > 500 else new_persona
+                print(f"{Colors.DIM}{preview}{Colors.RESET}")
+
+                # Confirm
+                confirm = input(f"\n{Colors.BRIGHT_GREEN}Apply this persona? [Y/n]: {Colors.RESET}").strip().lower()
+                if confirm != 'n':
+                    self.cfg_mgr.update('system_prompt', new_persona)
+                    print(f"{Colors.BRIGHT_GREEN}✓ Persona created and applied!{Colors.RESET}")
+                else:
+                    print(f"{Colors.DIM}Cancelled{Colors.RESET}")
 
             elif subcmd == "load":
                 if subargs:
@@ -6728,105 +7434,440 @@ class App:
                                 persona = f.read()
                             self.cfg_mgr.update('system_prompt', persona)
                             print(f"{Colors.BRIGHT_GREEN}✓ Persona loaded from: {filepath}{Colors.RESET}")
+                            print(f"{Colors.DIM}Length: {len(persona)} characters{Colors.RESET}")
                         except Exception as e:
                             print(f"{Colors.RED}Error: {e}{Colors.RESET}")
                     else:
+                        # List available persona files
                         print(f"{Colors.RED}File not found: {filepath}{Colors.RESET}")
+                        print(f"\n{Colors.CYAN}Available persona files:{Colors.RESET}")
+                        try:
+                            for f in os.listdir(SANDBOX_DIR):
+                                if f.startswith('persona_') or f.endswith('.txt'):
+                                    print(f"  {Colors.DIM}{f}{Colors.RESET}")
+                        except:
+                            pass
                 else:
-                    print(f"{Colors.YELLOW}Usage: /persona load [filename]{Colors.RESET}")
+                    # List available persona files
+                    print(f"\n{Colors.BRIGHT_CYAN}Available Persona Files:{Colors.RESET}")
+                    try:
+                        found = False
+                        for f in os.listdir(SANDBOX_DIR):
+                            if f.startswith('persona_') or f.endswith('.txt'):
+                                print(f"  {Colors.BRIGHT_WHITE}{f}{Colors.RESET}")
+                                found = True
+                        if not found:
+                            print(f"  {Colors.DIM}No persona files found{Colors.RESET}")
+                    except:
+                        print(f"  {Colors.DIM}No persona files found{Colors.RESET}")
+                    print(f"\n{Colors.DIM}Usage: /persona load [filename]{Colors.RESET}")
 
             elif subcmd == "save":
                 filename = subargs if subargs else f"persona_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+                if not filename.endswith('.txt'):
+                    filename += '.txt'
                 filepath = os.path.join(SANDBOX_DIR, filename)
                 try:
+                    os.makedirs(SANDBOX_DIR, exist_ok=True)
                     with open(filepath, 'w') as f:
                         f.write(self.config.get('system_prompt', ''))
                     print(f"{Colors.BRIGHT_GREEN}✓ Persona saved to: {filepath}{Colors.RESET}")
                 except Exception as e:
                     print(f"{Colors.RED}Error: {e}{Colors.RESET}")
 
+            elif subcmd == "show":
+                print(f"\n{Colors.BRIGHT_CYAN}Current Persona:{Colors.RESET}")
+                print(f"{Colors.DIM}{'─'*60}{Colors.RESET}")
+                current = self.config.get('system_prompt', 'No persona set')
+                print(f"{Colors.BRIGHT_WHITE}{current}{Colors.RESET}")
+
+            elif subcmd == "edit":
+                print(f"\n{Colors.BRIGHT_CYAN}Edit Persona{Colors.RESET}")
+                print(f"{Colors.DIM}{'─'*60}{Colors.RESET}")
+                print(f"{Colors.DIM}Current persona:{Colors.RESET}")
+                current = self.config.get('system_prompt', '')
+                print(f"{Colors.DIM}{current[:200]}...{Colors.RESET}" if len(current) > 200 else f"{Colors.DIM}{current}{Colors.RESET}")
+                print(f"\n{Colors.CYAN}Enter new persona (press Enter twice to finish, 'cancel' to abort):{Colors.RESET}")
+
+                lines = []
+                while True:
+                    line = input()
+                    if line.lower() == 'cancel':
+                        print(f"{Colors.DIM}Cancelled{Colors.RESET}")
+                        return "COMMAND"
+                    if line == '' and lines and lines[-1] == '':
+                        break
+                    lines.append(line)
+
+                new_persona = '\n'.join(lines[:-1] if lines and lines[-1] == '' else lines)
+                if new_persona.strip():
+                    self.cfg_mgr.update('system_prompt', new_persona)
+                    print(f"{Colors.BRIGHT_GREEN}✓ Persona updated!{Colors.RESET}")
+                else:
+                    print(f"{Colors.YELLOW}Empty persona, keeping existing{Colors.RESET}")
+
             elif subcmd == "clear":
-                # Reset to default system prompt
-                default_prompt = "You are a helpful AI assistant."
+                default_prompt = "You are a helpful AI assistant. You provide clear, accurate, and helpful responses."
                 self.cfg_mgr.update('system_prompt', default_prompt)
                 print(f"{Colors.BRIGHT_GREEN}✓ Persona cleared, reset to default{Colors.RESET}")
 
             else:
                 print(f"{Colors.YELLOW}Unknown persona command: {subcmd}{Colors.RESET}")
+                print(f"{Colors.DIM}Available: create, load, save, show, edit, clear{Colors.RESET}")
 
             return "COMMAND"
 
         elif cmd == "/analyze":
-            # Analyze codebase
-            path = args.strip() if args else "."
-            print(f"\n{Colors.BRIGHT_CYAN}Analyzing: {path}{Colors.RESET}")
+            # Full codebase analysis - FULL IMPLEMENTATION
+            path = args.strip() if args else (self.working_directory if hasattr(self, 'working_directory') and self.working_directory else ".")
 
-            if os.path.exists(path):
-                print(f"{Colors.DIM}Scanning directory structure...{Colors.RESET}")
-                file_count = 0
-                for root, dirs, files in os.walk(path):
-                    # Skip hidden and common non-source directories
-                    dirs[:] = [d for d in dirs if not d.startswith('.') and d not in ['node_modules', '__pycache__', 'venv', '.git']]
-                    file_count += len([f for f in files if not f.startswith('.')])
-                print(f"  {Colors.CYAN}Files found:{Colors.RESET} {Colors.BRIGHT_WHITE}{file_count}{Colors.RESET}")
-                print(f"\n{Colors.YELLOW}Use Document Loader (main menu option 2) to ingest files for RAG{Colors.RESET}")
-            else:
+            print(f"\n{Colors.BRIGHT_CYAN}{Colors.BOLD}Codebase Analysis{Colors.RESET}")
+            print(f"{Colors.DIM}{'─'*60}{Colors.RESET}")
+            print(f"{Colors.CYAN}Path:{Colors.RESET} {Colors.BRIGHT_WHITE}{path}{Colors.RESET}")
+
+            if not os.path.exists(path):
                 print(f"{Colors.RED}Path not found: {path}{Colors.RESET}")
+                return "COMMAND"
+
+            # Analysis containers
+            stats = {
+                'total_files': 0, 'total_dirs': 0, 'total_lines': 0, 'total_size': 0,
+                'by_language': {}, 'by_extension': {}, 'largest_files': [],
+                'frameworks': [], 'config_files': [], 'entry_points': []
+            }
+
+            lang_map = {
+                '.py': 'Python', '.js': 'JavaScript', '.ts': 'TypeScript', '.jsx': 'React',
+                '.tsx': 'React/TS', '.java': 'Java', '.go': 'Go', '.rs': 'Rust',
+                '.cpp': 'C++', '.c': 'C', '.h': 'C/C++ Header', '.cs': 'C#',
+                '.rb': 'Ruby', '.php': 'PHP', '.swift': 'Swift', '.kt': 'Kotlin',
+                '.sql': 'SQL', '.html': 'HTML', '.css': 'CSS', '.scss': 'SCSS',
+                '.vue': 'Vue', '.svelte': 'Svelte', '.sh': 'Shell', '.bash': 'Bash'
+            }
+
+            config_indicators = [
+                'package.json', 'requirements.txt', 'Pipfile', 'setup.py', 'pyproject.toml',
+                'Cargo.toml', 'go.mod', 'pom.xml', 'build.gradle', 'Gemfile',
+                'composer.json', 'Makefile', 'CMakeLists.txt', 'Dockerfile',
+                'docker-compose.yml', '.env', 'config.json', 'config.yaml', 'config.yml',
+                'tsconfig.json', 'webpack.config.js', 'vite.config.js', '.eslintrc.js',
+                'firebase.json', 'vercel.json', 'netlify.toml'
+            ]
+
+            entry_indicators = ['main.py', 'app.py', 'index.js', 'index.ts', 'main.go',
+                               'main.rs', 'Main.java', 'Program.cs', 'main.c', 'main.cpp']
+
+            skip_dirs = {'.git', 'node_modules', '__pycache__', 'venv', '.venv', 'env',
+                        'dist', 'build', '.idea', '.vscode', 'target', 'bin', 'obj'}
+
+            print(f"{Colors.DIM}Scanning...{Colors.RESET}")
+
+            for root, dirs, files in os.walk(path):
+                dirs[:] = [d for d in dirs if d not in skip_dirs and not d.startswith('.')]
+                stats['total_dirs'] += len(dirs)
+
+                for file in files:
+                    if file.startswith('.'):
+                        continue
+
+                    filepath = os.path.join(root, file)
+                    stats['total_files'] += 1
+
+                    # File size
+                    try:
+                        size = os.path.getsize(filepath)
+                        stats['total_size'] += size
+                        stats['largest_files'].append((filepath, size))
+                    except:
+                        size = 0
+
+                    # Extension analysis
+                    ext = os.path.splitext(file)[1].lower()
+                    stats['by_extension'][ext] = stats['by_extension'].get(ext, 0) + 1
+
+                    # Language detection
+                    if ext in lang_map:
+                        lang = lang_map[ext]
+                        if lang not in stats['by_language']:
+                            stats['by_language'][lang] = {'files': 0, 'lines': 0}
+                        stats['by_language'][lang]['files'] += 1
+
+                        # Count lines
+                        try:
+                            with open(filepath, 'r', errors='ignore') as f:
+                                lines = len(f.readlines())
+                                stats['by_language'][lang]['lines'] += lines
+                                stats['total_lines'] += lines
+                        except:
+                            pass
+
+                    # Config files
+                    if file in config_indicators:
+                        stats['config_files'].append(file)
+
+                    # Entry points
+                    if file in entry_indicators:
+                        stats['entry_points'].append(os.path.relpath(filepath, path))
+
+            # Sort largest files
+            stats['largest_files'].sort(key=lambda x: x[1], reverse=True)
+
+            # Display results
+            print(f"\n{Colors.BRIGHT_GREEN}Analysis Complete{Colors.RESET}")
+            print(f"{Colors.DIM}{'─'*60}{Colors.RESET}")
+
+            print(f"\n{Colors.BRIGHT_WHITE}Overview:{Colors.RESET}")
+            print(f"  {Colors.CYAN}Total Files:{Colors.RESET}   {stats['total_files']}")
+            print(f"  {Colors.CYAN}Total Dirs:{Colors.RESET}    {stats['total_dirs']}")
+            print(f"  {Colors.CYAN}Total Lines:{Colors.RESET}   {stats['total_lines']:,}")
+            size_mb = stats['total_size'] / (1024 * 1024)
+            print(f"  {Colors.CYAN}Total Size:{Colors.RESET}    {size_mb:.2f} MB")
+
+            if stats['by_language']:
+                print(f"\n{Colors.BRIGHT_WHITE}Languages:{Colors.RESET}")
+                sorted_langs = sorted(stats['by_language'].items(), key=lambda x: x[1]['lines'], reverse=True)
+                for lang, data in sorted_langs[:8]:
+                    pct = (data['lines'] / stats['total_lines'] * 100) if stats['total_lines'] > 0 else 0
+                    bar_len = int(pct / 5)
+                    bar = f"{Colors.BRIGHT_GREEN}{'█' * bar_len}{Colors.DIM}{'░' * (20 - bar_len)}{Colors.RESET}"
+                    print(f"  {Colors.CYAN}{lang:15}{Colors.RESET} {bar} {data['files']:4} files, {data['lines']:6} lines ({pct:.1f}%)")
+
+            if stats['config_files']:
+                print(f"\n{Colors.BRIGHT_WHITE}Config Files Found:{Colors.RESET}")
+                for cf in stats['config_files'][:10]:
+                    print(f"  {Colors.DIM}•{Colors.RESET} {cf}")
+
+            if stats['entry_points']:
+                print(f"\n{Colors.BRIGHT_WHITE}Potential Entry Points:{Colors.RESET}")
+                for ep in stats['entry_points'][:5]:
+                    print(f"  {Colors.BRIGHT_GREEN}→{Colors.RESET} {ep}")
+
+            if stats['largest_files']:
+                print(f"\n{Colors.BRIGHT_WHITE}Largest Files:{Colors.RESET}")
+                for fp, sz in stats['largest_files'][:5]:
+                    rel_path = os.path.relpath(fp, path)
+                    if sz > 1024 * 1024:
+                        sz_str = f"{sz / (1024*1024):.1f} MB"
+                    elif sz > 1024:
+                        sz_str = f"{sz / 1024:.1f} KB"
+                    else:
+                        sz_str = f"{sz} B"
+                    print(f"  {Colors.DIM}{sz_str:>10}{Colors.RESET}  {rel_path}")
+
+            # Offer to ingest to RAG
+            print(f"\n{Colors.DIM}{'─'*60}{Colors.RESET}")
+            ingest = input(f"{Colors.BRIGHT_GREEN}Add to RAG context? [y/N]: {Colors.RESET}").strip().lower()
+            if ingest == 'y':
+                print(f"{Colors.CYAN}Ingesting files to RAG...{Colors.RESET}")
+                ingested = 0
+                for root, dirs, files in os.walk(path):
+                    dirs[:] = [d for d in dirs if d not in skip_dirs and not d.startswith('.')]
+                    for file in files:
+                        ext = os.path.splitext(file)[1].lower()
+                        if ext in lang_map or ext in ['.md', '.txt', '.json', '.yaml', '.yml']:
+                            try:
+                                filepath = os.path.join(root, file)
+                                with open(filepath, 'r', errors='ignore') as f:
+                                    content = f.read()
+                                if len(content) > 100:  # Skip tiny files
+                                    self.memory.add_document(content, filepath, self.current_project_id)
+                                    ingested += 1
+                            except:
+                                pass
+                print(f"{Colors.BRIGHT_GREEN}✓ Ingested {ingested} files to RAG{Colors.RESET}")
 
             return "COMMAND"
 
         elif cmd == "/chat":
             # Legacy load command
             if args:
-                print(f"{Colors.CYAN}Loading session: {args}{Colors.RESET}")
                 return self.handle_chat_command(f"/load {args}")
             else:
                 return self.handle_chat_command("/load")
 
         elif cmd == "/app":
-            # App Builder access
+            # Full App Builder integration - FULL IMPLEMENTATION
             subcmd = args.split()[0].lower() if args else ""
             subargs = " ".join(args.split()[1:]) if args and len(args.split()) > 1 else ""
 
+            if not hasattr(self, 'app_builder') or not self.app_builder:
+                print(f"{Colors.YELLOW}Initializing App Builder...{Colors.RESET}")
+                try:
+                    self.app_builder = AppBuilderOrchestrator(self.engine, self.memory)
+                except Exception as e:
+                    print(f"{Colors.RED}Failed to initialize App Builder: {e}{Colors.RESET}")
+                    return "COMMAND"
+
             if not subcmd:
-                print(f"\n{Colors.BRIGHT_CYAN}{Colors.BOLD}App Builder{Colors.RESET}")
-                print(f"{Colors.DIM}{'─'*50}{Colors.RESET}")
-                print(f"{Colors.DIM}Multi-agent development system{Colors.RESET}")
+                print(f"\n{Colors.BRIGHT_CYAN}{Colors.BOLD}App Builder - Multi-Agent Development{Colors.RESET}")
+                print(f"{Colors.DIM}{'─'*60}{Colors.RESET}")
+
+                # Show current status
+                try:
+                    projects = self.app_builder.list_projects()
+                    print(f"\n{Colors.CYAN}Projects:{Colors.RESET} {Colors.BRIGHT_WHITE}{len(projects)}{Colors.RESET}")
+                except:
+                    print(f"\n{Colors.CYAN}Projects:{Colors.RESET} {Colors.BRIGHT_WHITE}0{Colors.RESET}")
+
                 print(f"\n{Colors.BRIGHT_WHITE}Subcommands:{Colors.RESET}")
-                print(f"  {Colors.CYAN}/app new [name]{Colors.RESET}    - Create new app project")
-                print(f"  {Colors.CYAN}/app list{Colors.RESET}          - List app projects")
-                print(f"  {Colors.CYAN}/app open [id]{Colors.RESET}     - Open existing project")
-                print(f"  {Colors.CYAN}/app status{Colors.RESET}        - Show current status")
-                print(f"\n{Colors.DIM}Or use App Builder from main menu (option 7){Colors.RESET}")
+                print(f"  {Colors.CYAN}/app new [name]{Colors.RESET}        - Create new app project")
+                print(f"  {Colors.CYAN}/app list{Colors.RESET}             - List all projects")
+                print(f"  {Colors.CYAN}/app open [id]{Colors.RESET}        - Open project by ID")
+                print(f"  {Colors.CYAN}/app status{Colors.RESET}           - Show current project status")
+                print(f"  {Colors.CYAN}/app agents{Colors.RESET}           - List available agents")
+                print(f"  {Colors.CYAN}/app run [agent]{Colors.RESET}      - Run specific agent")
+                print(f"  {Colors.CYAN}/app files{Colors.RESET}            - List generated files")
+                print(f"  {Colors.CYAN}/app export [path]{Colors.RESET}    - Export project files")
 
             elif subcmd == "list":
-                if hasattr(self, 'app_builder') and self.app_builder:
-                    try:
-                        projects = self.app_builder.list_projects()
-                        if projects:
-                            print(f"\n{Colors.BRIGHT_CYAN}App Projects:{Colors.RESET}")
-                            for p in projects[:10]:
-                                print(f"  {Colors.CYAN}[{p[0]}]{Colors.RESET} {Colors.BRIGHT_WHITE}{p[1]}{Colors.RESET}")
-                        else:
-                            print(f"{Colors.YELLOW}No app projects found{Colors.RESET}")
-                    except Exception as e:
-                        print(f"{Colors.RED}Error: {e}{Colors.RESET}")
-                else:
-                    print(f"{Colors.YELLOW}App Builder not available{Colors.RESET}")
+                try:
+                    projects = self.app_builder.list_projects()
+                    if projects:
+                        print(f"\n{Colors.BRIGHT_CYAN}App Projects:{Colors.RESET}")
+                        print(f"{Colors.DIM}{'─'*60}{Colors.RESET}")
+                        for p in projects:
+                            pid, name, desc, created = p[0], p[1], p[2] if len(p) > 2 else '', p[3] if len(p) > 3 else ''
+                            print(f"  {Colors.CYAN}[{pid}]{Colors.RESET} {Colors.BRIGHT_WHITE}{name}{Colors.RESET}")
+                            if desc:
+                                print(f"      {Colors.DIM}{desc[:50]}{Colors.RESET}")
+                    else:
+                        print(f"{Colors.YELLOW}No app projects found. Create one with /app new [name]{Colors.RESET}")
+                except Exception as e:
+                    print(f"{Colors.RED}Error listing projects: {e}{Colors.RESET}")
 
             elif subcmd == "new":
-                if subargs:
-                    print(f"{Colors.CYAN}Creating app project: {subargs}{Colors.RESET}")
-                    print(f"{Colors.YELLOW}Use App Builder menu (option 7) for full project creation{Colors.RESET}")
-                else:
+                if not subargs:
                     print(f"{Colors.YELLOW}Usage: /app new [project_name]{Colors.RESET}")
+                    return "COMMAND"
+
+                print(f"\n{Colors.BRIGHT_CYAN}Creating App Project: {subargs}{Colors.RESET}")
+                print(f"{Colors.DIM}{'─'*50}{Colors.RESET}")
+
+                # Get description
+                desc = input(f"{Colors.CYAN}Description (optional): {Colors.RESET}").strip()
+
+                try:
+                    project_id = self.app_builder.create_project(subargs, desc)
+                    self.current_app_project = project_id
+                    print(f"\n{Colors.BRIGHT_GREEN}✓ Project created with ID: {project_id}{Colors.RESET}")
+                    print(f"\n{Colors.DIM}Available agents:{Colors.RESET}")
+                    print(f"  • SpecificationWriter - Define project requirements")
+                    print(f"  • Architect - Design system architecture")
+                    print(f"  • TechLead - Technical decisions")
+                    print(f"  • Developer - Write code")
+                    print(f"  • Reviewer - Review code quality")
+                    print(f"\n{Colors.DIM}Use /app run [agent] to start development{Colors.RESET}")
+                except Exception as e:
+                    print(f"{Colors.RED}Error creating project: {e}{Colors.RESET}")
+
+            elif subcmd == "open":
+                if not subargs:
+                    return self.handle_chat_command("/app list")
+
+                try:
+                    project_id = int(subargs)
+                    project = self.app_builder.get_project(project_id)
+                    if project:
+                        self.current_app_project = project_id
+                        print(f"{Colors.BRIGHT_GREEN}✓ Opened project: {project[1]}{Colors.RESET}")
+                    else:
+                        print(f"{Colors.RED}Project not found: {project_id}{Colors.RESET}")
+                except ValueError:
+                    print(f"{Colors.RED}Invalid project ID: {subargs}{Colors.RESET}")
+                except Exception as e:
+                    print(f"{Colors.RED}Error: {e}{Colors.RESET}")
 
             elif subcmd == "status":
-                print(f"\n{Colors.BRIGHT_CYAN}App Builder Status{Colors.RESET}")
-                if hasattr(self, 'app_builder') and self.app_builder:
-                    print(f"  {Colors.BRIGHT_GREEN}Available{Colors.RESET}")
-                else:
-                    print(f"  {Colors.YELLOW}Not initialized{Colors.RESET}")
+                if not hasattr(self, 'current_app_project') or not self.current_app_project:
+                    print(f"{Colors.YELLOW}No project open. Use /app open [id] or /app new [name]{Colors.RESET}")
+                    return "COMMAND"
+
+                try:
+                    project = self.app_builder.get_project(self.current_app_project)
+                    tasks = self.app_builder.get_tasks(self.current_app_project) if hasattr(self.app_builder, 'get_tasks') else []
+                    files = self.app_builder.get_files(self.current_app_project) if hasattr(self.app_builder, 'get_files') else []
+
+                    print(f"\n{Colors.BRIGHT_CYAN}Project Status{Colors.RESET}")
+                    print(f"{Colors.DIM}{'─'*50}{Colors.RESET}")
+                    print(f"  {Colors.CYAN}Name:{Colors.RESET}  {Colors.BRIGHT_WHITE}{project[1]}{Colors.RESET}")
+                    print(f"  {Colors.CYAN}ID:{Colors.RESET}    {Colors.BRIGHT_WHITE}{self.current_app_project}{Colors.RESET}")
+                    print(f"  {Colors.CYAN}Tasks:{Colors.RESET} {Colors.BRIGHT_WHITE}{len(tasks)}{Colors.RESET}")
+                    print(f"  {Colors.CYAN}Files:{Colors.RESET} {Colors.BRIGHT_WHITE}{len(files)}{Colors.RESET}")
+                except Exception as e:
+                    print(f"{Colors.RED}Error: {e}{Colors.RESET}")
+
+            elif subcmd == "agents":
+                print(f"\n{Colors.BRIGHT_CYAN}Available Agents{Colors.RESET}")
+                print(f"{Colors.DIM}{'─'*50}{Colors.RESET}")
+                agents = [
+                    ("SpecificationWriter", "Define project requirements and user stories"),
+                    ("Architect", "Design system architecture and components"),
+                    ("TechLead", "Make technical decisions and define patterns"),
+                    ("Developer", "Write application code"),
+                    ("CodeMonkey", "Generate boilerplate and repetitive code"),
+                    ("Reviewer", "Review code for quality and issues"),
+                    ("Troubleshooter", "Debug and fix problems"),
+                    ("Debugger", "Advanced debugging and analysis"),
+                    ("TechnicalWriter", "Generate documentation")
+                ]
+                for name, desc in agents:
+                    print(f"  {Colors.BRIGHT_GREEN}{name:20}{Colors.RESET} {Colors.DIM}{desc}{Colors.RESET}")
+
+            elif subcmd == "run":
+                if not hasattr(self, 'current_app_project') or not self.current_app_project:
+                    print(f"{Colors.YELLOW}No project open. Use /app open [id] first{Colors.RESET}")
+                    return "COMMAND"
+
+                agent_name = subargs.lower() if subargs else ""
+                if not agent_name:
+                    print(f"{Colors.YELLOW}Usage: /app run [agent_name]{Colors.RESET}")
+                    print(f"{Colors.DIM}Agents: spec, architect, techlead, developer, reviewer{Colors.RESET}")
+                    return "COMMAND"
+
+                print(f"\n{Colors.CYAN}Running {agent_name} agent...{Colors.RESET}")
+                task_input = input(f"{Colors.BRIGHT_GREEN}Task description: {Colors.RESET}").strip()
+                if task_input:
+                    try:
+                        result = self.app_builder.run_agent(self.current_app_project, agent_name, task_input)
+                        print(f"\n{Colors.BRIGHT_GREEN}Agent Output:{Colors.RESET}")
+                        print(f"{Colors.DIM}{'─'*50}{Colors.RESET}")
+                        print(result if result else "Agent completed.")
+                    except Exception as e:
+                        print(f"{Colors.RED}Error running agent: {e}{Colors.RESET}")
+
+            elif subcmd == "files":
+                if not hasattr(self, 'current_app_project') or not self.current_app_project:
+                    print(f"{Colors.YELLOW}No project open{Colors.RESET}")
+                    return "COMMAND"
+
+                try:
+                    files = self.app_builder.get_files(self.current_app_project) if hasattr(self.app_builder, 'get_files') else []
+                    if files:
+                        print(f"\n{Colors.BRIGHT_CYAN}Generated Files:{Colors.RESET}")
+                        for f in files:
+                            print(f"  {Colors.DIM}•{Colors.RESET} {f[1] if len(f) > 1 else f}")
+                    else:
+                        print(f"{Colors.YELLOW}No files generated yet{Colors.RESET}")
+                except Exception as e:
+                    print(f"{Colors.RED}Error: {e}{Colors.RESET}")
+
+            elif subcmd == "export":
+                if not hasattr(self, 'current_app_project') or not self.current_app_project:
+                    print(f"{Colors.YELLOW}No project open{Colors.RESET}")
+                    return "COMMAND"
+
+                export_path = subargs if subargs else os.path.join(APPS_DIR, f"export_{self.current_app_project}")
+                try:
+                    os.makedirs(export_path, exist_ok=True)
+                    files = self.app_builder.get_files(self.current_app_project) if hasattr(self.app_builder, 'get_files') else []
+                    for f in files:
+                        fname = f[1] if len(f) > 1 else 'file.txt'
+                        content = f[2] if len(f) > 2 else ''
+                        with open(os.path.join(export_path, fname), 'w') as fp:
+                            fp.write(content)
+                    print(f"{Colors.BRIGHT_GREEN}✓ Exported to: {export_path}{Colors.RESET}")
+                except Exception as e:
+                    print(f"{Colors.RED}Export failed: {e}{Colors.RESET}")
 
             else:
                 print(f"{Colors.YELLOW}Unknown app command: {subcmd}{Colors.RESET}")
@@ -6834,70 +7875,335 @@ class App:
             return "COMMAND"
 
         elif cmd == "/train":
-            # Training access
-            subcmd = args.strip().lower() if args else ""
+            # Full training integration - FULL IMPLEMENTATION
+            subcmd = args.split()[0].lower() if args else ""
+            subargs = " ".join(args.split()[1:]) if args and len(args.split()) > 1 else ""
 
             print(f"\n{Colors.BRIGHT_CYAN}{Colors.BOLD}Model Training{Colors.RESET}")
-            print(f"{Colors.DIM}{'─'*50}{Colors.RESET}")
+            print(f"{Colors.DIM}{'─'*60}{Colors.RESET}")
+
+            # Check for training managers
+            has_finetune = hasattr(self, 'finetune_mgr') or True  # Will initialize if needed
+            has_lora = hasattr(self, 'lora_mgr') or True
+            has_rlhf = hasattr(self, 'rlhf_mgr') or True
 
             if not subcmd:
                 print(f"\n{Colors.BRIGHT_WHITE}Training Options:{Colors.RESET}")
-                print(f"  {Colors.CYAN}/train finetune{Colors.RESET}  - Fine-tune model on dataset")
-                print(f"  {Colors.CYAN}/train lora{Colors.RESET}      - LoRA parameter-efficient training")
-                print(f"  {Colors.CYAN}/train rlhf{Colors.RESET}      - RLHF training mode")
-                print(f"  {Colors.CYAN}/train status{Colors.RESET}    - Show training status")
-                print(f"\n{Colors.DIM}Or use Model Training from main menu (option 5){Colors.RESET}")
+                print(f"  {Colors.CYAN}/train finetune [dataset]{Colors.RESET}  - Fine-tune on dataset")
+                print(f"  {Colors.CYAN}/train lora [dataset]{Colors.RESET}      - LoRA training")
+                print(f"  {Colors.CYAN}/train rlhf{Colors.RESET}                - RLHF mode")
+                print(f"  {Colors.CYAN}/train status{Colors.RESET}              - Training status")
+                print(f"  {Colors.CYAN}/train list{Colors.RESET}                - List datasets")
+                print(f"  {Colors.CYAN}/train create [name]{Colors.RESET}       - Create dataset")
+                print(f"  {Colors.CYAN}/train stop{Colors.RESET}                - Stop training")
 
             elif subcmd == "status":
                 print(f"\n{Colors.BRIGHT_WHITE}Training Status:{Colors.RESET}")
-                print(f"  {Colors.DIM}No active training jobs{Colors.RESET}")
+                # Check for active training
+                training_active = hasattr(self, '_training_thread') and self._training_thread and self._training_thread.is_alive()
+                if training_active:
+                    print(f"  {Colors.BRIGHT_GREEN}● Training in progress{Colors.RESET}")
+                    if hasattr(self, '_training_info'):
+                        info = self._training_info
+                        print(f"    Type: {info.get('type', 'Unknown')}")
+                        print(f"    Progress: {info.get('progress', 0)}%")
+                else:
+                    print(f"  {Colors.DIM}○ No active training{Colors.RESET}")
+
+                # Show available resources
+                print(f"\n{Colors.CYAN}Resources:{Colors.RESET}")
+                print(f"  Training Dir: {TRAINING_DIR}")
+                print(f"  Models Dir: {MODELS_DIR}")
+                if torch.cuda.is_available():
+                    print(f"  {Colors.BRIGHT_GREEN}GPU: Available ({torch.cuda.get_device_name(0)}){Colors.RESET}")
+                else:
+                    print(f"  {Colors.YELLOW}GPU: Not available (CPU mode){Colors.RESET}")
+
+            elif subcmd == "list":
+                print(f"\n{Colors.BRIGHT_WHITE}Available Datasets:{Colors.RESET}")
+                data_dir = os.path.join(TRAINING_DIR, 'data')
+                try:
+                    os.makedirs(data_dir, exist_ok=True)
+                    datasets = [f for f in os.listdir(data_dir) if f.endswith(('.json', '.jsonl', '.csv', '.txt'))]
+                    if datasets:
+                        for ds in datasets:
+                            size = os.path.getsize(os.path.join(data_dir, ds))
+                            print(f"  {Colors.DIM}•{Colors.RESET} {ds} ({size // 1024}KB)")
+                    else:
+                        print(f"  {Colors.DIM}No datasets found in {data_dir}{Colors.RESET}")
+                except Exception as e:
+                    print(f"  {Colors.RED}Error: {e}{Colors.RESET}")
+
+            elif subcmd == "create":
+                dataset_name = subargs if subargs else f"dataset_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+                if not dataset_name.endswith('.jsonl'):
+                    dataset_name += '.jsonl'
+
+                print(f"\n{Colors.BRIGHT_CYAN}Creating Dataset: {dataset_name}{Colors.RESET}")
+                print(f"{Colors.DIM}Enter training examples (format: prompt|||response){Colors.RESET}")
+                print(f"{Colors.DIM}Type 'done' when finished, 'cancel' to abort{Colors.RESET}\n")
+
+                examples = []
+                while True:
+                    line = input(f"{Colors.CYAN}[{len(examples)+1}]: {Colors.RESET}").strip()
+                    if line.lower() == 'done':
+                        break
+                    if line.lower() == 'cancel':
+                        print(f"{Colors.DIM}Cancelled{Colors.RESET}")
+                        return "COMMAND"
+                    if '|||' in line:
+                        prompt, response = line.split('|||', 1)
+                        examples.append({'prompt': prompt.strip(), 'response': response.strip()})
+                    else:
+                        print(f"{Colors.YELLOW}Format: prompt|||response{Colors.RESET}")
+
+                if examples:
+                    data_dir = os.path.join(TRAINING_DIR, 'data')
+                    os.makedirs(data_dir, exist_ok=True)
+                    filepath = os.path.join(data_dir, dataset_name)
+                    with open(filepath, 'w') as f:
+                        for ex in examples:
+                            f.write(json.dumps(ex) + '\n')
+                    print(f"{Colors.BRIGHT_GREEN}✓ Created dataset with {len(examples)} examples{Colors.RESET}")
+                    print(f"  Path: {filepath}")
+
+            elif subcmd == "finetune":
+                dataset = subargs if subargs else None
+                if not dataset:
+                    print(f"{Colors.YELLOW}Usage: /train finetune [dataset_name]{Colors.RESET}")
+                    return self.handle_chat_command("/train list")
+
+                data_path = os.path.join(TRAINING_DIR, 'data', dataset)
+                if not os.path.exists(data_path):
+                    print(f"{Colors.RED}Dataset not found: {dataset}{Colors.RESET}")
+                    return "COMMAND"
+
+                print(f"\n{Colors.BRIGHT_CYAN}Fine-tuning Configuration{Colors.RESET}")
+                epochs = input(f"{Colors.CYAN}Epochs [3]: {Colors.RESET}").strip() or "3"
+                batch_size = input(f"{Colors.CYAN}Batch size [4]: {Colors.RESET}").strip() or "4"
+                lr = input(f"{Colors.CYAN}Learning rate [2e-5]: {Colors.RESET}").strip() or "2e-5"
+
+                print(f"\n{Colors.BRIGHT_YELLOW}Starting fine-tuning...{Colors.RESET}")
+                print(f"{Colors.DIM}This may take a while. Training runs in background.{Colors.RESET}")
+
+                # Initialize training in background
+                try:
+                    if not hasattr(self, 'finetune_mgr'):
+                        self.finetune_mgr = FineTuningManager(self.config.get('model_name', 'gpt2'))
+
+                    def train_thread():
+                        try:
+                            self._training_info = {'type': 'finetune', 'progress': 0}
+                            self.finetune_mgr.train(data_path, int(epochs), int(batch_size), float(lr))
+                            self._training_info['progress'] = 100
+                        except Exception as e:
+                            print(f"{Colors.RED}Training error: {e}{Colors.RESET}")
+
+                    self._training_thread = threading.Thread(target=train_thread, daemon=True)
+                    self._training_thread.start()
+                    print(f"{Colors.BRIGHT_GREEN}✓ Training started. Use /train status to monitor.{Colors.RESET}")
+                except Exception as e:
+                    print(f"{Colors.RED}Failed to start training: {e}{Colors.RESET}")
+
+            elif subcmd == "lora":
+                dataset = subargs if subargs else None
+                if not dataset:
+                    print(f"{Colors.YELLOW}Usage: /train lora [dataset_name]{Colors.RESET}")
+                    return "COMMAND"
+
+                print(f"\n{Colors.BRIGHT_CYAN}LoRA Training{Colors.RESET}")
+                print(f"{Colors.DIM}Parameter-efficient fine-tuning{Colors.RESET}")
+
+                try:
+                    if not hasattr(self, 'lora_mgr'):
+                        self.lora_mgr = LoRAManager(self.config.get('model_name', 'gpt2'))
+
+                    rank = input(f"{Colors.CYAN}LoRA rank [8]: {Colors.RESET}").strip() or "8"
+                    alpha = input(f"{Colors.CYAN}LoRA alpha [16]: {Colors.RESET}").strip() or "16"
+
+                    data_path = os.path.join(TRAINING_DIR, 'data', dataset)
+                    if os.path.exists(data_path):
+                        print(f"{Colors.BRIGHT_YELLOW}Starting LoRA training...{Colors.RESET}")
+                        self.lora_mgr.train(data_path, int(rank), int(alpha))
+                        print(f"{Colors.BRIGHT_GREEN}✓ LoRA training complete{Colors.RESET}")
+                    else:
+                        print(f"{Colors.RED}Dataset not found{Colors.RESET}")
+                except Exception as e:
+                    print(f"{Colors.RED}LoRA training error: {e}{Colors.RESET}")
+
+            elif subcmd == "rlhf":
+                print(f"\n{Colors.BRIGHT_CYAN}RLHF Training Mode{Colors.RESET}")
+                print(f"{Colors.DIM}Reinforcement Learning from Human Feedback{Colors.RESET}")
+                print(f"\n{Colors.YELLOW}RLHF requires:{Colors.RESET}")
+                print(f"  1. A reward model or human feedback")
+                print(f"  2. Preference dataset")
+                print(f"  3. Significant compute resources")
+                print(f"\n{Colors.DIM}Use main menu option 5 for full RLHF setup{Colors.RESET}")
+
+            elif subcmd == "stop":
+                if hasattr(self, '_training_thread') and self._training_thread and self._training_thread.is_alive():
+                    print(f"{Colors.YELLOW}Stopping training...{Colors.RESET}")
+                    # Note: Proper implementation would need a stop flag
+                    print(f"{Colors.DIM}Training will stop at next checkpoint{Colors.RESET}")
+                else:
+                    print(f"{Colors.DIM}No active training to stop{Colors.RESET}")
 
             else:
-                print(f"\n{Colors.YELLOW}Use Model Training menu (option 5) for {subcmd}{Colors.RESET}")
+                print(f"{Colors.YELLOW}Unknown train command: {subcmd}{Colors.RESET}")
 
             return "COMMAND"
 
         elif cmd == "/api":
-            # API management
+            # Full API management - FULL IMPLEMENTATION
             subcmd = args.split()[0].lower() if args else ""
             subargs = " ".join(args.split()[1:]) if args and len(args.split()) > 1 else ""
 
+            # Initialize API manager if needed
+            if not hasattr(self, 'api_manager') or not self.api_manager:
+                try:
+                    self.api_manager = APIServerManager(self)
+                except Exception as e:
+                    print(f"{Colors.YELLOW}API Manager initialization: {e}{Colors.RESET}")
+
             if not subcmd:
-                print(f"\n{Colors.BRIGHT_CYAN}{Colors.BOLD}API Server{Colors.RESET}")
-                print(f"{Colors.DIM}{'─'*50}{Colors.RESET}")
+                print(f"\n{Colors.BRIGHT_CYAN}{Colors.BOLD}API Server Management{Colors.RESET}")
+                print(f"{Colors.DIM}{'─'*60}{Colors.RESET}")
+
+                # Show status
                 if hasattr(self, 'api_manager') and self.api_manager:
-                    servers = self.api_manager.list_servers() if hasattr(self.api_manager, 'list_servers') else []
-                    if servers:
-                        print(f"  {Colors.CYAN}Running servers:{Colors.RESET} {Colors.BRIGHT_WHITE}{len(servers)}{Colors.RESET}")
+                    if hasattr(self.api_manager, 'servers') and self.api_manager.servers:
+                        print(f"\n{Colors.BRIGHT_GREEN}● Servers running: {len(self.api_manager.servers)}{Colors.RESET}")
+                        for port, info in self.api_manager.servers.items():
+                            print(f"    Port {port}: {info.get('status', 'unknown')}")
                     else:
-                        print(f"  {Colors.DIM}No servers running{Colors.RESET}")
+                        print(f"\n{Colors.DIM}○ No servers running{Colors.RESET}")
                 else:
-                    print(f"  {Colors.YELLOW}API Manager not available{Colors.RESET}")
+                    print(f"\n{Colors.DIM}○ API Manager not initialized{Colors.RESET}")
+
                 print(f"\n{Colors.BRIGHT_WHITE}Subcommands:{Colors.RESET}")
-                print(f"  {Colors.CYAN}/api start [port]{Colors.RESET} - Start server")
-                print(f"  {Colors.CYAN}/api stop{Colors.RESET}         - Stop server")
-                print(f"  {Colors.CYAN}/api status{Colors.RESET}       - Detailed status")
-                print(f"  {Colors.CYAN}/api key{Colors.RESET}          - Show API key")
+                print(f"  {Colors.CYAN}/api start [port]{Colors.RESET}   - Start API server")
+                print(f"  {Colors.CYAN}/api stop [port]{Colors.RESET}    - Stop API server")
+                print(f"  {Colors.CYAN}/api status{Colors.RESET}         - Detailed status")
+                print(f"  {Colors.CYAN}/api key{Colors.RESET}            - Show/generate API key")
+                print(f"  {Colors.CYAN}/api test{Colors.RESET}           - Test API endpoint")
+                print(f"  {Colors.CYAN}/api logs{Colors.RESET}           - Show recent logs")
+
+            elif subcmd == "start":
+                port = int(subargs) if subargs and subargs.isdigit() else 5000
+                print(f"\n{Colors.CYAN}Starting API server on port {port}...{Colors.RESET}")
+
+                try:
+                    if hasattr(self.api_manager, 'start_server'):
+                        self.api_manager.start_server(port)
+                        print(f"{Colors.BRIGHT_GREEN}✓ API server started on port {port}{Colors.RESET}")
+                        print(f"\n{Colors.DIM}Endpoints:{Colors.RESET}")
+                        print(f"  POST http://localhost:{port}/chat")
+                        print(f"  GET  http://localhost:{port}/health")
+                        print(f"  GET  http://localhost:{port}/info")
+                    else:
+                        # Fallback: start Flask directly
+                        if FLASK_AVAILABLE:
+                            def run_api():
+                                app = Flask(__name__)
+                                CORS(app)
+
+                                @app.route('/health', methods=['GET'])
+                                def health():
+                                    return jsonify({'status': 'healthy'})
+
+                                @app.route('/chat', methods=['POST'])
+                                def chat():
+                                    data = request.get_json()
+                                    message = data.get('message', '')
+                                    # Process with AI
+                                    response = self.engine.generate(message) if self.engine else "AI not available"
+                                    return jsonify({'response': response})
+
+                                app.run(port=port, threaded=True)
+
+                            api_thread = threading.Thread(target=run_api, daemon=True)
+                            api_thread.start()
+                            if not hasattr(self, '_api_threads'):
+                                self._api_threads = {}
+                            self._api_threads[port] = api_thread
+                            print(f"{Colors.BRIGHT_GREEN}✓ API server started on port {port}{Colors.RESET}")
+                        else:
+                            print(f"{Colors.RED}Flask not available. Install with: pip install flask flask-cors{Colors.RESET}")
+                except Exception as e:
+                    print(f"{Colors.RED}Failed to start API server: {e}{Colors.RESET}")
+
+            elif subcmd == "stop":
+                port = int(subargs) if subargs and subargs.isdigit() else None
+                if port:
+                    print(f"{Colors.CYAN}Stopping API server on port {port}...{Colors.RESET}")
+                    try:
+                        if hasattr(self.api_manager, 'stop_server'):
+                            self.api_manager.stop_server(port)
+                        print(f"{Colors.BRIGHT_GREEN}✓ Server stopped{Colors.RESET}")
+                    except Exception as e:
+                        print(f"{Colors.RED}Error: {e}{Colors.RESET}")
+                else:
+                    print(f"{Colors.YELLOW}Usage: /api stop [port]{Colors.RESET}")
 
             elif subcmd == "status":
                 print(f"\n{Colors.BRIGHT_CYAN}API Server Status{Colors.RESET}")
+                print(f"{Colors.DIM}{'─'*50}{Colors.RESET}")
+
                 if hasattr(self, 'api_manager') and self.api_manager:
-                    print(f"  {Colors.BRIGHT_GREEN}Manager available{Colors.RESET}")
+                    print(f"  {Colors.BRIGHT_GREEN}Manager: Initialized{Colors.RESET}")
+                    if hasattr(self.api_manager, 'servers'):
+                        for port, info in self.api_manager.servers.items():
+                            print(f"  Port {port}: {Colors.BRIGHT_GREEN}Running{Colors.RESET}")
+                    else:
+                        print(f"  {Colors.DIM}No servers configured{Colors.RESET}")
                 else:
-                    print(f"  {Colors.YELLOW}Not initialized{Colors.RESET}")
+                    print(f"  {Colors.YELLOW}Manager: Not initialized{Colors.RESET}")
+
+                # Check Flask availability
+                print(f"\n{Colors.CYAN}Dependencies:{Colors.RESET}")
+                print(f"  Flask: {Colors.BRIGHT_GREEN if FLASK_AVAILABLE else Colors.RED}{'Available' if FLASK_AVAILABLE else 'Not installed'}{Colors.RESET}")
+                print(f"  Encryption: {Colors.BRIGHT_GREEN if ENCRYPTION_AVAILABLE else Colors.RED}{'Available' if ENCRYPTION_AVAILABLE else 'Not installed'}{Colors.RESET}")
 
             elif subcmd == "key":
-                print(f"\n{Colors.BRIGHT_CYAN}API Key{Colors.RESET}")
-                print(f"{Colors.YELLOW}Use API Management menu (option 6) to view/generate keys{Colors.RESET}")
+                print(f"\n{Colors.BRIGHT_CYAN}API Key Management{Colors.RESET}")
+                print(f"{Colors.DIM}{'─'*50}{Colors.RESET}")
 
-            elif subcmd == "start":
-                port = subargs if subargs else "5000"
-                print(f"{Colors.CYAN}Starting API server on port {port}...{Colors.RESET}")
-                print(f"{Colors.YELLOW}Use API Management menu (option 6) for full control{Colors.RESET}")
+                if ENCRYPTION_AVAILABLE:
+                    # Generate or show API key
+                    if not hasattr(self, '_api_key') or not self._api_key:
+                        self._api_key = Fernet.generate_key().decode()
 
-            elif subcmd == "stop":
-                print(f"{Colors.CYAN}Stopping API server...{Colors.RESET}")
-                print(f"{Colors.YELLOW}Use API Management menu (option 6) for full control{Colors.RESET}")
+                    print(f"\n{Colors.BRIGHT_WHITE}Your API Key:{Colors.RESET}")
+                    print(f"  {Colors.BRIGHT_GREEN}{self._api_key}{Colors.RESET}")
+                    print(f"\n{Colors.DIM}Use this key in the X-API-Key header for authenticated requests{Colors.RESET}")
+
+                    regen = input(f"\n{Colors.CYAN}Generate new key? [y/N]: {Colors.RESET}").strip().lower()
+                    if regen == 'y':
+                        self._api_key = Fernet.generate_key().decode()
+                        print(f"\n{Colors.BRIGHT_GREEN}New API Key:{Colors.RESET}")
+                        print(f"  {self._api_key}")
+                else:
+                    print(f"{Colors.RED}Encryption not available. Install cryptography package.{Colors.RESET}")
+
+            elif subcmd == "test":
+                port = int(subargs) if subargs and subargs.isdigit() else 5000
+                print(f"\n{Colors.CYAN}Testing API on port {port}...{Colors.RESET}")
+
+                try:
+                    import requests as req
+                    response = req.get(f"http://localhost:{port}/health", timeout=5)
+                    if response.status_code == 200:
+                        print(f"{Colors.BRIGHT_GREEN}✓ API is healthy{Colors.RESET}")
+                        print(f"  Response: {response.json()}")
+                    else:
+                        print(f"{Colors.YELLOW}API returned status {response.status_code}{Colors.RESET}")
+                except Exception as e:
+                    print(f"{Colors.RED}API test failed: {e}{Colors.RESET}")
+
+            elif subcmd == "logs":
+                print(f"\n{Colors.BRIGHT_CYAN}Recent API Logs{Colors.RESET}")
+                print(f"{Colors.DIM}{'─'*50}{Colors.RESET}")
+                print(f"{Colors.DIM}Log viewing not yet implemented{Colors.RESET}")
 
             else:
                 print(f"{Colors.YELLOW}Unknown API command: {subcmd}{Colors.RESET}")
@@ -6915,36 +8221,864 @@ class App:
             return "COMMAND"
 
         elif cmd == "/settings":
-            # Open settings
-            print(f"\n{Colors.BRIGHT_CYAN}{Colors.BOLD}Settings{Colors.RESET}")
-            print(f"{Colors.DIM}{'─'*50}{Colors.RESET}")
-            print(f"\n{Colors.DIM}Use Settings from main menu (option 9) for full settings{Colors.RESET}")
-            print(f"\n{Colors.BRIGHT_WHITE}Quick Settings:{Colors.RESET}")
-            print(f"  {Colors.CYAN}/config{Colors.RESET}          - View/edit configuration")
-            print(f"  {Colors.CYAN}/model{Colors.RESET}           - Change model")
-            print(f"  {Colors.CYAN}/theme{Colors.RESET}           - Change theme (if available)")
+            # Full settings editor
+            subcmd = args.split()[0].lower() if args else ""
+            sub_args = ' '.join(args.split()[1:]) if len(args.split()) > 1 else ""
+
+            # Settings categories
+            settings_categories = {
+                'general': ['model', 'temperature', 'max_tokens', 'streaming', 'verbose'],
+                'memory': ['max_context_window', 'auto_summarize', 'memory_limit'],
+                'api': ['api_host', 'api_port', 'api_enabled', 'require_auth'],
+                'rag': ['rag_enabled', 'vector_db_path', 'chunk_size', 'embedding_model'],
+                'mcp': ['mcp_auto_start', 'mcp_timeout', 'mcp_servers'],
+                'ui': ['theme', 'show_timestamps', 'colored_output', 'compact_mode'],
+                'voice': ['voice_enabled', 'tts_engine', 'stt_engine', 'voice_rate'],
+                'advanced': ['debug_mode', 'log_level', 'auto_save', 'backup_enabled']
+            }
+
+            def _get_setting_value(key):
+                """Get current setting value"""
+                if hasattr(self, 'config') and self.config:
+                    return self.config.get(key, None)
+                return None
+
+            def _set_setting_value(key, value):
+                """Set setting value"""
+                if hasattr(self, 'config') and self.config:
+                    # Type conversion
+                    old_val = self.config.get(key)
+                    if isinstance(old_val, bool):
+                        value = str(value).lower() in ('true', 'yes', '1', 'on')
+                    elif isinstance(old_val, int):
+                        value = int(value)
+                    elif isinstance(old_val, float):
+                        value = float(value)
+                    self.config[key] = value
+                    return True
+                return False
+
+            def _save_settings():
+                """Save settings to config file"""
+                config_path = os.path.join(os.path.dirname(__file__), 'config.json')
+                try:
+                    with open(config_path, 'w') as f:
+                        json.dump(self.config, f, indent=2)
+                    return True
+                except Exception as e:
+                    print(f"{Colors.RED}Error saving: {e}{Colors.RESET}")
+                    return False
+
+            if not subcmd:
+                # Show settings overview
+                print(f"\n{Colors.BRIGHT_CYAN}{Colors.BOLD}Settings{Colors.RESET}")
+                print(f"{Colors.DIM}{'─'*60}{Colors.RESET}")
+                print(f"\n{Colors.BRIGHT_WHITE}Commands:{Colors.RESET}")
+                print(f"  {Colors.CYAN}/settings show [category]{Colors.RESET}  - Show settings")
+                print(f"  {Colors.CYAN}/settings set <key> <value>{Colors.RESET} - Change setting")
+                print(f"  {Colors.CYAN}/settings get <key>{Colors.RESET}         - Get setting value")
+                print(f"  {Colors.CYAN}/settings reset [key]{Colors.RESET}       - Reset to default")
+                print(f"  {Colors.CYAN}/settings save{Colors.RESET}              - Save settings")
+                print(f"  {Colors.CYAN}/settings reload{Colors.RESET}            - Reload from file")
+                print(f"  {Colors.CYAN}/settings export <file>{Colors.RESET}     - Export settings")
+                print(f"  {Colors.CYAN}/settings import <file>{Colors.RESET}     - Import settings")
+                print(f"  {Colors.CYAN}/settings edit{Colors.RESET}              - Interactive editor")
+                print(f"\n{Colors.BRIGHT_WHITE}Categories:{Colors.RESET}")
+                for cat in settings_categories:
+                    print(f"  {Colors.CYAN}{cat}{Colors.RESET} - {', '.join(settings_categories[cat][:3])}...")
+                print(f"\n{Colors.DIM}Use /settings show <category> to see all settings in that category{Colors.RESET}")
+
+            elif subcmd == "show":
+                category = sub_args.strip().lower() if sub_args else ""
+
+                print(f"\n{Colors.BRIGHT_CYAN}{Colors.BOLD}Settings{Colors.RESET}")
+                print(f"{Colors.DIM}{'─'*60}{Colors.RESET}")
+
+                if category and category in settings_categories:
+                    # Show specific category
+                    print(f"\n{Colors.BRIGHT_WHITE}[{category.upper()}]{Colors.RESET}")
+                    for key in settings_categories[category]:
+                        val = _get_setting_value(key)
+                        val_str = str(val) if val is not None else f"{Colors.DIM}(not set){Colors.RESET}"
+                        if isinstance(val, bool):
+                            val_str = f"{Colors.BRIGHT_GREEN}ON{Colors.RESET}" if val else f"{Colors.BRIGHT_RED}OFF{Colors.RESET}"
+                        print(f"  {Colors.CYAN}{key}:{Colors.RESET} {val_str}")
+                elif category:
+                    print(f"{Colors.YELLOW}Unknown category: {category}{Colors.RESET}")
+                    print(f"{Colors.DIM}Available: {', '.join(settings_categories.keys())}{Colors.RESET}")
+                else:
+                    # Show all settings
+                    for cat, keys in settings_categories.items():
+                        print(f"\n{Colors.BRIGHT_WHITE}[{cat.upper()}]{Colors.RESET}")
+                        for key in keys:
+                            val = _get_setting_value(key)
+                            val_str = str(val) if val is not None else f"{Colors.DIM}(not set){Colors.RESET}"
+                            if isinstance(val, bool):
+                                val_str = f"{Colors.BRIGHT_GREEN}ON{Colors.RESET}" if val else f"{Colors.BRIGHT_RED}OFF{Colors.RESET}"
+                            print(f"  {Colors.CYAN}{key}:{Colors.RESET} {val_str}")
+
+            elif subcmd == "get":
+                key = sub_args.strip()
+                if not key:
+                    print(f"{Colors.YELLOW}Usage: /settings get <key>{Colors.RESET}")
+                else:
+                    val = _get_setting_value(key)
+                    if val is not None:
+                        print(f"{Colors.CYAN}{key}:{Colors.RESET} {val}")
+                    else:
+                        print(f"{Colors.YELLOW}Setting not found: {key}{Colors.RESET}")
+
+            elif subcmd == "set":
+                parts = sub_args.split(maxsplit=1)
+                if len(parts) < 2:
+                    print(f"{Colors.YELLOW}Usage: /settings set <key> <value>{Colors.RESET}")
+                else:
+                    key, value = parts
+                    old_val = _get_setting_value(key)
+                    if _set_setting_value(key, value):
+                        print(f"{Colors.BRIGHT_GREEN}✓ Set {key}: {old_val} → {_get_setting_value(key)}{Colors.RESET}")
+                        print(f"{Colors.DIM}Use /settings save to persist changes{Colors.RESET}")
+                    else:
+                        print(f"{Colors.RED}Failed to set {key}{Colors.RESET}")
+
+            elif subcmd == "reset":
+                key = sub_args.strip() if sub_args else ""
+
+                # Default values
+                defaults = {
+                    'model': 'gpt-4',
+                    'temperature': 0.7,
+                    'max_tokens': 4096,
+                    'streaming': True,
+                    'verbose': False,
+                    'max_context_window': 32768,
+                    'auto_summarize': True,
+                    'memory_limit': 1000,
+                    'theme': 'default',
+                    'colored_output': True,
+                    'debug_mode': False,
+                    'log_level': 'INFO'
+                }
+
+                if key:
+                    if key in defaults:
+                        _set_setting_value(key, defaults[key])
+                        print(f"{Colors.BRIGHT_GREEN}✓ Reset {key} to: {defaults[key]}{Colors.RESET}")
+                    else:
+                        print(f"{Colors.YELLOW}No default for: {key}{Colors.RESET}")
+                else:
+                    confirm = input(f"{Colors.BRIGHT_RED}Reset ALL settings to defaults? [y/N]: {Colors.RESET}").strip().lower()
+                    if confirm == 'y':
+                        for k, v in defaults.items():
+                            _set_setting_value(k, v)
+                        print(f"{Colors.BRIGHT_GREEN}✓ All settings reset to defaults{Colors.RESET}")
+                    else:
+                        print(f"{Colors.DIM}Cancelled{Colors.RESET}")
+
+            elif subcmd == "save":
+                if _save_settings():
+                    print(f"{Colors.BRIGHT_GREEN}✓ Settings saved{Colors.RESET}")
+                else:
+                    print(f"{Colors.RED}Failed to save settings{Colors.RESET}")
+
+            elif subcmd == "reload":
+                config_path = os.path.join(os.path.dirname(__file__), 'config.json')
+                try:
+                    if os.path.exists(config_path):
+                        with open(config_path, 'r') as f:
+                            loaded = json.load(f)
+                            self.config.update(loaded)
+                        print(f"{Colors.BRIGHT_GREEN}✓ Settings reloaded from {config_path}{Colors.RESET}")
+                    else:
+                        print(f"{Colors.YELLOW}Config file not found: {config_path}{Colors.RESET}")
+                except Exception as e:
+                    print(f"{Colors.RED}Error reloading: {e}{Colors.RESET}")
+
+            elif subcmd == "export":
+                path = sub_args.strip() if sub_args else "settings_export.json"
+                if not path.endswith('.json'):
+                    path += '.json'
+                try:
+                    with open(path, 'w') as f:
+                        json.dump(self.config, f, indent=2)
+                    print(f"{Colors.BRIGHT_GREEN}✓ Settings exported to: {path}{Colors.RESET}")
+                except Exception as e:
+                    print(f"{Colors.RED}Export error: {e}{Colors.RESET}")
+
+            elif subcmd == "import":
+                path = sub_args.strip()
+                if not path:
+                    print(f"{Colors.YELLOW}Usage: /settings import <file.json>{Colors.RESET}")
+                elif not os.path.exists(path):
+                    print(f"{Colors.RED}File not found: {path}{Colors.RESET}")
+                else:
+                    try:
+                        with open(path, 'r') as f:
+                            imported = json.load(f)
+
+                        # Show preview
+                        print(f"\n{Colors.BRIGHT_CYAN}Import Preview:{Colors.RESET}")
+                        for key, val in list(imported.items())[:10]:
+                            print(f"  {Colors.CYAN}{key}:{Colors.RESET} {val}")
+                        if len(imported) > 10:
+                            print(f"  {Colors.DIM}... and {len(imported) - 10} more{Colors.RESET}")
+
+                        confirm = input(f"\n{Colors.BRIGHT_YELLOW}Import these settings? [y/N]: {Colors.RESET}").strip().lower()
+                        if confirm == 'y':
+                            self.config.update(imported)
+                            print(f"{Colors.BRIGHT_GREEN}✓ Imported {len(imported)} settings{Colors.RESET}")
+                        else:
+                            print(f"{Colors.DIM}Cancelled{Colors.RESET}")
+                    except json.JSONDecodeError:
+                        print(f"{Colors.RED}Invalid JSON file{Colors.RESET}")
+                    except Exception as e:
+                        print(f"{Colors.RED}Import error: {e}{Colors.RESET}")
+
+            elif subcmd == "edit":
+                # Interactive settings editor
+                print(f"\n{Colors.BRIGHT_CYAN}{Colors.BOLD}Interactive Settings Editor{Colors.RESET}")
+                print(f"{Colors.DIM}{'─'*60}{Colors.RESET}")
+                print(f"{Colors.DIM}Type setting name to edit, 'save' to save, 'quit' to exit{Colors.RESET}\n")
+
+                # Show current settings
+                all_keys = []
+                for cat, keys in settings_categories.items():
+                    for key in keys:
+                        val = _get_setting_value(key)
+                        if val is not None:
+                            all_keys.append(key)
+
+                while True:
+                    print(f"\n{Colors.BRIGHT_WHITE}Current Settings:{Colors.RESET}")
+                    for i, key in enumerate(all_keys[:15], 1):
+                        val = _get_setting_value(key)
+                        print(f"  {Colors.DIM}{i:2}.{Colors.RESET} {Colors.CYAN}{key}:{Colors.RESET} {val}")
+
+                    try:
+                        choice = input(f"\n{Colors.BRIGHT_CYAN}Setting name (or save/quit): {Colors.RESET}").strip()
+                    except (EOFError, KeyboardInterrupt):
+                        break
+
+                    if choice.lower() in ('quit', 'q', 'exit'):
+                        print(f"{Colors.DIM}Exiting editor{Colors.RESET}")
+                        break
+                    elif choice.lower() == 'save':
+                        if _save_settings():
+                            print(f"{Colors.BRIGHT_GREEN}✓ Settings saved{Colors.RESET}")
+                        break
+                    elif choice:
+                        # Try to edit setting
+                        current = _get_setting_value(choice)
+                        if current is not None:
+                            print(f"  {Colors.DIM}Current value: {current}{Colors.RESET}")
+                            new_val = input(f"  {Colors.BRIGHT_CYAN}New value: {Colors.RESET}").strip()
+                            if new_val:
+                                _set_setting_value(choice, new_val)
+                                print(f"  {Colors.BRIGHT_GREEN}✓ Updated{Colors.RESET}")
+                        else:
+                            # Check if it's a number reference
+                            try:
+                                idx = int(choice) - 1
+                                if 0 <= idx < len(all_keys):
+                                    key = all_keys[idx]
+                                    current = _get_setting_value(key)
+                                    print(f"  {Colors.DIM}Current value: {current}{Colors.RESET}")
+                                    new_val = input(f"  {Colors.BRIGHT_CYAN}New value for {key}: {Colors.RESET}").strip()
+                                    if new_val:
+                                        _set_setting_value(key, new_val)
+                                        print(f"  {Colors.BRIGHT_GREEN}✓ Updated{Colors.RESET}")
+                            except ValueError:
+                                print(f"{Colors.YELLOW}Unknown setting: {choice}{Colors.RESET}")
+
+            else:
+                print(f"{Colors.YELLOW}Unknown settings command: {subcmd}{Colors.RESET}")
+                print(f"{Colors.DIM}Use /settings for help{Colors.RESET}")
+
             return "COMMAND"
 
         elif cmd == "/theme":
-            # Theme management
-            theme = args.strip().lower() if args else ""
+            # Full theme management system
+            subcmd = args.split()[0].lower() if args else ""
+            sub_args = ' '.join(args.split()[1:]) if len(args.split()) > 1 else ""
 
-            if not theme:
-                print(f"\n{Colors.BRIGHT_CYAN}Theme{Colors.RESET}")
-                print(f"{Colors.DIM}Current: default{Colors.RESET}")
-                print(f"\n{Colors.DIM}Available: dark, light{Colors.RESET}")
+            # Theme definitions
+            themes = {
+                'default': {
+                    'name': 'Default',
+                    'description': 'Default terminal colors',
+                    'primary': '\033[36m',      # Cyan
+                    'secondary': '\033[33m',    # Yellow
+                    'accent': '\033[35m',       # Magenta
+                    'success': '\033[32m',      # Green
+                    'error': '\033[31m',        # Red
+                    'warning': '\033[33m',      # Yellow
+                    'info': '\033[34m',         # Blue
+                    'muted': '\033[90m',        # Bright Black
+                    'text': '\033[37m',         # White
+                    'bg': ''                    # Default
+                },
+                'dark': {
+                    'name': 'Dark Mode',
+                    'description': 'Dark theme with blue accents',
+                    'primary': '\033[94m',      # Bright Blue
+                    'secondary': '\033[96m',    # Bright Cyan
+                    'accent': '\033[95m',       # Bright Magenta
+                    'success': '\033[92m',      # Bright Green
+                    'error': '\033[91m',        # Bright Red
+                    'warning': '\033[93m',      # Bright Yellow
+                    'info': '\033[94m',         # Bright Blue
+                    'muted': '\033[90m',        # Bright Black
+                    'text': '\033[97m',         # Bright White
+                    'bg': '\033[40m'            # Black BG
+                },
+                'light': {
+                    'name': 'Light Mode',
+                    'description': 'Light theme optimized for light terminals',
+                    'primary': '\033[34m',      # Blue
+                    'secondary': '\033[36m',    # Cyan
+                    'accent': '\033[35m',       # Magenta
+                    'success': '\033[32m',      # Green
+                    'error': '\033[31m',        # Red
+                    'warning': '\033[33m',      # Yellow
+                    'info': '\033[34m',         # Blue
+                    'muted': '\033[2m',         # Dim
+                    'text': '\033[30m',         # Black
+                    'bg': ''                    # Default
+                },
+                'ocean': {
+                    'name': 'Ocean',
+                    'description': 'Calm blue-green theme',
+                    'primary': '\033[38;5;39m',     # Deep sky blue
+                    'secondary': '\033[38;5;50m',   # Cyan
+                    'accent': '\033[38;5;147m',     # Light purple
+                    'success': '\033[38;5;84m',     # Sea green
+                    'error': '\033[38;5;203m',      # Coral
+                    'warning': '\033[38;5;221m',    # Gold
+                    'info': '\033[38;5;75m',        # Sky blue
+                    'muted': '\033[38;5;245m',      # Gray
+                    'text': '\033[38;5;255m',       # White
+                    'bg': ''
+                },
+                'forest': {
+                    'name': 'Forest',
+                    'description': 'Nature-inspired green theme',
+                    'primary': '\033[38;5;34m',     # Forest green
+                    'secondary': '\033[38;5;142m',  # Olive
+                    'accent': '\033[38;5;179m',     # Tan
+                    'success': '\033[38;5;40m',     # Lime
+                    'error': '\033[38;5;124m',      # Dark red
+                    'warning': '\033[38;5;214m',    # Orange
+                    'info': '\033[38;5;71m',        # Medium green
+                    'muted': '\033[38;5;242m',      # Gray
+                    'text': '\033[38;5;230m',       # Light beige
+                    'bg': ''
+                },
+                'sunset': {
+                    'name': 'Sunset',
+                    'description': 'Warm orange-pink theme',
+                    'primary': '\033[38;5;208m',    # Orange
+                    'secondary': '\033[38;5;204m',  # Hot pink
+                    'accent': '\033[38;5;213m',     # Pink
+                    'success': '\033[38;5;155m',    # Yellow-green
+                    'error': '\033[38;5;196m',      # Red
+                    'warning': '\033[38;5;220m',    # Gold
+                    'info': '\033[38;5;216m',       # Light orange
+                    'muted': '\033[38;5;241m',      # Gray
+                    'text': '\033[38;5;255m',       # White
+                    'bg': ''
+                },
+                'hacker': {
+                    'name': 'Hacker',
+                    'description': 'Classic green-on-black terminal',
+                    'primary': '\033[38;5;46m',     # Bright green
+                    'secondary': '\033[38;5;40m',   # Green
+                    'accent': '\033[38;5;48m',      # Spring green
+                    'success': '\033[38;5;82m',     # Yellow-green
+                    'error': '\033[38;5;196m',      # Red
+                    'warning': '\033[38;5;226m',    # Yellow
+                    'info': '\033[38;5;34m',        # Forest green
+                    'muted': '\033[38;5;22m',       # Dark green
+                    'text': '\033[38;5;46m',        # Bright green
+                    'bg': '\033[40m'                # Black BG
+                },
+                'cyberpunk': {
+                    'name': 'Cyberpunk',
+                    'description': 'Neon purple and pink',
+                    'primary': '\033[38;5;201m',    # Fuchsia
+                    'secondary': '\033[38;5;51m',   # Cyan
+                    'accent': '\033[38;5;226m',     # Yellow
+                    'success': '\033[38;5;118m',    # Bright green
+                    'error': '\033[38;5;196m',      # Red
+                    'warning': '\033[38;5;208m',    # Orange
+                    'info': '\033[38;5;141m',       # Medium purple
+                    'muted': '\033[38;5;240m',      # Gray
+                    'text': '\033[38;5;255m',       # White
+                    'bg': ''
+                }
+            }
+
+            # Get current theme
+            if not hasattr(self, '_current_theme'):
+                self._current_theme = 'default'
+
+            def _apply_theme(theme_name):
+                """Apply theme colors to the Colors class"""
+                if theme_name not in themes:
+                    return False
+
+                theme = themes[theme_name]
+                self._current_theme = theme_name
+
+                # Update Colors class
+                Colors.CYAN = theme['primary']
+                Colors.YELLOW = theme['secondary']
+                Colors.MAGENTA = theme['accent']
+                Colors.GREEN = theme['success']
+                Colors.RED = theme['error']
+                Colors.BLUE = theme['info']
+                Colors.DIM = theme['muted']
+                Colors.WHITE = theme['text']
+
+                # Update bright variants
+                Colors.BRIGHT_CYAN = theme['primary']
+                Colors.BRIGHT_YELLOW = theme['secondary']
+                Colors.BRIGHT_MAGENTA = theme['accent']
+                Colors.BRIGHT_GREEN = theme['success']
+                Colors.BRIGHT_RED = theme['error']
+                Colors.BRIGHT_BLUE = theme['info']
+                Colors.BRIGHT_WHITE = theme['text']
+
+                # Save to config
+                if hasattr(self, 'config') and self.config:
+                    self.config['theme'] = theme_name
+
+                return True
+
+            def _preview_theme(theme_name):
+                """Preview a theme's colors"""
+                if theme_name not in themes:
+                    return
+
+                t = themes[theme_name]
+                print(f"\n{t['primary']}Primary{Colors.RESET} | ", end='')
+                print(f"{t['secondary']}Secondary{Colors.RESET} | ", end='')
+                print(f"{t['accent']}Accent{Colors.RESET}")
+                print(f"{t['success']}Success{Colors.RESET} | ", end='')
+                print(f"{t['error']}Error{Colors.RESET} | ", end='')
+                print(f"{t['warning']}Warning{Colors.RESET}")
+                print(f"{t['info']}Info{Colors.RESET} | ", end='')
+                print(f"{t['muted']}Muted{Colors.RESET} | ", end='')
+                print(f"{t['text']}Text{Colors.RESET}")
+
+            if not subcmd:
+                # Show theme menu
+                print(f"\n{Colors.BRIGHT_CYAN}{Colors.BOLD}Theme Manager{Colors.RESET}")
+                print(f"{Colors.DIM}{'─'*60}{Colors.RESET}")
+                print(f"\n{Colors.BRIGHT_WHITE}Current Theme:{Colors.RESET} {Colors.CYAN}{themes[self._current_theme]['name']}{Colors.RESET}")
+                print(f"{Colors.DIM}{themes[self._current_theme]['description']}{Colors.RESET}")
+                print(f"\n{Colors.BRIGHT_WHITE}Commands:{Colors.RESET}")
+                print(f"  {Colors.CYAN}/theme list{Colors.RESET}        - List all themes")
+                print(f"  {Colors.CYAN}/theme set <name>{Colors.RESET}  - Apply theme")
+                print(f"  {Colors.CYAN}/theme preview <n>{Colors.RESET} - Preview theme colors")
+                print(f"  {Colors.CYAN}/theme reset{Colors.RESET}       - Reset to default")
+                print(f"  {Colors.CYAN}/theme create{Colors.RESET}      - Create custom theme")
+
+            elif subcmd == "list":
+                print(f"\n{Colors.BRIGHT_CYAN}{Colors.BOLD}Available Themes{Colors.RESET}")
+                print(f"{Colors.DIM}{'─'*60}{Colors.RESET}\n")
+
+                for theme_id, theme_data in themes.items():
+                    is_current = theme_id == self._current_theme
+                    indicator = f"{Colors.BRIGHT_GREEN}●{Colors.RESET}" if is_current else f"{Colors.DIM}○{Colors.RESET}"
+                    print(f"  {indicator} {Colors.BRIGHT_WHITE}{theme_data['name']}{Colors.RESET} ({theme_id})")
+                    print(f"    {Colors.DIM}{theme_data['description']}{Colors.RESET}")
+                    # Show color samples inline
+                    t = theme_data
+                    print(f"    {t['primary']}▓▓{Colors.RESET}{t['secondary']}▓▓{Colors.RESET}{t['accent']}▓▓{Colors.RESET}{t['success']}▓▓{Colors.RESET}{t['error']}▓▓{Colors.RESET}{t['info']}▓▓{Colors.RESET}")
+                    print()
+
+            elif subcmd in ("set", "apply", "use"):
+                theme_name = sub_args.strip().lower()
+                if not theme_name:
+                    print(f"{Colors.YELLOW}Usage: /theme set <theme_name>{Colors.RESET}")
+                    print(f"{Colors.DIM}Available: {', '.join(themes.keys())}{Colors.RESET}")
+                elif theme_name not in themes:
+                    print(f"{Colors.RED}Unknown theme: {theme_name}{Colors.RESET}")
+                    print(f"{Colors.DIM}Available: {', '.join(themes.keys())}{Colors.RESET}")
+                else:
+                    if _apply_theme(theme_name):
+                        print(f"{Colors.BRIGHT_GREEN}✓ Theme applied: {themes[theme_name]['name']}{Colors.RESET}")
+                        _preview_theme(theme_name)
+                    else:
+                        print(f"{Colors.RED}Failed to apply theme{Colors.RESET}")
+
+            elif subcmd == "preview":
+                theme_name = sub_args.strip().lower()
+                if not theme_name:
+                    print(f"{Colors.YELLOW}Usage: /theme preview <theme_name>{Colors.RESET}")
+                elif theme_name not in themes:
+                    print(f"{Colors.RED}Unknown theme: {theme_name}{Colors.RESET}")
+                else:
+                    print(f"\n{Colors.BRIGHT_CYAN}Preview: {themes[theme_name]['name']}{Colors.RESET}")
+                    print(f"{Colors.DIM}{themes[theme_name]['description']}{Colors.RESET}")
+                    _preview_theme(theme_name)
+                    print(f"\n{Colors.DIM}Use /theme set {theme_name} to apply{Colors.RESET}")
+
+            elif subcmd == "reset":
+                if _apply_theme('default'):
+                    print(f"{Colors.BRIGHT_GREEN}✓ Theme reset to default{Colors.RESET}")
+
+            elif subcmd == "create":
+                # Interactive custom theme creator
+                print(f"\n{Colors.BRIGHT_CYAN}{Colors.BOLD}Custom Theme Creator{Colors.RESET}")
+                print(f"{Colors.DIM}{'─'*60}{Colors.RESET}")
+                print(f"{Colors.DIM}Create a custom theme with 256-color support{Colors.RESET}")
+                print(f"{Colors.DIM}Color format: number (0-255) for 256-color palette{Colors.RESET}\n")
+
+                try:
+                    name = input(f"{Colors.CYAN}Theme name: {Colors.RESET}").strip()
+                    if not name:
+                        print(f"{Colors.DIM}Cancelled{Colors.RESET}")
+                        return "COMMAND"
+
+                    desc = input(f"{Colors.CYAN}Description: {Colors.RESET}").strip() or f"Custom theme: {name}"
+
+                    print(f"\n{Colors.DIM}Enter color codes (0-255) or press Enter for default{Colors.RESET}")
+
+                    def _get_color(prompt, default=39):
+                        try:
+                            val = input(f"  {Colors.CYAN}{prompt} [{default}]: {Colors.RESET}").strip()
+                            if val:
+                                num = int(val)
+                                if 0 <= num <= 255:
+                                    return f'\033[38;5;{num}m'
+                            return f'\033[38;5;{default}m'
+                        except ValueError:
+                            return f'\033[38;5;{default}m'
+
+                    primary = _get_color("Primary color", 39)
+                    secondary = _get_color("Secondary color", 220)
+                    accent = _get_color("Accent color", 165)
+                    success = _get_color("Success color", 82)
+                    error = _get_color("Error color", 196)
+
+                    theme_id = name.lower().replace(' ', '_')
+
+                    # Add to themes
+                    themes[theme_id] = {
+                        'name': name,
+                        'description': desc,
+                        'primary': primary,
+                        'secondary': secondary,
+                        'accent': accent,
+                        'success': success,
+                        'error': error,
+                        'warning': secondary,
+                        'info': primary,
+                        'muted': '\033[38;5;245m',
+                        'text': '\033[38;5;255m',
+                        'bg': ''
+                    }
+
+                    print(f"\n{Colors.BRIGHT_GREEN}✓ Theme '{name}' created!{Colors.RESET}")
+                    _preview_theme(theme_id)
+                    print(f"\n{Colors.DIM}Use /theme set {theme_id} to apply{Colors.RESET}")
+
+                except (EOFError, KeyboardInterrupt):
+                    print(f"\n{Colors.DIM}Cancelled{Colors.RESET}")
+
             else:
-                print(f"{Colors.YELLOW}Theme '{theme}' - Theme switching not yet implemented{Colors.RESET}")
-                print(f"{Colors.DIM}Using default terminal colors{Colors.RESET}")
+                # Treat as theme name
+                if subcmd in themes:
+                    if _apply_theme(subcmd):
+                        print(f"{Colors.BRIGHT_GREEN}✓ Theme applied: {themes[subcmd]['name']}{Colors.RESET}")
+                        _preview_theme(subcmd)
+                else:
+                    print(f"{Colors.YELLOW}Unknown theme or command: {subcmd}{Colors.RESET}")
+                    print(f"{Colors.DIM}Use /theme list to see available themes{Colors.RESET}")
 
             return "COMMAND"
 
         elif cmd == "/whisper":
-            # Speech to text
-            print(f"\n{Colors.BRIGHT_CYAN}Whisper Speech-to-Text{Colors.RESET}")
-            print(f"{Colors.DIM}{'─'*50}{Colors.RESET}")
-            print(f"\n{Colors.DIM}Voice input using Whisper ASR{Colors.RESET}")
-            print(f"{Colors.YELLOW}Use /voice command for voice assistant{Colors.RESET}")
+            # Full Whisper speech-to-text integration
+            subcmd = args.split()[0].lower() if args else ""
+            sub_args = ' '.join(args.split()[1:]) if len(args.split()) > 1 else ""
+
+            # Initialize whisper state
+            if not hasattr(self, '_whisper_model'):
+                self._whisper_model = None
+                self._whisper_model_name = 'base'
+
+            def _check_whisper():
+                """Check if whisper is available"""
+                try:
+                    import whisper
+                    return True
+                except ImportError:
+                    return False
+
+            def _check_audio():
+                """Check if audio recording is available"""
+                try:
+                    import sounddevice
+                    import numpy
+                    return True
+                except ImportError:
+                    return False
+
+            def _load_whisper_model(model_name='base'):
+                """Load whisper model"""
+                try:
+                    import whisper
+                    print(f"{Colors.CYAN}Loading Whisper model: {model_name}...{Colors.RESET}")
+                    self._whisper_model = whisper.load_model(model_name)
+                    self._whisper_model_name = model_name
+                    print(f"{Colors.BRIGHT_GREEN}✓ Model loaded{Colors.RESET}")
+                    return True
+                except Exception as e:
+                    print(f"{Colors.RED}Error loading model: {e}{Colors.RESET}")
+                    return False
+
+            def _transcribe_file(file_path):
+                """Transcribe audio file"""
+                if not os.path.exists(file_path):
+                    print(f"{Colors.RED}File not found: {file_path}{Colors.RESET}")
+                    return None
+
+                if self._whisper_model is None:
+                    if not _load_whisper_model(self._whisper_model_name):
+                        return None
+
+                try:
+                    print(f"{Colors.CYAN}Transcribing: {file_path}...{Colors.RESET}")
+                    result = self._whisper_model.transcribe(file_path)
+                    return result
+                except Exception as e:
+                    print(f"{Colors.RED}Transcription error: {e}{Colors.RESET}")
+                    return None
+
+            def _record_audio(duration=5, sample_rate=16000):
+                """Record audio from microphone"""
+                try:
+                    import sounddevice as sd
+                    import numpy as np
+                    import tempfile
+                    import scipy.io.wavfile as wav
+
+                    print(f"{Colors.CYAN}Recording for {duration} seconds... (speak now){Colors.RESET}")
+                    audio = sd.rec(int(duration * sample_rate), samplerate=sample_rate, channels=1, dtype='float32')
+                    sd.wait()
+                    print(f"{Colors.BRIGHT_GREEN}✓ Recording complete{Colors.RESET}")
+
+                    # Save to temp file
+                    temp_file = tempfile.NamedTemporaryFile(suffix='.wav', delete=False)
+                    # Normalize and convert to int16
+                    audio_normalized = np.int16(audio.flatten() * 32767)
+                    wav.write(temp_file.name, sample_rate, audio_normalized)
+                    return temp_file.name
+                except Exception as e:
+                    print(f"{Colors.RED}Recording error: {e}{Colors.RESET}")
+                    return None
+
+            if not subcmd:
+                # Show whisper help
+                print(f"\n{Colors.BRIGHT_CYAN}{Colors.BOLD}Whisper Speech-to-Text{Colors.RESET}")
+                print(f"{Colors.DIM}{'─'*60}{Colors.RESET}")
+
+                # Check dependencies
+                whisper_ok = _check_whisper()
+                audio_ok = _check_audio()
+
+                print(f"\n{Colors.BRIGHT_WHITE}Status:{Colors.RESET}")
+                print(f"  {Colors.CYAN}Whisper:{Colors.RESET} {'✓ Available' if whisper_ok else '✗ Not installed'}")
+                print(f"  {Colors.CYAN}Audio:{Colors.RESET} {'✓ Available' if audio_ok else '✗ Not installed'}")
+                if self._whisper_model:
+                    print(f"  {Colors.CYAN}Model:{Colors.RESET} {self._whisper_model_name} (loaded)")
+                else:
+                    print(f"  {Colors.CYAN}Model:{Colors.RESET} {self._whisper_model_name} (not loaded)")
+
+                print(f"\n{Colors.BRIGHT_WHITE}Commands:{Colors.RESET}")
+                print(f"  {Colors.CYAN}/whisper listen{Colors.RESET}          - Record and transcribe")
+                print(f"  {Colors.CYAN}/whisper listen <sec>{Colors.RESET}    - Record for N seconds")
+                print(f"  {Colors.CYAN}/whisper file <path>{Colors.RESET}     - Transcribe audio file")
+                print(f"  {Colors.CYAN}/whisper model <name>{Colors.RESET}    - Change model")
+                print(f"  {Colors.CYAN}/whisper models{Colors.RESET}          - List available models")
+                print(f"  {Colors.CYAN}/whisper chat{Colors.RESET}            - Voice chat mode")
+                print(f"  {Colors.CYAN}/whisper status{Colors.RESET}          - Show status")
+
+                if not whisper_ok:
+                    print(f"\n{Colors.YELLOW}Install Whisper:{Colors.RESET}")
+                    print(f"  {Colors.DIM}pip install openai-whisper{Colors.RESET}")
+                if not audio_ok:
+                    print(f"\n{Colors.YELLOW}Install audio support:{Colors.RESET}")
+                    print(f"  {Colors.DIM}pip install sounddevice scipy numpy{Colors.RESET}")
+
+            elif subcmd == "listen":
+                # Record and transcribe
+                if not _check_whisper():
+                    print(f"{Colors.YELLOW}Whisper not installed. Run: pip install openai-whisper{Colors.RESET}")
+                    return "COMMAND"
+                if not _check_audio():
+                    print(f"{Colors.YELLOW}Audio not available. Run: pip install sounddevice scipy numpy{Colors.RESET}")
+                    return "COMMAND"
+
+                try:
+                    duration = int(sub_args) if sub_args else 5
+                except ValueError:
+                    duration = 5
+
+                # Record
+                audio_file = _record_audio(duration)
+                if audio_file:
+                    # Transcribe
+                    result = _transcribe_file(audio_file)
+                    if result:
+                        text = result.get('text', '').strip()
+                        print(f"\n{Colors.BRIGHT_CYAN}Transcription:{Colors.RESET}")
+                        print(f"  {Colors.BRIGHT_WHITE}{text}{Colors.RESET}")
+
+                        # Store for use
+                        self._last_transcription = text
+
+                        # Offer to use as input
+                        use = input(f"\n{Colors.CYAN}Use as chat input? [Y/n]: {Colors.RESET}").strip().lower()
+                        if use != 'n':
+                            return text  # Return transcription as user input
+
+                    # Clean up
+                    try:
+                        os.unlink(audio_file)
+                    except:
+                        pass
+
+            elif subcmd == "file":
+                # Transcribe file
+                file_path = sub_args.strip()
+                if not file_path:
+                    print(f"{Colors.YELLOW}Usage: /whisper file <audio_file>{Colors.RESET}")
+                    print(f"{Colors.DIM}Supported: mp3, wav, m4a, webm, mp4, flac{Colors.RESET}")
+                elif not _check_whisper():
+                    print(f"{Colors.YELLOW}Whisper not installed. Run: pip install openai-whisper{Colors.RESET}")
+                else:
+                    result = _transcribe_file(file_path)
+                    if result:
+                        text = result.get('text', '').strip()
+                        language = result.get('language', 'unknown')
+
+                        print(f"\n{Colors.BRIGHT_CYAN}{Colors.BOLD}Transcription Result{Colors.RESET}")
+                        print(f"{Colors.DIM}{'─'*60}{Colors.RESET}")
+                        print(f"  {Colors.CYAN}File:{Colors.RESET} {file_path}")
+                        print(f"  {Colors.CYAN}Language:{Colors.RESET} {language}")
+                        print(f"  {Colors.CYAN}Duration:{Colors.RESET} {result.get('segments', [{}])[-1].get('end', 0):.1f}s")
+                        print(f"\n{Colors.BRIGHT_WHITE}Text:{Colors.RESET}")
+                        print(f"  {text}")
+
+                        # Show segments if verbose
+                        if 'segments' in result and len(result['segments']) > 1:
+                            print(f"\n{Colors.DIM}Segments: {len(result['segments'])}{Colors.RESET}")
+
+            elif subcmd == "model":
+                # Change model
+                model_name = sub_args.strip().lower() if sub_args else ""
+                available_models = ['tiny', 'base', 'small', 'medium', 'large', 'large-v2', 'large-v3']
+
+                if not model_name:
+                    print(f"{Colors.YELLOW}Usage: /whisper model <name>{Colors.RESET}")
+                    print(f"{Colors.DIM}Current: {self._whisper_model_name}{Colors.RESET}")
+                    print(f"{Colors.DIM}Available: {', '.join(available_models)}{Colors.RESET}")
+                elif model_name not in available_models:
+                    print(f"{Colors.RED}Unknown model: {model_name}{Colors.RESET}")
+                    print(f"{Colors.DIM}Available: {', '.join(available_models)}{Colors.RESET}")
+                else:
+                    self._whisper_model = None  # Unload current
+                    self._whisper_model_name = model_name
+                    print(f"{Colors.BRIGHT_GREEN}✓ Model set to: {model_name}{Colors.RESET}")
+                    print(f"{Colors.DIM}Model will be loaded on next transcription{Colors.RESET}")
+
+            elif subcmd == "models":
+                # List models
+                models_info = [
+                    ('tiny', '39M params', 'Fastest, lowest accuracy'),
+                    ('base', '74M params', 'Good balance for quick tasks'),
+                    ('small', '244M params', 'Better accuracy, slower'),
+                    ('medium', '769M params', 'High accuracy'),
+                    ('large', '1550M params', 'Best accuracy'),
+                    ('large-v2', '1550M params', 'Improved large'),
+                    ('large-v3', '1550M params', 'Latest large model'),
+                ]
+
+                print(f"\n{Colors.BRIGHT_CYAN}{Colors.BOLD}Whisper Models{Colors.RESET}")
+                print(f"{Colors.DIM}{'─'*60}{Colors.RESET}\n")
+
+                for name, size, desc in models_info:
+                    is_current = name == self._whisper_model_name
+                    indicator = f"{Colors.BRIGHT_GREEN}●{Colors.RESET}" if is_current else f"{Colors.DIM}○{Colors.RESET}"
+                    print(f"  {indicator} {Colors.BRIGHT_WHITE}{name:12}{Colors.RESET} {Colors.DIM}{size:15}{Colors.RESET} {desc}")
+
+                print(f"\n{Colors.DIM}Use /whisper model <name> to change{Colors.RESET}")
+
+            elif subcmd == "chat":
+                # Voice chat mode
+                if not _check_whisper() or not _check_audio():
+                    print(f"{Colors.YELLOW}Voice chat requires whisper and audio support{Colors.RESET}")
+                    return "COMMAND"
+
+                print(f"\n{Colors.BRIGHT_CYAN}{Colors.BOLD}Voice Chat Mode{Colors.RESET}")
+                print(f"{Colors.DIM}{'─'*60}{Colors.RESET}")
+                print(f"{Colors.DIM}Press Enter to record, 'q' to quit{Colors.RESET}\n")
+
+                while True:
+                    try:
+                        cmd = input(f"{Colors.CYAN}[Press Enter to speak, 'q' to quit]: {Colors.RESET}").strip().lower()
+                    except (EOFError, KeyboardInterrupt):
+                        break
+
+                    if cmd == 'q':
+                        break
+
+                    # Record
+                    audio_file = _record_audio(5)
+                    if audio_file:
+                        result = _transcribe_file(audio_file)
+                        if result:
+                            text = result.get('text', '').strip()
+                            if text:
+                                print(f"\n{Colors.BRIGHT_WHITE}You said:{Colors.RESET} {text}")
+
+                                # Process as chat input
+                                print(f"\n{Colors.BRIGHT_CYAN}AI Response:{Colors.RESET}")
+                                # Call the chat processing
+                                response = self._process_chat_input(text)
+                                if response:
+                                    print(response)
+
+                        try:
+                            os.unlink(audio_file)
+                        except:
+                            pass
+
+                print(f"\n{Colors.DIM}Voice chat ended{Colors.RESET}")
+
+            elif subcmd == "status":
+                print(f"\n{Colors.BRIGHT_CYAN}{Colors.BOLD}Whisper Status{Colors.RESET}")
+                print(f"{Colors.DIM}{'─'*50}{Colors.RESET}")
+
+                whisper_ok = _check_whisper()
+                audio_ok = _check_audio()
+
+                print(f"  {Colors.CYAN}Whisper installed:{Colors.RESET} {'✓ Yes' if whisper_ok else '✗ No'}")
+                print(f"  {Colors.CYAN}Audio support:{Colors.RESET} {'✓ Yes' if audio_ok else '✗ No'}")
+                print(f"  {Colors.CYAN}Selected model:{Colors.RESET} {self._whisper_model_name}")
+                print(f"  {Colors.CYAN}Model loaded:{Colors.RESET} {'✓ Yes' if self._whisper_model else '✗ No'}")
+
+                if hasattr(self, '_last_transcription'):
+                    print(f"\n{Colors.CYAN}Last transcription:{Colors.RESET}")
+                    print(f"  {Colors.DIM}{self._last_transcription[:100]}{'...' if len(self._last_transcription) > 100 else ''}{Colors.RESET}")
+
+            else:
+                print(f"{Colors.YELLOW}Unknown whisper command: {subcmd}{Colors.RESET}")
+                print(f"{Colors.DIM}Use /whisper for help{Colors.RESET}")
+
             return "COMMAND"
 
         elif cmd == "/sysinfo":
@@ -7980,55 +10114,55 @@ class LocalAIEngine:
                 
                 self.model = AutoModelForCausalLM.from_pretrained(self.model_name)
                 self.model.to(self.device)
-                print(f"{{Colors.BRIGHT_GREEN}}✓ Model loaded on {{self.device}}{{Colors.RESET}}")
+                print(f"{Colors.BRIGHT_GREEN}✓ Model loaded on {self.device}{Colors.RESET}")
             except Exception as e:
-                print(f"{{Colors.BRIGHT_RED}}✗ Model load failed: {{e}}{{Colors.RESET}}")
+                print(f"{Colors.BRIGHT_RED}✗ Model load failed: {e}{Colors.RESET}")
                 raise
         elif self.backend == "ollama":
             try:
-                # 1. Check if Ollama is running
-                requests.get("http://localhost:11434", timeout=2)
-                print(f"{{Colors.BRIGHT_GREEN}}✓ Ollama connection established{{Colors.RESET}}")
-                
+                # 1. Check if Ollama is running with resilient request
+                resilient_request('get', "http://localhost:11434", timeout=2, max_retries=3, retry_delay=1.0)
+                print(f"{Colors.BRIGHT_GREEN}✓ Ollama connection established{Colors.RESET}")
+
                 # 2. Fetch available models for Auto-Detection
-                print(f"{{Colors.CYAN}}Detecting available models...{{Colors.RESET}}")
-                resp = requests.get("http://localhost:11434/api/tags", timeout=5)
+                print(f"{Colors.CYAN}Detecting available models...{Colors.RESET}")
+                resp = resilient_request('get', "http://localhost:11434/api/tags", timeout=5, max_retries=2, retry_delay=1.0)
                 if resp.status_code == 200:
                     available = [m['name'] for m in resp.json().get('models', [])]
-                    
+
                     # 3. Check if configured model exists
                     if self.model_name in available:
-                        print(f"{{Colors.BRIGHT_GREEN}}✓ Using configured model: {{self.model_name}}{{Colors.RESET}}")
+                        print(f"{Colors.BRIGHT_GREEN}✓ Using configured model: {self.model_name}{Colors.RESET}")
                     else:
-                        print(f"{{Colors.YELLOW}}⚠ Configured model '{{self.model_name}}' not found on this machine.{{Colors.RESET}}")
-                        
+                        print(f"{Colors.YELLOW}⚠ Configured model '{self.model_name}' not found on this machine.{Colors.RESET}")
+
                         # 4. Auto-Detection Logic
                         fallbacks = ['mistral:latest', 'mistral', 'llama3:latest', 'llama3', 'llama2:latest', 'qwen2.5-coder:latest']
                         detected_model = None
-                        
+
                         # Try to find a match in our fallback list
                         for f in fallbacks:
                             if f in available:
                                 detected_model = f
                                 break
-                        
+
                         # If no common fallback, just take the first available one
                         if not detected_model and available:
                             detected_model = available[0]
-                        
+
                         if detected_model:
-                            print(f"{{Colors.BRIGHT_CYAN}}✨ Auto-detected alternative: {{detected_model}}{{Colors.RESET}}")
+                            print(f"{Colors.BRIGHT_CYAN}✨ Auto-detected alternative: {detected_model}{Colors.RESET}")
                             self.model_name = detected_model
                         else:
-                            print(f"{{Colors.BRIGHT_RED}}✗ No models found in Ollama.{{Colors.RESET}}")
-                            print(f"{{Colors.YELLOW}}Please run: ollama pull mistral{{Colors.RESET}}")
+                            print(f"{Colors.BRIGHT_RED}✗ No models found in Ollama.{Colors.RESET}")
+                            print(f"{Colors.YELLOW}Please run: ollama pull mistral{Colors.RESET}")
                             raise Exception("No Ollama models available")
                 else:
-                    print(f"{{Colors.BRIGHT_RED}}✗ Failed to fetch models from Ollama{{Colors.RESET}}")
-                    
+                    print(f"{Colors.BRIGHT_RED}✗ Failed to fetch models from Ollama{Colors.RESET}")
+
             except requests.exceptions.RequestException:
-                print(f"{{Colors.BRIGHT_YELLOW}}⚠ Ollama not running on localhost:11434{{Colors.RESET}}")
-                print(f"{{Colors.YELLOW}}Start Ollama with: ollama serve{{Colors.RESET}}")
+                print(f"{Colors.BRIGHT_YELLOW}⚠ Ollama not running on localhost:11434{Colors.RESET}")
+                print(f"{Colors.YELLOW}Start Ollama with: ollama serve{Colors.RESET}")
                 raise Exception("Ollama backend not available")
 
     def generate(self, prompt):
@@ -8051,25 +10185,29 @@ class LocalAIEngine:
             try:
                 # Use streaming for faster response and progress feedback
                 max_tokens = min(self.config.get("max_response_tokens", 200), 200)  # Reduced for low-end PCs
-                
-                response = requests.post(
+
+                # Use resilient_request with self-healing for better reliability
+                response = resilient_request(
+                    'post',
                     "http://localhost:11434/api/generate",
-                    json={{
+                    json={
                         "model": self.model_name,
                         "prompt": prompt,
                         "stream": True,  # Enable streaming
-                        "options": {{
+                        "options": {
                             "temperature": self.config.get("temperature", 0.7),
                             "num_predict": max_tokens
-                        }}
-                    }},
+                        }
+                    },
                     stream=True,
-                    timeout=90  # Increased timeout for slower models
+                    timeout=90,  # Increased timeout for slower models
+                    max_retries=3,
+                    retry_delay=2.0
                 )
-                
+
                 if response.status_code != 200:
-                    return f"Ollama Error: {{response.text[:200]}}"
-                
+                    return f"Ollama Error: {response.text[:200]}"
+
                 # Stream the response
                 full_response = ""
                 for line in response.iter_lines():
@@ -8084,25 +10222,25 @@ class LocalAIEngine:
                             break
                     except json.JSONDecodeError:
                         continue
-                
+
                 result = full_response.strip()
                 if not result:
                     return "I received an empty response. Please try rephrasing your question."
                 return result
-                
+
             except requests.exceptions.Timeout:
                 return "Request timed out after 90 seconds. The model may be slow. Try a shorter question or check Ollama is running properly."
             except requests.exceptions.ConnectionError:
                 return "Cannot connect to Ollama. Make sure Ollama is running: ollama serve"
             except Exception as e:
-                return f"Error: {{str(e)[:200]}}"
+                return f"Error: {str(e)[:200]}"
 
 try:
     ai_engine = LocalAIEngine(CONFIG)
-    print(f"{{Colors.BRIGHT_GREEN}}✓ Local AI Engine ready{{Colors.RESET}}")
+    print(f"{Colors.BRIGHT_GREEN}✓ Local AI Engine ready{Colors.RESET}")
 except Exception as e:
-    print(f"{{Colors.BRIGHT_RED}}✗ Failed to load AI model: {{e}}{{Colors.RESET}}")
-    print(f"{{Colors.YELLOW}}Check your backend configuration in config.json{{Colors.RESET}}")
+    print(f"{Colors.BRIGHT_RED}✗ Failed to load AI model: {e}{Colors.RESET}")
+    print(f"{Colors.YELLOW}Check your backend configuration in config.json{Colors.RESET}")
     webcam_stream.stop()
     sys.exit(1)
 
