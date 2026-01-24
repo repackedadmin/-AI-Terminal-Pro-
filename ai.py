@@ -3938,7 +3938,9 @@ class AppBuilderOrchestrator:
     def _get_db_connection(self):
         """Get a database connection with optional self-healing."""
         if self.db_healer:
-            return self.db_healer.connect(), True
+            # Avoid sharing a single connection across threads; heal, then use a fresh handle.
+            self.db_healer.conn = None
+            return self.db_healer.connect(), False
         return sqlite3.connect(APP_PROJECTS_DB), False
 
     def _finalize_db(self, conn, persistent, commit=False):
@@ -3998,8 +4000,6 @@ class AppBuilderOrchestrator:
         stripped = code.strip()
         if not stripped:
             return True, "Code response was empty."
-        if "```" in code:
-            return True, "Code contained markdown fences."
         if stripped.endswith(("...", "…")):
             return True, "Code appears truncated with ellipsis."
 
@@ -4032,7 +4032,20 @@ class AppBuilderOrchestrator:
     def _validate_generated_code(self, code, filename, min_chars=None):
         """Validate generated code and produce actionable feedback."""
         cleaned = self._normalize_code_output(code)
-        min_required = self.min_code_chars if min_chars is None else max(20, int(min_chars))
+
+        lower_name = (filename or "").lower()
+        if min_chars is None:
+            min_required = self.min_code_chars
+        else:
+            min_required = max(1, int(min_chars))
+
+        # Allow smaller utility/config files to pass validation.
+        if lower_name.endswith("__init__.py"):
+            min_required = min(min_required, 10)
+        elif not lower_name.endswith(".py"):
+            min_required = min(min_required, 20)
+
+        min_required = max(5, min_required)
         if len(cleaned) < min_required:
             return False, cleaned, f"Code too short ({len(cleaned)} chars)."
 
