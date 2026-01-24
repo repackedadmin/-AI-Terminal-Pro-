@@ -200,6 +200,14 @@ DEFAULT_CONFIG = {
     "cpu_threads": max(1, min(8, os.cpu_count() or 1)),
     "cpu_interop_threads": 2,
     "builder_threads": 1,
+    # App Builder quality + self-healing knobs
+    "builder_fast_mode": False,
+    "builder_max_attempts": 3,
+    "builder_min_code_chars": 120,
+    "builder_plan_tokens": 650,
+    "builder_code_tokens": 1600,
+    "builder_review_tokens": 250,
+    "builder_feedback_tokens": 450,
     # Default external editor command (used when creating tools / MCP servers)
     # Example values:
     #   "code"         (VS Code)
@@ -3538,70 +3546,115 @@ class TechLeadAgent(BaseAgent):
     """Breaks down work into development tasks."""
 
     def __init__(self, ai_engine):
-        system_prompt = "You are a Tech Lead. Break projects into numbered tasks."
+        system_prompt = (
+            "You are a Tech Lead. Break projects into numbered, implementation-ready tasks "
+            "that cover the full build from setup to polish."
+        )
         super().__init__("Tech Lead", "TECH_LEAD", system_prompt, ai_engine)
 
     def create_tasks(self, specification, architecture):
         """Create development task list."""
-        # Truncate to avoid timeout
-        spec_short = specification[:500] if len(specification) > 500 else specification
-        arch_short = architecture[:400] if len(architecture) > 400 else architecture
-        context = f"Spec: {spec_short}\nArch: {arch_short}\n\nCreate 3-7 numbered tasks. Format: 1. Task name - brief description"
-        return self.think(context, 400, timeout=90)
+        spec_short = specification[:900] if len(specification) > 900 else specification
+        arch_short = architecture[:700] if len(architecture) > 700 else architecture
+        context = (
+            f"Specification:\n{spec_short}\n\nArchitecture:\n{arch_short}\n\n"
+            "Create 5-9 numbered tasks that deliver a complete, runnable project. "
+            "Include setup/config, core features, error handling, and documentation. "
+            "Each line MUST start with a number followed by a period (e.g., '1.'). "
+            "Format: '1. Task name - brief description and expected files'."
+        )
+        max_tokens = int(self.ai_engine.config.get("builder_feedback_tokens", 450))
+        return self.think(context, max_tokens, timeout=120)
 
 
 class DeveloperAgent(BaseAgent):
     """Plans implementation details for tasks."""
 
     def __init__(self, ai_engine):
-        system_prompt = "You are a Developer. Plan implementation briefly."
+        system_prompt = (
+            "You are a Senior Developer. Produce concise but complete implementation plans "
+            "that enumerate files to create/update, key functions/classes, and acceptance criteria."
+        )
         super().__init__("Developer", "DEVELOPER", system_prompt, ai_engine)
 
-    def plan_task(self, task, specification, architecture, existing_files):
+    def plan_task(self, task, specification, architecture, existing_files, feedback=None):
         """Plan how to implement a task."""
-        # Minimal context for faster processing
-        spec_short = specification[:300] if len(specification) > 300 else specification
-        arch_short = architecture[:200] if len(architecture) > 200 else architecture
-        files_short = existing_files[:150] if len(existing_files) > 150 else existing_files
-        context = f"Task: {task}\nSpec: {spec_short}\nArch: {arch_short}\nExisting: {files_short}\n\nBrief plan: filename, functions to create."
-        return self.think(context, 300, timeout=90)
+        spec_short = specification[:700] if len(specification) > 700 else specification
+        arch_short = architecture[:500] if len(architecture) > 500 else architecture
+        files_short = existing_files[:400] if len(existing_files) > 400 else existing_files
+
+        context = (
+            f"Task:\n{task}\n\nSpecification (excerpt):\n{spec_short}\n\n"
+            f"Architecture (excerpt):\n{arch_short}\n\nExisting files summary:\n{files_short or 'None yet.'}\n\n"
+            "Provide a short plan with the following sections:\n"
+            "- Files: bullet list of files to create/update.\n"
+            "- Steps: 3-6 bullets describing the implementation order.\n"
+            "- Acceptance Criteria: bullets describing how we know the task is complete."
+        )
+        if feedback:
+            context += f"\n\nReviewer/validator feedback to address:\n{feedback[:600]}"
+
+        max_tokens = int(self.ai_engine.config.get("builder_plan_tokens", 650))
+        return self.think(context, max_tokens, timeout=120)
 
 
 class CodeMonkeyAgent(BaseAgent):
     """Writes actual code based on developer's plan."""
 
     def __init__(self, ai_engine):
-        system_prompt = "You are a coder. Write clean, working Python code. Output ONLY code, no explanations."
+        system_prompt = (
+            "You are an expert implementation engineer. Generate complete, runnable code that satisfies "
+            "the plan and does not omit required imports, helper functions, or error handling. "
+            "Output ONLY code."
+        )
         super().__init__("Code Monkey", "CODE_MONKEY", system_prompt, ai_engine)
 
-    def write_code(self, implementation_plan, existing_code=""):
+    def write_code(self, implementation_plan, existing_code="", task_desc="", spec_excerpt="", arch_excerpt="", feedback=None):
         """Write code based on plan."""
-        # Minimal context for faster code generation
-        plan_short = implementation_plan[:400] if len(implementation_plan) > 400 else implementation_plan
-        existing_short = existing_code[:500] if len(existing_code) > 500 else existing_code
+        plan_short = implementation_plan[:900] if len(implementation_plan) > 900 else implementation_plan
+        existing_short = existing_code[:2000] if len(existing_code) > 2000 else existing_code
+        spec_short = spec_excerpt[:800] if len(spec_excerpt) > 800 else spec_excerpt
+        arch_short = arch_excerpt[:600] if len(arch_excerpt) > 600 else arch_excerpt
 
-        context = f"Plan: {plan_short}"
-        if existing_short.strip():
-            context += f"\nContext: {existing_short}"
-        context += "\n\nWrite the Python code (include # File: filename.py at top):"
+        context = (
+            f"Task:\n{task_desc[:400]}\n\nPlan:\n{plan_short}\n\n"
+            f"Specification excerpt:\n{spec_short}\n\nArchitecture excerpt:\n{arch_short}\n\n"
+            "Relevant existing code (may be empty):\n"
+            f"{existing_short if existing_short.strip() else 'None provided.'}\n\n"
+            "Requirements:\n"
+            "1) Start with '# File: path/filename.py'.\n"
+            "2) Provide the full file contents, not a diff.\n"
+            "3) Ensure the module is self-contained and runnable.\n"
+            "4) Do not include markdown fences or explanations."
+        )
+        if feedback:
+            context += f"\n\nFix the following issues noted by review/validation:\n{feedback[:800]}"
 
-        # Longer timeout for code generation (3 minutes)
-        return self.think(context, 800, timeout=180)
+        max_tokens = int(self.ai_engine.config.get("builder_code_tokens", 1600))
+        return self.think(context, max_tokens, timeout=240)
 
 
 class ReviewerAgent(BaseAgent):
     """Reviews code for issues."""
 
     def __init__(self, ai_engine):
-        system_prompt = "You are a Code Reviewer. Reply APPROVED if code looks good, or REJECTED: reason if not."
+        system_prompt = (
+            "You are a strict Code Reviewer. Verify completeness, correctness, and basic robustness. "
+            "Reply with 'APPROVED' only if the code is complete and runnable; otherwise reply "
+            "with 'REJECTED: <clear actionable issues>'."
+        )
         super().__init__("Reviewer", "REVIEWER", system_prompt, ai_engine)
 
     def review_code(self, code, task, implementation_plan):
         """Review code quality - fast review."""
-        # Quick review - check first part of code
-        code_sample = code[:800] if len(code) > 800 else code
-        context = f"Task: {task[:100]}\nCode:\n{code_sample}\n\nReview: APPROVED or REJECTED: reason"
-        return self.think(context, 150, timeout=60)
+        code_sample = code[:2000] if len(code) > 2000 else code
+        context = (
+            f"Task:\n{task[:300]}\n\nImplementation plan excerpt:\n{implementation_plan[:500]}\n\n"
+            f"Code excerpt:\n{code_sample}\n\n"
+            "Decide: APPROVED or REJECTED with concrete fixes."
+        )
+        max_tokens = int(self.ai_engine.config.get("builder_review_tokens", 250))
+        return self.think(context, max_tokens, timeout=90)
 
 
 class TroubleshooterAgent(BaseAgent):
@@ -3672,14 +3725,18 @@ class AppBuilderOrchestrator:
         self.tech_writer = TechnicalWriterAgent(ai_engine)
         
         self.builder_threads = max(1, int(ai_engine.config.get("builder_threads", 1)))
-        self.fast_mode = ai_engine.config.get("builder_fast_mode", True)  # Fast mode enabled by default
+        self.fast_mode = bool(ai_engine.config.get("builder_fast_mode", False))
+        self.max_attempts = max(1, int(ai_engine.config.get("builder_max_attempts", 3)))
+        self.min_code_chars = max(40, int(ai_engine.config.get("builder_min_code_chars", 120)))
+        self.heal_logger = SelfHealingLogger() if SELF_HEALING_AVAILABLE else None
+        self.db_healer = DatabaseHealer(APP_PROJECTS_DB) if SELF_HEALING_AVAILABLE else None
         self.db_lock = threading.Lock()
         self.current_project = None
         self.init_app_database()
     
     def init_app_database(self):
         """Initialize app projects database."""
-        conn = sqlite3.connect(APP_PROJECTS_DB)
+        conn, persistent = self._get_db_connection()
         cursor = conn.cursor()
         
         # App projects table
@@ -3729,19 +3786,19 @@ class AppBuilderOrchestrator:
             FOREIGN KEY (task_id) REFERENCES app_tasks(id)
         )''')
         
-        conn.commit()
-        conn.close()
+        self._finalize_db(conn, persistent, commit=True)
     
     def create_project(self, name, description):
         """Create a new app project."""
-        conn = sqlite3.connect(APP_PROJECTS_DB)
+        conn, persistent = self._get_db_connection()
         cursor = conn.cursor()
+        success = False
         
         try:
             cursor.execute("INSERT INTO app_projects (name, description, status) VALUES (?, ?, ?)",
                           (name, description, "specification"))
             project_id = cursor.lastrowid
-            conn.commit()
+            success = True
             
             # Create project directory
             project_dir = os.path.join(APPS_DIR, name)
@@ -3752,15 +3809,15 @@ class AppBuilderOrchestrator:
             print(f"{Colors.BRIGHT_RED}✗ Project '{name}' already exists.{Colors.RESET}")
             return None
         finally:
-            conn.close()
+            self._finalize_db(conn, persistent, commit=success)
     
     def get_project(self, project_id):
         """Get project details."""
-        conn = sqlite3.connect(APP_PROJECTS_DB)
+        conn, persistent = self._get_db_connection()
         cursor = conn.cursor()
         cursor.execute("SELECT * FROM app_projects WHERE id=?", (project_id,))
         project = cursor.fetchone()
-        conn.close()
+        self._finalize_db(conn, persistent)
         return project
     
     def update_project_field(self, project_id, field, value):
@@ -3769,12 +3826,11 @@ class AppBuilderOrchestrator:
         if lock:
             lock.acquire()
         try:
-            conn = sqlite3.connect(APP_PROJECTS_DB)
+            conn, persistent = self._get_db_connection()
             cursor = conn.cursor()
             cursor.execute(f"UPDATE app_projects SET {field}=?, updated_at=CURRENT_TIMESTAMP WHERE id=?", 
                           (value, project_id))
-            conn.commit()
-            conn.close()
+            self._finalize_db(conn, persistent, commit=True)
         finally:
             if lock:
                 lock.release()
@@ -3785,7 +3841,7 @@ class AppBuilderOrchestrator:
         if lock:
             lock.acquire()
         try:
-            conn = sqlite3.connect(APP_PROJECTS_DB)
+            conn, persistent = self._get_db_connection()
             cursor = conn.cursor()
             
             # Check if file exists
@@ -3799,8 +3855,7 @@ class AppBuilderOrchestrator:
                 cursor.execute("INSERT INTO app_files (project_id, filepath, content) VALUES (?, ?, ?)",
                               (project_id, filepath, content))
             
-            conn.commit()
-            conn.close()
+            self._finalize_db(conn, persistent, commit=True)
         finally:
             if lock:
                 lock.release()
@@ -3818,12 +3873,19 @@ class AppBuilderOrchestrator:
     
     def get_project_files(self, project_id):
         """Get all files for a project."""
-        conn = sqlite3.connect(APP_PROJECTS_DB)
-        cursor = conn.cursor()
-        cursor.execute("SELECT filepath, content FROM app_files WHERE project_id=?", (project_id,))
-        files = cursor.fetchall()
-        conn.close()
-        return files
+        lock = getattr(self, "db_lock", None)
+        if lock:
+            lock.acquire()
+        try:
+            conn, persistent = self._get_db_connection()
+            cursor = conn.cursor()
+            cursor.execute("SELECT filepath, content FROM app_files WHERE project_id=?", (project_id,))
+            files = cursor.fetchall()
+            self._finalize_db(conn, persistent)
+            return files
+        finally:
+            if lock:
+                lock.release()
     
     def filter_relevant_context(self, task_description, all_files, max_context=5000):
         """Filter relevant files for current task context - optimized for speed."""
@@ -3858,6 +3920,324 @@ class AppBuilderOrchestrator:
                 break
         
         return context
+
+    def _log_heal(self, level, message):
+        """Log self-healing events when available."""
+        if self.heal_logger:
+            self.heal_logger.log(level, message, "app_builder")
+            return
+        prefix = {"warning": "⚠", "error": "✗", "success": "✓", "info": "·"}.get(level, "·")
+        color = (
+            Colors.BRIGHT_RED if level == "error"
+            else Colors.BRIGHT_GREEN if level == "success"
+            else Colors.YELLOW if level == "warning"
+            else Colors.DIM
+        )
+        print(f"{color}{prefix} {message}{Colors.RESET}")
+
+    def _get_db_connection(self):
+        """Get a database connection with optional self-healing."""
+        if self.db_healer:
+            return self.db_healer.connect(), True
+        return sqlite3.connect(APP_PROJECTS_DB), False
+
+    def _finalize_db(self, conn, persistent, commit=False):
+        """Commit/close a database connection safely."""
+        if commit:
+            conn.commit()
+        if not persistent:
+            conn.close()
+
+    def _summarize_files(self, files, max_chars=1200):
+        """Summarize existing files for planning context."""
+        if not files:
+            return "No files yet."
+        parts = []
+        remaining = max_chars
+        for filepath, content in files:
+            snippet = content[:200].replace("\n", " ")
+            entry = f"- {filepath} ({len(content)} chars): {snippet}"
+            if len(entry) > remaining:
+                break
+            parts.append(entry)
+            remaining -= len(entry)
+            if remaining <= 0:
+                break
+        return "\n".join(parts) if parts else "Files exist but summary was truncated."
+
+    def _normalize_code_output(self, code):
+        """Strip markdown fences and normalize whitespace."""
+        if not isinstance(code, str):
+            return ""
+        cleaned = code.strip()
+        if cleaned.startswith("```"):
+            cleaned = re.sub(r"^```[a-zA-Z0-9_+-]*\n?", "", cleaned)
+            cleaned = cleaned.replace("```", "").strip()
+        return cleaned
+
+    def _split_code_blocks(self, code, fallback_filename):
+        """Split multi-file outputs using '# File:' markers."""
+        pattern = re.compile(r"^\s*#\s*File\s*:\s*(.+)$", re.IGNORECASE | re.MULTILINE)
+        matches = list(pattern.finditer(code))
+        if not matches:
+            return [(fallback_filename, code)]
+
+        blocks = []
+        for idx, match in enumerate(matches):
+            filename = match.group(1).strip()
+            start = match.end()
+            end = matches[idx + 1].start() if idx + 1 < len(matches) else len(code)
+            content = code[start:end].strip()
+            if content:
+                blocks.append((filename, content))
+
+        return blocks if blocks else [(fallback_filename, code)]
+
+    def _detect_truncation(self, code):
+        """Heuristics to detect truncated or partial code."""
+        stripped = code.strip()
+        if not stripped:
+            return True, "Code response was empty."
+        if "```" in code:
+            return True, "Code contained markdown fences."
+        if stripped.endswith(("...", "…")):
+            return True, "Code appears truncated with ellipsis."
+
+        tail = stripped.splitlines()[-1].strip().lower()
+        dangling_tokens = {"def", "class", "if", "elif", "else", "for", "while", "try", "except", "with"}
+        if tail in dangling_tokens:
+            return True, f"Code ended with dangling token '{tail}'."
+        if tail.endswith(("=", ":", "(", "[", "{", ",")):
+            return True, "Code appears to end mid-statement."
+
+        triple_quotes = stripped.count('"""') + stripped.count("'''")
+        if triple_quotes % 2 != 0:
+            return True, "Unbalanced triple-quoted string detected."
+
+        return False, ""
+
+    def _syntax_feedback(self, code, filename):
+        """Compile Python code to detect syntax issues."""
+        if not filename.lower().endswith(".py"):
+            return ""
+        try:
+            compile(code, filename, "exec")
+            return ""
+        except SyntaxError as e:
+            line = e.lineno or 0
+            return f"SyntaxError line {line}: {e.msg}"
+        except Exception as e:
+            return f"Compile check failed: {e}"
+
+    def _validate_generated_code(self, code, filename, min_chars=None):
+        """Validate generated code and produce actionable feedback."""
+        cleaned = self._normalize_code_output(code)
+        min_required = self.min_code_chars if min_chars is None else max(20, int(min_chars))
+        if len(cleaned) < min_required:
+            return False, cleaned, f"Code too short ({len(cleaned)} chars)."
+
+        truncated, reason = self._detect_truncation(cleaned)
+        if truncated:
+            return False, cleaned, reason
+
+        syntax_issue = self._syntax_feedback(cleaned, filename)
+        if syntax_issue:
+            return False, cleaned, syntax_issue
+
+        return True, cleaned, ""
+
+    def _extract_task_lines(self, tasks_doc):
+        """Parse tasks from AI output with multiple fallbacks."""
+        lines = []
+        for raw_line in tasks_doc.split("\n"):
+            line = raw_line.strip()
+            if not line:
+                continue
+            match = re.match(r"^\s*(\d+)[\).:-]\s*(.+)$", line)
+            if match:
+                number = match.group(1)
+                desc = match.group(2).strip()
+                lines.append(f"{number}. {desc}")
+                continue
+            bullet = re.match(r"^\s*[-*•]\s*(.+)$", line)
+            if bullet:
+                lines.append(bullet.group(1).strip())
+                continue
+            if line.lower().startswith("task "):
+                lines.append(line)
+        # Normalize bullets into numbered tasks
+        normalized = []
+        for idx, task in enumerate(lines, 1):
+            if re.match(r"^\d+\.\s+", task):
+                normalized.append(task)
+            else:
+                normalized.append(f"{idx}. {task}")
+        return normalized
+
+    def _generate_tasks_with_healing(self, spec, architecture):
+        """Generate tasks with a retry and stricter fallback prompt."""
+        tasks_doc = self.tech_lead.create_tasks(spec, architecture)
+        task_lines = self._extract_task_lines(tasks_doc)
+        if task_lines:
+            return tasks_doc, task_lines
+
+        self._log_heal("warning", "Initial task parsing failed, retrying with stricter instructions.")
+        fallback_prompt = (
+            f"Specification:\n{spec[:900]}\n\nArchitecture:\n{architecture[:700]}\n\n"
+            "Return ONLY a numbered list of 5-9 tasks. Each line must begin with '1.' style numbering."
+        )
+        max_tokens = int(self.ai_engine.config.get("builder_feedback_tokens", 450))
+        tasks_doc = self.tech_lead.think(fallback_prompt, max_tokens, timeout=120)
+        task_lines = self._extract_task_lines(tasks_doc)
+        return tasks_doc, task_lines
+
+    def _save_task_plan(self, task_id, plan):
+        """Persist an implementation plan with recovery."""
+        lock = getattr(self, "db_lock", None)
+        if lock:
+            lock.acquire()
+        try:
+            conn, persistent = self._get_db_connection()
+            cursor = conn.cursor()
+            cursor.execute("UPDATE app_tasks SET implementation_plan=? WHERE id=?", (plan, task_id))
+            self._finalize_db(conn, persistent, commit=True)
+        finally:
+            if lock:
+                lock.release()
+
+    def _record_review(self, project_id, task_id, review_status, feedback):
+        """Persist a review result."""
+        lock = getattr(self, "db_lock", None)
+        if lock:
+            lock.acquire()
+        try:
+            conn, persistent = self._get_db_connection()
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT INTO app_reviews (project_id, task_id, review_result, feedback) VALUES (?, ?, ?, ?)",
+                (project_id, task_id, review_status, feedback[:4000])
+            )
+            self._finalize_db(conn, persistent, commit=True)
+        finally:
+            if lock:
+                lock.release()
+
+    def _mark_task_completed(self, task_id):
+        """Mark a task as completed."""
+        lock = getattr(self, "db_lock", None)
+        if lock:
+            lock.acquire()
+        try:
+            conn, persistent = self._get_db_connection()
+            cursor = conn.cursor()
+            cursor.execute("UPDATE app_tasks SET status='completed' WHERE id=?", (task_id,))
+            self._finalize_db(conn, persistent, commit=True)
+        finally:
+            if lock:
+                lock.release()
+
+    def _run_task_pipeline(self, project_id, task_tuple, spec, architecture, announce=True):
+        """Run a self-healing plan/code/review loop for a task."""
+        task_id, task_num, task_desc, task_status = task_tuple
+        if task_status == "completed":
+            return {"task_num": task_num, "ok": True, "message": "already completed"}
+
+        feedback = ""
+        last_review = ""
+        for attempt in range(1, self.max_attempts + 1):
+            if announce:
+                print(f"{Colors.DIM}Attempt {attempt}/{self.max_attempts}...{Colors.RESET}")
+
+            existing_files = self.get_project_files(project_id)
+            files_context = self._summarize_files(existing_files)
+
+            impl_plan = self.developer.plan_task(task_desc, spec, architecture, files_context, feedback=feedback)
+            if self._is_ai_error(impl_plan):
+                feedback = f"Plan generation failed: {impl_plan[:200]}"
+                self._log_heal("warning", f"Plan generation failed for task {task_num}: {impl_plan[:120]}")
+                continue
+
+            self._save_task_plan(task_id, impl_plan)
+
+            relevant_context = self.filter_relevant_context(task_desc + " " + impl_plan, existing_files)
+            filename = self.extract_filename("", impl_plan, task_desc) or f"task_{task_num}.py"
+
+            code = self.code_monkey.write_code(
+                impl_plan,
+                relevant_context,
+                task_desc=task_desc,
+                spec_excerpt=spec,
+                arch_excerpt=architecture,
+                feedback=feedback or last_review
+            )
+
+            if self._is_ai_error(code):
+                feedback = f"Code generation failed: {code[:200]}"
+                self._log_heal("warning", f"Code generation failed for task {task_num}: {code[:120]}")
+                continue
+
+            filename = self.extract_filename(code, impl_plan, task_desc) or filename
+            valid, cleaned_code, validation_feedback = self._validate_generated_code(code, filename)
+            if not valid:
+                feedback = f"Validation failed: {validation_feedback}"
+                last_review = feedback
+                self._log_heal("warning", f"Validation issue on task {task_num}: {validation_feedback}")
+                continue
+
+            file_blocks = self._split_code_blocks(cleaned_code, filename)
+            validated_blocks = []
+            block_errors = []
+            min_chars = self.min_code_chars if len(file_blocks) == 1 else 40
+            for block_filename, block_content in file_blocks:
+                block_ok, block_cleaned, block_feedback = self._validate_generated_code(
+                    block_content, block_filename, min_chars=min_chars
+                )
+                if not block_ok:
+                    block_errors.append(f"{block_filename}: {block_feedback}")
+                else:
+                    validated_blocks.append((block_filename, block_cleaned))
+
+            if block_errors:
+                feedback = "Validation failed: " + "; ".join(block_errors[:3])
+                last_review = feedback
+                self._log_heal("warning", f"Multi-file validation issue on task {task_num}: {feedback[:160]}")
+                continue
+
+            review_input = (
+                cleaned_code
+                if len(validated_blocks) == 1
+                else "\n\n".join([f"# File: {fname}\n{content}" for fname, content in validated_blocks])
+            )
+
+            review = self.reviewer.review_code(review_input, task_desc, impl_plan)
+            if self._is_ai_error(review):
+                review = "REJECTED: Reviewer failed to provide feedback."
+
+            approved = "APPROVED" in review.upper()
+            review_status = "approved" if approved else "rejected"
+            self._record_review(project_id, task_id, review_status, review)
+
+            if approved:
+                for block_filename, block_content in validated_blocks:
+                    self.save_file(project_id, block_filename, block_content)
+                self._mark_task_completed(task_id)
+                preview = ", ".join([fname for fname, _ in validated_blocks[:3]])
+                if len(validated_blocks) > 3:
+                    preview += ", ..."
+                return {
+                    "task_num": task_num,
+                    "ok": True,
+                    "message": f"saved {len(validated_blocks)} file(s): {preview}",
+                    "review": review
+                }
+
+            feedback = review
+            last_review = review
+            self._log_heal("warning", f"Review rejected task {task_num}: {review[:120]}")
+
+        # Exhausted retries
+        failure_reason = last_review or feedback or "Exceeded retry attempts."
+        return {"task_num": task_num, "ok": False, "message": failure_reason}
     
     def _is_ai_error(self, response):
         """Check if AI response is an error message."""
@@ -3980,7 +4360,7 @@ class AppBuilderOrchestrator:
                 return False, "Missing architecture"
 
             print(f"\n{Colors.BRIGHT_CYAN}[3/5] Tech Lead creating task list...{Colors.RESET}")
-            tasks_doc = self.tech_lead.create_tasks(spec, architecture)
+            tasks_doc, task_lines = self._generate_tasks_with_healing(spec, architecture)
 
             # Validate tasks document
             if self._is_ai_error(tasks_doc):
@@ -3989,36 +4369,27 @@ class AppBuilderOrchestrator:
 
             print(f"\n{Colors.CYAN}Tasks:{Colors.RESET}\n{tasks_doc}\n")
 
-            # Parse and save tasks
-            conn = sqlite3.connect(APP_PROJECTS_DB)
-            cursor = conn.cursor()
-
-            # Enhanced task parsing - handle multiple formats
-            task_lines = []
-            for line in tasks_doc.split('\n'):
-                line = line.strip()
-                if not line:
-                    continue
-                # Match: digits, dashes, bullets, asterisks, "Task X:", etc.
-                if (line[0].isdigit() or
-                    line.startswith('-') or
-                    line.startswith('*') or
-                    line.startswith('•') or
-                    line.lower().startswith('task')):
-                    task_lines.append(line)
-
             if not task_lines:
                 print(f"{Colors.BRIGHT_RED}✗ Failed to parse tasks from AI output.{Colors.RESET}")
                 print(f"{Colors.YELLOW}Please try again or manually add tasks.{Colors.RESET}")
-                conn.close()
                 return False, "No tasks could be parsed"
 
-            for i, task_line in enumerate(task_lines, 1):
-                cursor.execute("INSERT INTO app_tasks (project_id, task_number, description, status) VALUES (?, ?, ?, ?)",
-                              (project_id, i, task_line, "pending"))
-
-            conn.commit()
-            conn.close()
+            lock = getattr(self, "db_lock", None)
+            if lock:
+                lock.acquire()
+            try:
+                conn, persistent = self._get_db_connection()
+                cursor = conn.cursor()
+                cursor.execute("DELETE FROM app_tasks WHERE project_id=?", (project_id,))
+                for i, task_line in enumerate(task_lines, 1):
+                    cursor.execute(
+                        "INSERT INTO app_tasks (project_id, task_number, description, status) VALUES (?, ?, ?, ?)",
+                        (project_id, i, task_line, "pending")
+                    )
+                self._finalize_db(conn, persistent, commit=True)
+            finally:
+                if lock:
+                    lock.release()
 
             self.update_project_field(project_id, "status", "development")
             print(f"\n{Colors.BRIGHT_GREEN}✓ {len(task_lines)} tasks created!{Colors.RESET}")
@@ -4038,13 +4409,13 @@ class AppBuilderOrchestrator:
         architecture = project[4]
         builder_threads = getattr(self, "builder_threads", 1)
 
-        conn = sqlite3.connect(APP_PROJECTS_DB)
+        conn, persistent = self._get_db_connection()
         cursor = conn.cursor()
 
         cursor.execute("SELECT id, task_number, description, status FROM app_tasks WHERE project_id=? ORDER BY task_number",
                       (project_id,))
         tasks = cursor.fetchall()
-        conn.close()
+        self._finalize_db(conn, persistent)
 
         # Check if there are any tasks to develop
         if not tasks:
@@ -4057,6 +4428,7 @@ class AppBuilderOrchestrator:
             self._develop_tasks_threaded(project_id, tasks, spec, architecture, builder_threads)
             return
 
+        failed_tasks = []
         for task_id, task_num, task_desc, task_status in tasks:
             if task_status == "completed":
                 print(f"{Colors.DIM}[Task {task_num}] Already completed: {task_desc[:50]}...{Colors.RESET}")
@@ -4066,111 +4438,28 @@ class AppBuilderOrchestrator:
             print(f"{Colors.BRIGHT_YELLOW}[Task {task_num}/{len(tasks)}] {task_desc}{Colors.RESET}")
             print(f"{Colors.BRIGHT_CYAN}{Colors.BOLD}{'='*79}{Colors.RESET}\n")
 
-            # Get existing files
-            existing_files = self.get_project_files(project_id)
-            files_context = "\n".join([f"{fp}: {len(content)} chars" for fp, content in existing_files])
-
-            # Developer plans implementation
-            print(f"{Colors.BRIGHT_CYAN}[4/5] Developer planning implementation...{Colors.RESET}")
-            impl_plan = self.developer.plan_task(task_desc, spec, architecture, files_context)
-
-            # Validate plan
-            if self._is_ai_error(impl_plan):
-                print(f"{Colors.BRIGHT_RED}✗ AI Error generating plan: {impl_plan[:100]}...{Colors.RESET}")
-                retry = input(f"\n{Colors.BRIGHT_GREEN}Retry this task? [Y/n]: {Colors.RESET}").strip().lower()
-                if retry != 'n':
-                    continue
-                else:
-                    print(f"{Colors.YELLOW}Task skipped.{Colors.RESET}")
-                    continue
-
-            print(f"\n{Colors.CYAN}Implementation Plan:{Colors.RESET}\n{impl_plan[:500]}{'...' if len(impl_plan) > 500 else ''}\n")
-
-            # Save implementation plan
-            conn = sqlite3.connect(APP_PROJECTS_DB)
-            cursor = conn.cursor()
-            cursor.execute("UPDATE app_tasks SET implementation_plan=? WHERE id=?", (impl_plan, task_id))
-            conn.commit()
-            conn.close()
-
-            # Code Monkey writes code
-            print(f"{Colors.BRIGHT_CYAN}[5/5] Code Monkey writing code...{Colors.RESET}")
-
-            # Get relevant context
-            relevant_context = self.filter_relevant_context(task_desc + " " + impl_plan, existing_files)
-
-            code = self.code_monkey.write_code(impl_plan, relevant_context)
-
-            # Validate code
-            if self._is_ai_error(code) or len(code.strip()) < 20:
-                print(f"{Colors.BRIGHT_RED}✗ AI Error generating code: {code[:100]}...{Colors.RESET}")
-                retry = input(f"\n{Colors.BRIGHT_GREEN}Retry this task? [Y/n]: {Colors.RESET}").strip().lower()
-                if retry != 'n':
-                    continue
-                else:
-                    print(f"{Colors.YELLOW}Task skipped.{Colors.RESET}")
-                    continue
-
-            print(f"\n{Colors.CYAN}Code Generated:{Colors.RESET}\n{code[:500]}{'...' if len(code) > 500 else ''}\n")
-
-            # Reviewer reviews code
-            print(f"{Colors.BRIGHT_CYAN}Reviewer checking code...{Colors.RESET}")
-            review = self.reviewer.review_code(code, task_desc, impl_plan)
-            print(f"\n{Colors.CYAN}Review:{Colors.RESET} {review}\n")
-
-            # Check if approved
-            if "APPROVED" in review.upper():
-                # Extract filename from code or plan
-                filename = self.extract_filename(code, impl_plan, task_desc)
-                if filename:
-                    self.save_file(project_id, filename, code)
-                    print(f"{Colors.BRIGHT_GREEN}✓ Code approved and saved: {filename}{Colors.RESET}")
-                else:
-                    # Ask user for filename
-                    filename = input(f"{Colors.BRIGHT_GREEN}Enter filename for this code: {Colors.RESET}").strip()
-                    if filename:
-                        self.save_file(project_id, filename, code)
-                        print(f"{Colors.BRIGHT_GREEN}✓ Code saved: {filename}{Colors.RESET}")
-                    else:
-                        # Auto-generate filename
-                        filename = f"task_{task_num}.py"
-                        self.save_file(project_id, filename, code)
-                        print(f"{Colors.BRIGHT_GREEN}✓ Code saved: {filename}{Colors.RESET}")
-
-                # Mark task as completed
-                conn = sqlite3.connect(APP_PROJECTS_DB)
-                cursor = conn.cursor()
-                cursor.execute("UPDATE app_tasks SET status='completed' WHERE id=?", (task_id,))
-                cursor.execute("INSERT INTO app_reviews (project_id, task_id, review_result, feedback) VALUES (?, ?, ?, ?)",
-                              (project_id, task_id, "approved", review))
-                conn.commit()
-                conn.close()
-
+            result = self._run_task_pipeline(project_id, (task_id, task_num, task_desc, task_status), spec, architecture)
+            if result.get("ok"):
+                print(f"{Colors.BRIGHT_GREEN}✓ Task {task_num} {result.get('message', 'completed')}{Colors.RESET}")
             else:
-                print(f"{Colors.BRIGHT_RED}✗ Code rejected. Needs revision.{Colors.RESET}")
-                print(f"{Colors.YELLOW}Feedback:{Colors.RESET} {review}")
+                failed_tasks.append((task_num, task_desc, result.get("message", "failed")))
+                print(f"{Colors.YELLOW}⚠ Task {task_num} needs attention: {result.get('message', '')[:200]}{Colors.RESET}")
 
-                # Save review
-                conn = sqlite3.connect(APP_PROJECTS_DB)
-                cursor = conn.cursor()
-                cursor.execute("INSERT INTO app_reviews (project_id, task_id, review_result, feedback) VALUES (?, ?, ?, ?)",
-                              (project_id, task_id, "rejected", review))
-                conn.commit()
-                conn.close()
+        conn, persistent = self._get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM app_tasks WHERE project_id=? AND status!='completed'", (project_id,))
+        remaining = cursor.fetchone()[0]
+        self._finalize_db(conn, persistent)
 
-                # Ask user if they want to retry or skip
-                retry = input(f"\n{Colors.BRIGHT_GREEN}Retry this task? [Y/n]: {Colors.RESET}").strip().lower()
-                if retry != 'n':
-                    # Re-run this task (will be picked up in next iteration)
-                    continue
-                else:
-                    print(f"{Colors.YELLOW}Task skipped. You can revisit it later.{Colors.RESET}")
-
-            input(f"\n{Colors.DIM}Press Enter for next task...{Colors.RESET}")
-
-        # All tasks processed
-        self.update_project_field(project_id, "status", "completed")
-        print(f"\n{Colors.BRIGHT_GREEN}{Colors.BOLD}✓ All tasks completed!{Colors.RESET}")
+        if remaining == 0:
+            self.update_project_field(project_id, "status", "completed")
+            print(f"\n{Colors.BRIGHT_GREEN}{Colors.BOLD}✓ All tasks completed!{Colors.RESET}")
+        else:
+            self.update_project_field(project_id, "status", "development")
+            print(f"\n{Colors.YELLOW}⚠ {remaining} task(s) remain pending after self-healing attempts.{Colors.RESET}")
+            for task_num, task_desc, reason in failed_tasks[:5]:
+                print(f"{Colors.DIM}  - Task {task_num}: {task_desc[:60]}... ({reason[:80]}){Colors.RESET}")
+            return
 
         # Generate documentation
         print(f"\n{Colors.BRIGHT_CYAN}Technical Writer creating documentation...{Colors.RESET}")
@@ -4210,67 +4499,15 @@ class AppBuilderOrchestrator:
         
         print(f"\n{Colors.BRIGHT_CYAN}Threaded mode enabled for task execution "
               f"({builder_threads} workers; device: {self.ai_engine.device}).{Colors.RESET}")
-        
-        lock = getattr(self, "db_lock", None)
         total_tasks = len(pending_tasks)
         
         def worker(task_tuple):
-            task_id, task_num, task_desc, _ = task_tuple
             try:
-                existing_files = self.get_project_files(project_id)
-                files_context = "\n".join([f"{fp}: {len(content)} chars" for fp, content in existing_files])
-                
-                impl_plan = self.developer.plan_task(task_desc, spec, architecture, files_context)
-                
-                # Save implementation plan
-                if lock:
-                    lock.acquire()
-                try:
-                    conn = sqlite3.connect(APP_PROJECTS_DB)
-                    cursor = conn.cursor()
-                    cursor.execute("UPDATE app_tasks SET implementation_plan=? WHERE id=?", (impl_plan, task_id))
-                    conn.commit()
-                    conn.close()
-                finally:
-                    if lock:
-                        lock.release()
-                
-                relevant_context = self.filter_relevant_context(task_desc + " " + impl_plan, existing_files)
-                code = self.code_monkey.write_code(impl_plan, relevant_context)
-                # Faster review for threaded mode
-                review = self.reviewer.review_code(code, task_desc, impl_plan)
-                
-                approved = "APPROVED" in review.upper()
-                filename = self.extract_filename(code, impl_plan, task_desc) or f"task_{task_num}.py"
-                
-                if lock:
-                    lock.acquire()
-                try:
-                    conn = sqlite3.connect(APP_PROJECTS_DB)
-                    cursor = conn.cursor()
-                    
-                    # Persist review
-                    review_status = "approved" if approved else "rejected"
-                    cursor.execute(
-                        "INSERT INTO app_reviews (project_id, task_id, review_result, feedback) VALUES (?, ?, ?, ?)",
-                        (project_id, task_id, review_status, review)
-                    )
-                    
-                    if approved:
-                        self.save_file(project_id, filename, code)
-                        cursor.execute("UPDATE app_tasks SET status='completed' WHERE id=?", (task_id,))
-                    
-                    conn.commit()
-                    conn.close()
-                finally:
-                    if lock:
-                        lock.release()
-                
-                if approved:
-                    return task_num, True, f"saved to {filename}"
-                return task_num, False, f"requires fixes (review saved)"
-            
+                result = self._run_task_pipeline(project_id, task_tuple, spec, architecture, announce=False)
+                return result.get("task_num"), result.get("ok"), result.get("message", "")
             except Exception as e:
+                task_num = task_tuple[1]
+                self._log_heal("error", f"Threaded task {task_num} crashed: {e}")
                 return task_num, False, f"error: {e}"
         
         completed = 0
@@ -4283,11 +4520,11 @@ class AppBuilderOrchestrator:
                 print(f"{status_color}[Task {task_num}/{total_tasks}]{Colors.RESET} {message}")
         
         # Finalize project if all tasks are done
-        conn = sqlite3.connect(APP_PROJECTS_DB)
+        conn, persistent = self._get_db_connection()
         cursor = conn.cursor()
         cursor.execute("SELECT COUNT(*) FROM app_tasks WHERE project_id=? AND status!='completed'", (project_id,))
         remaining = cursor.fetchone()[0]
-        conn.close()
+        self._finalize_db(conn, persistent)
         
         if remaining == 0:
             self.update_project_field(project_id, "status", "completed")
@@ -4300,9 +4537,13 @@ class AppBuilderOrchestrator:
             
             project = self.get_project(project_id)
             docs = self.tech_writer.write_documentation(project[1], spec, architecture, codebase_summary)
-            self.save_file(project_id, "README.md", docs)
-            print(f"{Colors.BRIGHT_GREEN}✓ Documentation saved: README.md{Colors.RESET}")
+            if not self._is_ai_error(docs):
+                self.save_file(project_id, "README.md", docs)
+                print(f"{Colors.BRIGHT_GREEN}✓ Documentation saved: README.md{Colors.RESET}")
+            else:
+                print(f"{Colors.YELLOW}⚠ Failed to generate documentation.{Colors.RESET}")
         else:
+            self.update_project_field(project_id, "status", "development")
             print(f"{Colors.YELLOW}⚠ Threaded run finished with {remaining} task(s) still pending.{Colors.RESET}")
     
     def extract_filename(self, code, plan, task):
