@@ -2430,12 +2430,13 @@ class AIEngine:
             except:
                 print(f"{Colors.YELLOW}[WARNING]{Colors.RESET} Ollama is not running on localhost:11434.")
 
-    def generate(self, prompt):
+    def generate(self, prompt, timeout=180):
+        """Generate AI response with configurable timeout."""
         if self.backend == "huggingface":
             inputs = self.tokenizer(prompt, return_tensors="pt", truncation=True, max_length=2048).to(self.device)
             with torch.no_grad():
                 out = self.model.generate(
-                    **inputs, 
+                    **inputs,
                     max_new_tokens=self.config.get("max_response_tokens"),
                     do_sample=True,
                     temperature=self.config.get("temperature"),
@@ -2447,10 +2448,10 @@ class AIEngine:
             # Stop sequence trimming
             if "You:" in response: response = response.split("You:")[0]
             return response.strip()
-            
+
         elif self.backend == "ollama":
             try:
-                # Use resilient request with self-healing
+                # Use resilient request with self-healing and configurable timeout
                 res = resilient_request(
                     'post',
                     "http://localhost:11434/api/generate",
@@ -2463,9 +2464,9 @@ class AIEngine:
                             "num_predict": self.config.get("max_response_tokens")
                         }
                     },
-                    timeout=90,
+                    timeout=timeout,
                     max_retries=3,
-                    retry_delay=2.0
+                    retry_delay=3.0
                 )
                 if res.status_code == 200:
                     return res.json()['response'].strip()
@@ -3444,69 +3445,64 @@ class ExtensionManager:
 
 class BaseAgent:
     """Base class for all AI agents."""
-    
+
     def __init__(self, name, role, system_prompt, ai_engine):
         self.name = name
         self.role = role
         self.system_prompt = system_prompt
         self.ai_engine = ai_engine
-    
-    def think(self, context, max_tokens=500):
-        """Generate response based on context."""
-        prompt = f"{self.system_prompt}\n\nContext:\n{context}\n\n{self.role} Response:"
-        
-        # Temporarily adjust max tokens for this agent
+
+    def think(self, context, max_tokens=500, timeout=120):
+        """Generate response based on context with configurable timeout."""
+        # Streamlined prompt format for faster processing
+        prompt = f"{self.system_prompt}\n\n{context}\n\nResponse:"
+
+        # Temporarily adjust settings for this agent
         original_max = self.ai_engine.config.get('max_response_tokens', 250)
         self.ai_engine.config['max_response_tokens'] = max_tokens
-        
-        response = self.ai_engine.generate(prompt)
-        
+
+        response = self.ai_engine.generate(prompt, timeout=timeout)
+
         # Restore original
         self.ai_engine.config['max_response_tokens'] = original_max
-        
+
         return response
 
 
 class SpecificationWriterAgent(BaseAgent):
     """Clarifies requirements and writes specifications."""
-    
+
     def __init__(self, ai_engine):
-        system_prompt = (
-            "You are a Specification Writer. Your job is to understand project requirements deeply. "
-            "Ask clarifying questions if the description is vague. Write clear, detailed specifications. "
-            "Output format: questions OR final specification document."
-        )
+        system_prompt = "You are a Specification Writer. Write clear, concise specifications."
         super().__init__("Specification Writer", "SPEC_WRITER", system_prompt, ai_engine)
-    
+
     def analyze_description(self, app_name, description):
         """Analyze if description is sufficient."""
-        context = f"App: {app_name}\nDesc: {description}\n\nClear? If not, list key questions (max 3)."
-        return self.think(context, 200)
-    
+        context = f"App: {app_name}\nDescription: {description}\n\nIs this clear enough to build? If not, list 1-3 key questions."
+        return self.think(context, 150, timeout=60)
+
     def write_specification(self, app_name, description, qa_pairs=None):
         """Write final specification."""
-        context = f"App: {app_name}\nDesc: {description}\n"
+        context = f"App: {app_name}\nDescription: {description}"
         if qa_pairs:
-            context += "\nQ&A:\n" + "\n".join([f"Q: {q}\nA: {a}" for q, a in qa_pairs])
-        context += "\n\nWrite concise specification (key features, requirements, tech constraints)."
-        return self.think(context, 600)
+            context += "\nAnswers: " + "; ".join([f"{q}: {a}" for q, a in qa_pairs])
+        context += "\n\nWrite a brief specification: features, requirements, constraints."
+        return self.think(context, 400, timeout=90)
 
 
 class ArchitectAgent(BaseAgent):
     """Designs architecture and checks dependencies."""
-    
+
     def __init__(self, ai_engine):
-        system_prompt = (
-            "You are a Software Architect. Design system architecture, choose technologies, "
-            "list required dependencies. Be specific about versions and installation commands. "
-            "Consider scalability, maintainability, and best practices."
-        )
+        system_prompt = "You are a Software Architect. Design simple, practical architectures."
         super().__init__("Architect", "ARCHITECT", system_prompt, ai_engine)
-    
+
     def design_architecture(self, specification):
         """Design system architecture."""
-        context = f"Spec:\n{specification}\n\nDesign architecture: tech stack, key dependencies (pip install commands), folder structure. Be concise."
-        return self.think(context, 700)
+        # Truncate spec to avoid timeout
+        spec_short = specification[:600] if len(specification) > 600 else specification
+        context = f"Spec: {spec_short}\n\nDesign: tech stack, pip dependencies, folder structure. Keep it simple."
+        return self.think(context, 500, timeout=90)
     
     def check_and_install_dependencies(self, architecture):
         """Parse architecture and install dependencies."""
@@ -3540,78 +3536,72 @@ class ArchitectAgent(BaseAgent):
 
 class TechLeadAgent(BaseAgent):
     """Breaks down work into development tasks."""
-    
+
     def __init__(self, ai_engine):
-        system_prompt = (
-            "You are a Tech Lead. Break down projects into specific, actionable development tasks. "
-            "Each task should be clear, focused, and achievable. Order tasks logically (dependencies first). "
-            "Format: numbered list with task name and brief description."
-        )
+        system_prompt = "You are a Tech Lead. Break projects into numbered tasks."
         super().__init__("Tech Lead", "TECH_LEAD", system_prompt, ai_engine)
-    
+
     def create_tasks(self, specification, architecture):
         """Create development task list."""
-        context = f"Spec:\n{specification[:800]}\n\nArch:\n{architecture[:600]}\n\nCreate numbered task list (5-10 tasks, ordered by dependencies)."
-        return self.think(context, 600)
+        # Truncate to avoid timeout
+        spec_short = specification[:500] if len(specification) > 500 else specification
+        arch_short = architecture[:400] if len(architecture) > 400 else architecture
+        context = f"Spec: {spec_short}\nArch: {arch_short}\n\nCreate 3-7 numbered tasks. Format: 1. Task name - brief description"
+        return self.think(context, 400, timeout=90)
 
 
 class DeveloperAgent(BaseAgent):
     """Plans implementation details for tasks."""
-    
+
     def __init__(self, ai_engine):
-        system_prompt = (
-            "You are a Senior Developer. For each task, write detailed implementation notes. "
-            "Describe what files to create/modify, what functions/classes to add, what logic is needed. "
-            "Be specific but write in human-readable form (not code yet)."
-        )
+        system_prompt = "You are a Developer. Plan implementation briefly."
         super().__init__("Developer", "DEVELOPER", system_prompt, ai_engine)
-    
+
     def plan_task(self, task, specification, architecture, existing_files):
         """Plan how to implement a task."""
-        # Truncate context to speed up processing
-        spec_summary = specification[:500] if len(specification) > 500 else specification
-        arch_summary = architecture[:400] if len(architecture) > 400 else architecture
-        files_summary = existing_files[:300] if len(existing_files) > 300 else existing_files
-        context = f"Task: {task}\n\nSpec: {spec_summary}\nArch: {arch_summary}\nFiles: {files_summary}\n\nBrief implementation plan (what to create/modify)."
-        return self.think(context, 500)
+        # Minimal context for faster processing
+        spec_short = specification[:300] if len(specification) > 300 else specification
+        arch_short = architecture[:200] if len(architecture) > 200 else architecture
+        files_short = existing_files[:150] if len(existing_files) > 150 else existing_files
+        context = f"Task: {task}\nSpec: {spec_short}\nArch: {arch_short}\nExisting: {files_short}\n\nBrief plan: filename, functions to create."
+        return self.think(context, 300, timeout=90)
 
 
 class CodeMonkeyAgent(BaseAgent):
     """Writes actual code based on developer's plan."""
-    
+
     def __init__(self, ai_engine):
-        system_prompt = (
-            "You are a Code Monkey. Implement code based on the Developer's plan. "
-            "Write clean, commented, production-ready code. Follow best practices and PEP 8 (for Python). "
-            "Output only the code, no explanations unless in comments."
-        )
+        system_prompt = "You are a coder. Write clean, working Python code. Output ONLY code, no explanations."
         super().__init__("Code Monkey", "CODE_MONKEY", system_prompt, ai_engine)
-    
+
     def write_code(self, implementation_plan, existing_code=""):
         """Write code based on plan."""
-        # Limit existing code context to speed up
-        existing_summary = existing_code[:2000] if len(existing_code) > 2000 else existing_code
-        context = f"Plan:\n{implementation_plan}\n\nExisting:\n{existing_summary}\n\nWrite production-ready code (complete, commented, PEP 8):"
-        return self.think(context, 1200)
+        # Minimal context for faster code generation
+        plan_short = implementation_plan[:400] if len(implementation_plan) > 400 else implementation_plan
+        existing_short = existing_code[:500] if len(existing_code) > 500 else existing_code
+
+        context = f"Plan: {plan_short}"
+        if existing_short.strip():
+            context += f"\nContext: {existing_short}"
+        context += "\n\nWrite the Python code (include # File: filename.py at top):"
+
+        # Longer timeout for code generation (3 minutes)
+        return self.think(context, 800, timeout=180)
 
 
 class ReviewerAgent(BaseAgent):
     """Reviews code for issues."""
-    
+
     def __init__(self, ai_engine):
-        system_prompt = (
-            "You are a Code Reviewer. Review code for bugs, bad practices, security issues, and logic errors. "
-            "Be critical but constructive. If code is good, approve it. If not, explain what needs fixing. "
-            "Format: 'APPROVED' or 'REJECTED: [reasons]'"
-        )
+        system_prompt = "You are a Code Reviewer. Reply APPROVED if code looks good, or REJECTED: reason if not."
         super().__init__("Reviewer", "REVIEWER", system_prompt, ai_engine)
-    
+
     def review_code(self, code, task, implementation_plan):
-        """Review code quality - optimized for speed."""
-        # Truncate code for faster review (review first 1500 chars typically enough)
-        code_sample = code[:1500] if len(code) > 1500 else code
-        context = f"Task: {task}\nPlan: {implementation_plan[:300]}\nCode:\n{code_sample}\n\nQuick review: APPROVED or REJECTED: [issue]"
-        return self.think(context, 300)
+        """Review code quality - fast review."""
+        # Quick review - check first part of code
+        code_sample = code[:800] if len(code) > 800 else code
+        context = f"Task: {task[:100]}\nCode:\n{code_sample}\n\nReview: APPROVED or REJECTED: reason"
+        return self.think(context, 150, timeout=60)
 
 
 class TroubleshooterAgent(BaseAgent):
@@ -3649,21 +3639,18 @@ class DebuggerAgent(BaseAgent):
 
 class TechnicalWriterAgent(BaseAgent):
     """Writes documentation."""
-    
+
     def __init__(self, ai_engine):
-        system_prompt = (
-            "You are a Technical Writer. Write clear, comprehensive documentation. "
-            "Include: overview, installation, usage, API docs, examples. Use markdown format."
-        )
+        system_prompt = "You are a Technical Writer. Write brief README.md documentation in markdown."
         super().__init__("Technical Writer", "TECH_WRITER", system_prompt, ai_engine)
-    
+
     def write_documentation(self, project_name, specification, architecture, codebase_summary):
-        """Write project documentation - optimized."""
-        # Truncate inputs for faster generation
-        spec_summary = specification[:600] if len(specification) > 600 else specification
-        arch_summary = architecture[:500] if len(architecture) > 500 else architecture
-        context = f"Project: {project_name}\n\nSpec: {spec_summary}\nArch: {arch_summary}\nFiles: {codebase_summary[:400]}\n\nWrite concise README (overview, install, usage, examples):"
-        return self.think(context, 1000)
+        """Write project documentation - fast."""
+        spec_short = specification[:300] if len(specification) > 300 else specification
+        arch_short = architecture[:200] if len(architecture) > 200 else architecture
+        files_short = codebase_summary[:200] if len(codebase_summary) > 200 else codebase_summary
+        context = f"Project: {project_name}\nSpec: {spec_short}\nArch: {arch_short}\nFiles: {files_short}\n\nWrite brief README: overview, install, usage."
+        return self.think(context, 500, timeout=90)
 
 
 class AppBuilderOrchestrator:
@@ -10408,12 +10395,13 @@ class LocalAIEngine:
                 print(f"{Colors.YELLOW}Start Ollama with: ollama serve{Colors.RESET}")
                 raise Exception("Ollama backend not available")
 
-    def generate(self, prompt):
+    def generate(self, prompt, timeout=180):
+        """Generate AI response with configurable timeout."""
         if self.backend == "huggingface":
             inputs = self.tokenizer(prompt, return_tensors="pt", truncation=True, max_length=2048).to(self.device)
             with torch.no_grad():
                 out = self.model.generate(
-                    **inputs, 
+                    **inputs,
                     max_new_tokens=min(self.config.get("max_response_tokens", 200), 200),  # Reduced for performance
                     do_sample=True,
                     temperature=self.config.get("temperature", 0.7),
@@ -10423,11 +10411,11 @@ class LocalAIEngine:
             response = full[len(prompt):].strip()
             if "You:" in response: response = response.split("You:")[0]
             return response.strip()
-            
+
         elif self.backend == "ollama":
             try:
                 # Use streaming for faster response and progress feedback
-                max_tokens = min(self.config.get("max_response_tokens", 200), 200)  # Reduced for low-end PCs
+                max_tokens = self.config.get("max_response_tokens", 200)
 
                 # Use resilient_request with self-healing for better reliability
                 response = resilient_request(
@@ -10443,9 +10431,9 @@ class LocalAIEngine:
                         }
                     },
                     stream=True,
-                    timeout=90,  # Increased timeout for slower models
+                    timeout=timeout,  # Configurable timeout
                     max_retries=3,
-                    retry_delay=2.0
+                    retry_delay=3.0
                 )
 
                 if response.status_code != 200:
@@ -10472,7 +10460,7 @@ class LocalAIEngine:
                 return result
 
             except requests.exceptions.Timeout:
-                return "Request timed out after 90 seconds. The model may be slow. Try a shorter question or check Ollama is running properly."
+                return f"Request timed out after {timeout} seconds. The model may be slow."
             except requests.exceptions.ConnectionError:
                 return "Cannot connect to Ollama. Make sure Ollama is running: ollama serve"
             except Exception as e:
