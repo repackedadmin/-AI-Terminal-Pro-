@@ -1,6 +1,6 @@
 # 🛡️ AI Terminal Pro 🛡️
 
-A **privacy-first**, terminal-based AI assistant you actually control. Run LLMs locally via **Ollama** or through self-hosted endpoints like **Hugging Face**, no cloud lock-in, no data collection, no nonsense.
+A **privacy-first**, terminal-based AI assistant you actually control. Run LLMs locally via **Ollama**, **llama.cpp servers**, or through self-hosted endpoints like **Hugging Face**, no cloud lock-in, no data collection, no nonsense.
 
 Built for **developers**,
 Built for **power users**,
@@ -14,8 +14,8 @@ Built for **privacy-first professionals**.
 ## 🔑 Core Features 🔑
 
 ### 🤖 AI & Model Support
-- 💻 **Local or Self-Hosted Model Support** (Ollama, Hugging Face)
-- 🔄 **Multiple Backend Support** - Switch between Ollama and HuggingFace Transformers
+- 💻 **Local or Self-Hosted Model Support** (Ollama, llama.cpp, Hugging Face)
+- 🔄 **Multiple Backend Support** - Switch between Ollama, llama.cpp, and HuggingFace Transformers
 - 🎯 **Configurable Model Parameters** - Temperature, context window, response tokens
 - 🚀 **GPU & CPU Compatibility** - Optimized for both hardware configurations
 
@@ -80,7 +80,7 @@ Built for **privacy-first professionals**.
 
 ### Prerequisites
 - **Python 3.8+**
-- **Ollama** (recommended) or HuggingFace models
+- **Ollama** (recommended), **llama.cpp servers**, or HuggingFace models
 
 ### Installation
 
@@ -232,7 +232,7 @@ ACTION: TOOL_NAME arg1 arg2 ...
 ## 🔑 Roadmap 🔑
 
 ### Completed ✅
-- ✅ Local model support (Ollama, HuggingFace)
+- ✅ Local model support (Ollama, llama.cpp, HuggingFace)
 - ✅ RAG system with vector database
 - ✅ Custom tooling (Python, JSON, YAML)
 - ✅ MCP server integration
