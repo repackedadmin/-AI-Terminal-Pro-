@@ -192,6 +192,7 @@ DEFAULT_CONFIG = {
     "backend": "huggingface",  # Options: "huggingface", "ollama", or "llama_cpp"
     "model_name": "gpt2",      # Options: "gpt2", "gpt2-xl", "llama3", "mistral"
     "llama_cpp_base_url": "http://127.0.0.1:8080",
+    "fast_chat_mode": True,
     "system_prompt": "You are a helpful AI assistant with full OS awareness and extensive memory capabilities. You have access to a large context window (32K+ tokens) and can maintain context across long conversations and complex projects. You automatically detect the operating system and use platform-appropriate commands. When working on projects, you remember project context, previous decisions, and ongoing work. When asked to perform a task, use the available ACTION tools with OS-specific commands. IMPORTANT: When asked to browse the web or interact with websites, you can use browser interaction commands. For example, to search Google and click results: 1) Use ACTION: BROWSE_SEARCH [query] to search Google, 2) Use ACTION: BROWSE_CLICK_FIRST to click the first result, 3) Use ACTION: BROWSE_WAIT [ms] to wait for pages to load. You can also use BROWSE_CLICK, BROWSE_TYPE, and BROWSE_PRESS to interact with page elements. The browser is VISIBLE so the user can see all your actions in real-time. After completing browser actions, provide your summary/analysis. CRITICAL: When generating scripts (batch, PowerShell, bash, Python, etc.), always write the COMPLETE, FULL script from start to finish - never truncate, cut off, or leave scripts incomplete.",
     "enable_dangerous_commands": False,  # Safety lock for file system/terminal
     "max_context_window": 32768,  # Large context window for project assistance and long conversations
@@ -2524,7 +2525,12 @@ class AIEngine:
                     choices = data.get("choices", [])
                     if choices:
                         message = choices[0].get("message", {})
-                        return (message.get("content") or "").strip()
+                        content = message.get("content")
+                        if content:
+                            return content.strip()
+                        text_fallback = choices[0].get("text")
+                        if text_fallback:
+                            return text_fallback.strip()
                     return "No response from llama.cpp server."
                 return f"llama.cpp Error: {res.text}"
             except requests.exceptions.ConnectionError:
@@ -9930,12 +9936,19 @@ class App:
                         break
                     continue
                 
-                # 1. Retrieve RAG
-                rag_context = self.memory.retrieve_context(user_input, self.current_project_id)
+                # 1. Retrieve RAG (skip in fast mode for snappier chat unless in project)
+                fast_chat_mode = self.config.get("fast_chat_mode", True)
+                if fast_chat_mode and not self.current_project_id:
+                    rag_context = ""
+                else:
+                    rag_context = self.memory.retrieve_context(user_input, self.current_project_id)
                 
-                # 2. Get History (increased limit for better context)
+                # 2. Get History (reduced limit for fast mode)
                 # Use larger limit for project-based conversations
-                history_limit = 200 if self.current_project_id else 100
+                if self.current_project_id:
+                    history_limit = 100 if fast_chat_mode else 200
+                else:
+                    history_limit = 40 if fast_chat_mode else 100
                 history = self.memory.get_recent_history(self.current_session_id, limit=history_limit)
                 
                 # 2.5. Get Project Memory
@@ -9956,6 +9969,10 @@ class App:
                     # Temporarily increase token limit for script generation
                     self.config["max_response_tokens"] = 4000
                     self.engine.config["max_response_tokens"] = 4000
+                elif fast_chat_mode:
+                    trimmed_tokens = min(original_max_tokens, 512)
+                    self.config["max_response_tokens"] = trimmed_tokens
+                    self.engine.config["max_response_tokens"] = trimmed_tokens
 
                 # 4. Generate with animated loading
                 frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
@@ -9963,9 +9980,17 @@ class App:
                 # Simple loading indicator
                 print(f"{Colors.BRIGHT_CYAN}⠋ Thinking...{Colors.RESET}", end='', flush=True)
                 response = self.engine.generate(final_prompt)
+                if not response or not response.strip():
+                    retry_prompt = final_prompt + "\n\nPlease respond succinctly."
+                    response = self.engine.generate(retry_prompt)
+                    if not response or not response.strip():
+                        response = "I didn't get a response from the model. Please try again."
                 
                 # Restore original token limit
                 if is_script_request:
+                    self.config["max_response_tokens"] = original_max_tokens
+                    self.engine.config["max_response_tokens"] = original_max_tokens
+                elif fast_chat_mode:
                     self.config["max_response_tokens"] = original_max_tokens
                     self.engine.config["max_response_tokens"] = original_max_tokens
                 print(f"\r{Colors.BRIGHT_GREEN}✓ Response ready{Colors.RESET}" + " " * 30)
@@ -10649,8 +10674,13 @@ class LocalAIEngine:
                 if not choices:
                     return "I received an empty response from llama.cpp. Please try again."
                 message = choices[0].get("message", {{}})
-                content = message.get("content", "")
-                return content.strip() if content else "I received an empty response from llama.cpp. Please try again."
+                content = message.get("content")
+                if content:
+                    return content.strip()
+                text_fallback = choices[0].get("text")
+                if text_fallback:
+                    return text_fallback.strip()
+                return "I received an empty response from llama.cpp. Please try again."
 
             except requests.exceptions.Timeout:
                 return f"Request timed out after {timeout} seconds. The model may be slow."

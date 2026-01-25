@@ -3,6 +3,7 @@
     "backend": "ollama",
     "model_name": "qwen2.5-coder:latest",
     "llama_cpp_base_url": "http://127.0.0.1:8080",
+    "fast_chat_mode": true,
     "system_prompt": "You are a helpful AI assistant. Use available tools (ACTION: ...) to solve problems.",
     "enable_dangerous_commands": true,
     "max_context_window": 2048,
