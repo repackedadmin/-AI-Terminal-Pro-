@@ -189,8 +189,9 @@ for directory in [SANDBOX_DIR, DOCS_DIR, CUSTOM_TOOLS_DIR, TRAINING_DIR, TRAININ
 
 DEFAULT_CONFIG = {
     "first_run": True,
-    "backend": "huggingface",  # Options: "huggingface" or "ollama"
+    "backend": "huggingface",  # Options: "huggingface", "ollama", or "llama_cpp"
     "model_name": "gpt2",      # Options: "gpt2", "gpt2-xl", "llama3", "mistral"
+    "llama_cpp_base_url": "http://127.0.0.1:8080",
     "system_prompt": "You are a helpful AI assistant with full OS awareness and extensive memory capabilities. You have access to a large context window (32K+ tokens) and can maintain context across long conversations and complex projects. You automatically detect the operating system and use platform-appropriate commands. When working on projects, you remember project context, previous decisions, and ongoing work. When asked to perform a task, use the available ACTION tools with OS-specific commands. IMPORTANT: When asked to browse the web or interact with websites, you can use browser interaction commands. For example, to search Google and click results: 1) Use ACTION: BROWSE_SEARCH [query] to search Google, 2) Use ACTION: BROWSE_CLICK_FIRST to click the first result, 3) Use ACTION: BROWSE_WAIT [ms] to wait for pages to load. You can also use BROWSE_CLICK, BROWSE_TYPE, and BROWSE_PRESS to interact with page elements. The browser is VISIBLE so the user can see all your actions in real-time. After completing browser actions, provide your summary/analysis. CRITICAL: When generating scripts (batch, PowerShell, bash, Python, etc.), always write the COMPLETE, FULL script from start to finish - never truncate, cut off, or leave scripts incomplete.",
     "enable_dangerous_commands": False,  # Safety lock for file system/terminal
     "max_context_window": 32768,  # Large context window for project assistance and long conversations
@@ -2429,6 +2430,31 @@ class AIEngine:
                 print(f"{Colors.BRIGHT_GREEN}[SYSTEM]{Colors.RESET} Ollama connection established.")
             except:
                 print(f"{Colors.YELLOW}[WARNING]{Colors.RESET} Ollama is not running on localhost:11434.")
+        elif self.backend == "llama_cpp":
+            base_url = normalize_base_url(self.config.get("llama_cpp_base_url", "http://127.0.0.1:8080"))
+            try:
+                response = requests.get(f"{base_url}/v1/models", timeout=3)
+                if response.status_code == 200:
+                    print(f"{Colors.BRIGHT_GREEN}[SYSTEM]{Colors.RESET} llama.cpp server detected at {base_url}.")
+                    available = []
+                    data = response.json().get("data", [])
+                    for model in data:
+                        model_id = model.get("id") or model.get("name")
+                        if model_id:
+                            available.append(model_id)
+
+                    if self.model_name in available:
+                        print(f"{Colors.BRIGHT_GREEN}[SYSTEM]{Colors.RESET} Using configured model: {self.model_name}")
+                    elif available:
+                        detected_model = available[0]
+                        print(f"{Colors.BRIGHT_CYAN}[SYSTEM]{Colors.RESET} Auto-detected model: {detected_model}")
+                        self.model_name = detected_model
+                    else:
+                        print(f"{Colors.YELLOW}[WARNING]{Colors.RESET} llama.cpp server returned no models.")
+                else:
+                    print(f"{Colors.YELLOW}[WARNING]{Colors.RESET} llama.cpp server responded with status {response.status_code}.")
+            except requests.exceptions.RequestException:
+                print(f"{Colors.YELLOW}[WARNING]{Colors.RESET} llama.cpp server not reachable at {base_url}.")
 
     def generate(self, prompt, timeout=180):
         """Generate AI response with configurable timeout."""
@@ -2477,6 +2503,36 @@ class AIEngine:
                 return "Request timed out. The model may be slow or Ollama is overloaded."
             except Exception as e:
                 return f"Error: {e}"
+        elif self.backend == "llama_cpp":
+            base_url = normalize_base_url(self.config.get("llama_cpp_base_url", "http://127.0.0.1:8080"))
+            try:
+                res = resilient_request(
+                    'post',
+                    f"{base_url}/v1/chat/completions",
+                    json={
+                        "model": self.model_name,
+                        "messages": [{"role": "user", "content": prompt}],
+                        "temperature": self.config.get("temperature"),
+                        "max_tokens": self.config.get("max_response_tokens")
+                    },
+                    timeout=timeout,
+                    max_retries=3,
+                    retry_delay=3.0
+                )
+                if res.status_code == 200:
+                    data = res.json()
+                    choices = data.get("choices", [])
+                    if choices:
+                        message = choices[0].get("message", {})
+                        return (message.get("content") or "").strip()
+                    return "No response from llama.cpp server."
+                return f"llama.cpp Error: {res.text}"
+            except requests.exceptions.ConnectionError:
+                return f"Connection Error: Cannot connect to llama.cpp at {base_url}."
+            except requests.exceptions.Timeout:
+                return "Request timed out. The model may be slow or server overloaded."
+            except Exception as e:
+                return f"Error: {e}"
 
 # ==============================================================================
 #                           6. MODEL DISCOVERY & DOWNLOAD
@@ -2492,6 +2548,36 @@ def get_ollama_models():
     except:
         pass
     return []
+
+def normalize_base_url(url):
+    """Normalize base URLs to avoid double slashes."""
+    if not url:
+        return url
+    return url.rstrip("/")
+
+def get_llama_cpp_models(base_url):
+    """Get list of available llama.cpp server models."""
+    try:
+        response = requests.get(f"{normalize_base_url(base_url)}/v1/models", timeout=3)
+        if response.status_code == 200:
+            data = response.json()
+            models = []
+            for model in data.get("data", []):
+                model_id = model.get("id") or model.get("name")
+                if model_id:
+                    models.append(model_id)
+            return models
+    except:
+        pass
+    return []
+
+def check_llama_cpp_running(base_url):
+    """Check if a llama.cpp server is running."""
+    try:
+        response = requests.get(f"{normalize_base_url(base_url)}/v1/models", timeout=2)
+        return response.status_code == 200
+    except:
+        return False
 
 def check_ollama_running():
     """Check if Ollama is running."""
@@ -3864,7 +3950,7 @@ class AppBuilderOrchestrator:
         if not response or len(response.strip()) < 20:
             return True
         error_indicators = [
-            "connection error", "cannot connect", "error:", "ollama error",
+            "connection error", "cannot connect", "error:", "ollama error", "llama.cpp error",
             "request timed out", "failed to", "exception", "traceback"
         ]
         response_lower = response.lower()
@@ -3890,7 +3976,7 @@ class AppBuilderOrchestrator:
         if self._is_ai_error(test_response):
             print(f" {Colors.BRIGHT_RED}FAILED{Colors.RESET}")
             print(f"\n{Colors.BRIGHT_RED}✗ AI Backend Error: {test_response[:100]}{Colors.RESET}")
-            print(f"{Colors.YELLOW}Please ensure your AI backend (Ollama/HuggingFace) is running properly.{Colors.RESET}")
+            print(f"{Colors.YELLOW}Please ensure your AI backend (Ollama/HuggingFace/llama.cpp) is running properly.{Colors.RESET}")
             print(f"{Colors.YELLOW}For Ollama, run: ollama serve{Colors.RESET}")
             return False, "AI backend not available"
         print(f" {Colors.BRIGHT_GREEN}OK{Colors.RESET}\n")
@@ -3903,7 +3989,7 @@ class AppBuilderOrchestrator:
             # Check for AI errors
             if self._is_ai_error(analysis):
                 print(f"{Colors.BRIGHT_RED}✗ AI Error: {analysis[:100]}...{Colors.RESET}")
-                print(f"{Colors.YELLOW}Please check your AI backend (Ollama/HuggingFace) is running.{Colors.RESET}")
+                print(f"{Colors.YELLOW}Please check your AI backend (Ollama/HuggingFace/llama.cpp) is running.{Colors.RESET}")
                 return False, "AI generation failed"
 
             print(f"\n{Colors.CYAN}Analysis:{Colors.RESET}\n{analysis}\n")
@@ -4506,9 +4592,10 @@ class App:
         
         # Backend selection
         print(f"{Colors.CYAN}  [1]{Colors.RESET} Hugging Face {Colors.DIM}(Local Python, High RAM){Colors.RESET}")
-        print(f"{Colors.CYAN}  [2]{Colors.RESET} Ollama {Colors.DIM}(External App, Fast){Colors.RESET}\n")
+        print(f"{Colors.CYAN}  [2]{Colors.RESET} Ollama {Colors.DIM}(External App, Fast){Colors.RESET}")
+        print(f"{Colors.CYAN}  [3]{Colors.RESET} llama.cpp Server {Colors.DIM}(External, OpenAI-compatible){Colors.RESET}\n")
         
-        choice = input(f"{Colors.BRIGHT_GREEN}Select Backend [1/2]: {Colors.RESET}").strip()
+        choice = input(f"{Colors.BRIGHT_GREEN}Select Backend [1/2/3]: {Colors.RESET}").strip()
         
         if choice == "2":
             # Ollama setup
@@ -4602,6 +4689,14 @@ class App:
             else:
                 print(f"{Colors.BRIGHT_GREEN}✓ Model is ready to use!{Colors.RESET}")
             
+        elif choice == "3":
+            self.cfg_mgr.update("backend", "llama_cpp")
+            base_url = input(f"{Colors.BRIGHT_GREEN}Enter llama.cpp base URL (default: http://127.0.0.1:8080): {Colors.RESET}").strip()
+            if not base_url:
+                base_url = "http://127.0.0.1:8080"
+            self.cfg_mgr.update("llama_cpp_base_url", base_url)
+            model_name = input(f"{Colors.BRIGHT_GREEN}Enter model name (leave blank for auto-detect): {Colors.RESET}").strip()
+            self.cfg_mgr.update("model_name", model_name if model_name else "auto")
         else:
             # HuggingFace setup
             self.cfg_mgr.update("backend", "huggingface")
@@ -4863,7 +4958,8 @@ class App:
         print(f"{Colors.BRIGHT_GREEN}  [1]{Colors.RESET} Toggle Dangerous Commands {Colors.DIM}(Allow writing outside sandbox){Colors.RESET}")
         print(f"{Colors.BRIGHT_GREEN}  [2]{Colors.RESET} Edit System Prompt")
         print(f"{Colors.BRIGHT_GREEN}  [3]{Colors.RESET} Set Default Editor for Tools/MCP Servers")
-        print(f"{Colors.BRIGHT_GREEN}  [4]{Colors.RESET} Back\n")
+        print(f"{Colors.BRIGHT_GREEN}  [4]{Colors.RESET} Change AI Backend")
+        print(f"{Colors.BRIGHT_GREEN}  [5]{Colors.RESET} Back\n")
         
         c = input(f"{Colors.BRIGHT_GREEN}Choice: {Colors.RESET}")
         if c == "1":
@@ -4951,6 +5047,36 @@ class App:
             
             print(f"{Colors.YELLOW}⚠ Invalid selection. Editor not changed.{Colors.RESET}")
             time.sleep(1.5)
+        elif c == "4":
+            print(f"\n{Colors.BRIGHT_CYAN}Select AI Backend:{Colors.RESET}\n")
+            print(f"{Colors.CYAN}  [1]{Colors.RESET} Ollama {Colors.DIM}(http://localhost:11434){Colors.RESET}")
+            print(f"{Colors.CYAN}  [2]{Colors.RESET} llama.cpp Server {Colors.DIM}(OpenAI-compatible){Colors.RESET}")
+            print(f"{Colors.CYAN}  [3]{Colors.RESET} Python/HuggingFace {Colors.DIM}(local .py models){Colors.RESET}\n")
+
+            backend_choice = input(f"{Colors.BRIGHT_GREEN}Select backend [1/2/3]: {Colors.RESET}").strip()
+            if backend_choice == "1":
+                self.cfg_mgr.update("backend", "ollama")
+                print(f"{Colors.BRIGHT_GREEN}✓ Backend set to Ollama{Colors.RESET}")
+            elif backend_choice == "2":
+                self.cfg_mgr.update("backend", "llama_cpp")
+                base_url = input(f"{Colors.BRIGHT_GREEN}Enter llama.cpp base URL (default: http://127.0.0.1:8080): {Colors.RESET}").strip()
+                if not base_url:
+                    base_url = "http://127.0.0.1:8080"
+                self.cfg_mgr.update("llama_cpp_base_url", base_url)
+                model_name = input(f"{Colors.BRIGHT_GREEN}Enter model name (leave blank for auto-detect): {Colors.RESET}").strip()
+                self.cfg_mgr.update("model_name", model_name if model_name else "auto")
+                print(f"{Colors.BRIGHT_GREEN}✓ Backend set to llama.cpp{Colors.RESET}")
+            elif backend_choice == "3":
+                self.cfg_mgr.update("backend", "huggingface")
+                model_name = input(f"{Colors.BRIGHT_GREEN}Enter HuggingFace model ID (blank keeps current): {Colors.RESET}").strip()
+                if model_name:
+                    self.cfg_mgr.update("model_name", model_name)
+                print(f"{Colors.BRIGHT_GREEN}✓ Backend set to HuggingFace (.py){Colors.RESET}")
+            else:
+                print(f"{Colors.YELLOW}⚠ Invalid selection. Backend not changed.{Colors.RESET}")
+            time.sleep(1.5)
+        elif c == "5":
+            return
     
     def open_in_default_editor(self, filepath):
         """
@@ -10319,7 +10445,7 @@ CONFIG = {config_repr}
 print(f"{{Colors.CYAN}}Loading local AI model ({{CONFIG.get('backend')}}: {{CONFIG.get('model_name')}})...{{Colors.RESET}}")
 
 class LocalAIEngine:
-    """Local AI Engine using HuggingFace or Ollama - NO cloud APIs."""
+    """Local AI Engine using HuggingFace, Ollama, or llama.cpp - NO cloud APIs."""
     def __init__(self, config):
         self.config = config
         self.backend = config.get("backend")
@@ -10394,6 +10520,38 @@ class LocalAIEngine:
                 print(f"{Colors.BRIGHT_YELLOW}⚠ Ollama not running on localhost:11434{Colors.RESET}")
                 print(f"{Colors.YELLOW}Start Ollama with: ollama serve{Colors.RESET}")
                 raise Exception("Ollama backend not available")
+        elif self.backend == "llama_cpp":
+            base_url = normalize_base_url(self.config.get("llama_cpp_base_url", "http://127.0.0.1:8080"))
+            try:
+                print(f"{Colors.CYAN}Detecting llama.cpp server at {base_url}...{Colors.RESET}")
+                resp = resilient_request('get', f"{base_url}/v1/models", timeout=5, max_retries=2, retry_delay=1.0)
+                if resp.status_code == 200:
+                    available = []
+                    data = resp.json().get("data", [])
+                    for model in data:
+                        model_id = model.get("id") or model.get("name")
+                        if model_id:
+                            available.append(model_id)
+
+                    if self.model_name in available:
+                        print(f"{Colors.BRIGHT_GREEN}✓ Using configured model: {self.model_name}{Colors.RESET}")
+                    else:
+                        if self.model_name and self.model_name != "auto":
+                            print(f"{Colors.YELLOW}⚠ Configured model '{self.model_name}' not found on llama.cpp server.{Colors.RESET}")
+                        detected_model = available[0] if available else None
+                        if detected_model:
+                            print(f"{Colors.BRIGHT_CYAN}✨ Auto-detected model: {detected_model}{Colors.RESET}")
+                            self.model_name = detected_model
+                        else:
+                            print(f"{Colors.BRIGHT_RED}✗ No models found on llama.cpp server.{Colors.RESET}")
+                            raise Exception("No llama.cpp models available")
+                else:
+                    print(f"{Colors.BRIGHT_RED}✗ Failed to fetch models from llama.cpp server (status {resp.status_code}).{Colors.RESET}")
+                    raise Exception("llama.cpp backend not available")
+            except requests.exceptions.RequestException:
+                print(f"{Colors.BRIGHT_YELLOW}⚠ llama.cpp server not running at {base_url}{Colors.RESET}")
+                print(f"{Colors.YELLOW}Start llama.cpp with: llama-server --host 127.0.0.1 --port 8080{Colors.RESET}")
+                raise Exception("llama.cpp backend not available")
 
     def generate(self, prompt, timeout=180):
         """Generate AI response with configurable timeout."""
@@ -10463,6 +10621,41 @@ class LocalAIEngine:
                 return f"Request timed out after {timeout} seconds. The model may be slow."
             except requests.exceptions.ConnectionError:
                 return "Cannot connect to Ollama. Make sure Ollama is running: ollama serve"
+            except Exception as e:
+                return f"Error: {str(e)[:200]}"
+        elif self.backend == "llama_cpp":
+            base_url = normalize_base_url(self.config.get("llama_cpp_base_url", "http://127.0.0.1:8080"))
+            try:
+                response = resilient_request(
+                    'post',
+                    f"{base_url}/v1/chat/completions",
+                    json={
+                        "model": self.model_name,
+                        "messages": [{"role": "user", "content": prompt}],
+                        "temperature": self.config.get("temperature", 0.7),
+                        "max_tokens": self.config.get("max_response_tokens", 200),
+                        "stream": False
+                    },
+                    timeout=timeout,
+                    max_retries=3,
+                    retry_delay=3.0
+                )
+
+                if response.status_code != 200:
+                    return f"llama.cpp Error: {response.text[:200]}"
+
+                data = response.json()
+                choices = data.get("choices", [])
+                if not choices:
+                    return "I received an empty response from llama.cpp. Please try again."
+                message = choices[0].get("message", {{}})
+                content = message.get("content", "")
+                return content.strip() if content else "I received an empty response from llama.cpp. Please try again."
+
+            except requests.exceptions.Timeout:
+                return f"Request timed out after {timeout} seconds. The model may be slow."
+            except requests.exceptions.ConnectionError:
+                return f"Cannot connect to llama.cpp at {base_url}."
             except Exception as e:
                 return f"Error: {str(e)[:200]}"
 
