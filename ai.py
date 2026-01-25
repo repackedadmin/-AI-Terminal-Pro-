@@ -5069,8 +5069,30 @@ class App:
                 if not base_url:
                     base_url = "http://127.0.0.1:8080"
                 self.cfg_mgr.update("llama_cpp_base_url", base_url)
-                model_name = input(f"{Colors.BRIGHT_GREEN}Enter model name (leave blank for auto-detect): {Colors.RESET}").strip()
-                self.cfg_mgr.update("model_name", model_name if model_name else "auto")
+
+                print(f"{Colors.CYAN}Detecting llama.cpp models...{Colors.RESET}")
+                models = get_llama_cpp_models(base_url)
+                if models:
+                    print(f"\n{Colors.BRIGHT_GREEN}Available llama.cpp Models:{Colors.RESET}\n")
+                    for i, model in enumerate(models[:15], 1):
+                        print(f"  {Colors.CYAN}[{i}]{Colors.RESET} {model}")
+                    print(f"  {Colors.CYAN}[0]{Colors.RESET} Auto-detect (first available)")
+                    selection = input(f"\n{Colors.BRIGHT_GREEN}Select model [1-{min(len(models), 15)}] or 0: {Colors.RESET}").strip()
+                    try:
+                        idx = int(selection)
+                        if idx == 0:
+                            selected_model = "auto"
+                        elif 1 <= idx <= min(len(models), 15):
+                            selected_model = models[idx - 1]
+                        else:
+                            selected_model = "auto"
+                    except ValueError:
+                        selected_model = "auto"
+                else:
+                    print(f"{Colors.YELLOW}⚠ No models detected. Using auto-detect.{Colors.RESET}")
+                    selected_model = "auto"
+
+                self.cfg_mgr.update("model_name", selected_model)
                 print(f"{Colors.BRIGHT_GREEN}✓ Backend set to llama.cpp{Colors.RESET}")
             elif backend_choice == "3":
                 self.cfg_mgr.update("backend", "huggingface")
@@ -9958,7 +9980,10 @@ class App:
                 
                 # 3. Build Prompt with project memory
                 sys_prompt = self.config.get("system_prompt") + self.registry.get_tool_prompt()
-                final_prompt = self.context_mgr.build_prompt(sys_prompt, history, rag_context, user_input, project_memory)
+                if fast_chat_mode and not self.current_project_id:
+                    final_prompt = f"{sys_prompt}\n\nUser: {user_input}\nAssistant:"
+                else:
+                    final_prompt = self.context_mgr.build_prompt(sys_prompt, history, rag_context, user_input, project_memory)
 
                 # 3.5. Detect script generation and adjust token limit
                 script_keywords = ["script", "batch", "powershell", "ps1", "bat", "bash", "sh", "python", "py"]
