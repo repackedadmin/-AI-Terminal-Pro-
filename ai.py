@@ -193,7 +193,7 @@ DEFAULT_CONFIG = {
     "model_name": "gpt2",      # Options: "gpt2", "gpt2-xl", "llama3", "mistral"
     "llama_cpp_base_url": "http://127.0.0.1:8080",
     "fast_chat_mode": True,
-    "system_prompt": "You are a helpful AI assistant with full OS awareness and extensive memory capabilities. You have access to a large context window (32K+ tokens) and can maintain context across long conversations and complex projects. You automatically detect the operating system and use platform-appropriate commands. When working on projects, you remember project context, previous decisions, and ongoing work. When asked to perform a task, use the available ACTION tools with OS-specific commands. IMPORTANT: When asked to browse the web or interact with websites, you can use browser interaction commands. For example, to search Google and click results: 1) Use ACTION: BROWSE_SEARCH [query] to search Google, 2) Use ACTION: BROWSE_CLICK_FIRST to click the first result, 3) Use ACTION: BROWSE_WAIT [ms] to wait for pages to load. You can also use BROWSE_CLICK, BROWSE_TYPE, and BROWSE_PRESS to interact with page elements. The browser is VISIBLE so the user can see all your actions in real-time. After completing browser actions, provide your summary/analysis. CRITICAL: When generating scripts (batch, PowerShell, bash, Python, etc.), always write the COMPLETE, FULL script from start to finish - never truncate, cut off, or leave scripts incomplete.",
+    "system_prompt": "You are a helpful AI assistant. Provide clear, accurate, and concise answers. Only use ACTION tools when the user explicitly asks or the task requires external actions. Do not claim tool outputs or system information you did not actually obtain. When generating scripts (batch, PowerShell, bash, Python, etc.), always write the COMPLETE, FULL script from start to finish - never truncate, cut off, or leave scripts incomplete.",
     "enable_dangerous_commands": False,  # Safety lock for file system/terminal
     "max_context_window": 32768,  # Large context window for project assistance and long conversations
     "max_response_tokens": 2000,  # Increased for script generation and longer responses
@@ -1724,7 +1724,7 @@ class ToolRegistry:
         p += "IMPORTANT: Always use OS-appropriate commands for the detected platform!\n"
         
         p += "\n### AVAILABLE TOOLS ###\n"
-        p += "SYNTAX: Response must start with 'ACTION: [Tool_Name] [Arguments]'\n"
+        p += "SYNTAX: When using tools, respond with 'ACTION: [Tool_Name] [Arguments]'\n"
         p += "IMPORTANT: Do NOT wrap file paths in brackets []. Use: FILE_READ ~/Desktop/file.txt\n"
         p += "CRITICAL FOR SCRIPTS: When writing scripts (batch, PowerShell, bash, Python, etc.), write the COMPLETE script!\n"
         p += "                      Include ALL code from start to finish - never truncate or cut off mid-script!\n"
@@ -2509,10 +2509,10 @@ class AIEngine:
             try:
                 res = resilient_request(
                     'post',
-                    f"{base_url}/v1/chat/completions",
+                    f"{base_url}/v1/completions",
                     json={
                         "model": self.model_name,
-                        "messages": [{"role": "user", "content": prompt}],
+                        "prompt": prompt,
                         "temperature": self.config.get("temperature"),
                         "max_tokens": self.config.get("max_response_tokens")
                     },
@@ -2524,13 +2524,13 @@ class AIEngine:
                     data = res.json()
                     choices = data.get("choices", [])
                     if choices:
+                        text = choices[0].get("text")
+                        if text:
+                            return text.strip()
                         message = choices[0].get("message", {})
                         content = message.get("content")
                         if content:
                             return content.strip()
-                        text_fallback = choices[0].get("text")
-                        if text_fallback:
-                            return text_fallback.strip()
                     return "No response from llama.cpp server."
                 return f"llama.cpp Error: {res.text}"
             except requests.exceptions.ConnectionError:
@@ -10678,10 +10678,10 @@ class LocalAIEngine:
             try:
                 response = resilient_request(
                     'post',
-                    f"{base_url}/v1/chat/completions",
+                    f"{base_url}/v1/completions",
                     json={
                         "model": self.model_name,
-                        "messages": [{"role": "user", "content": prompt}],
+                        "prompt": prompt,
                         "temperature": self.config.get("temperature", 0.7),
                         "max_tokens": self.config.get("max_response_tokens", 200),
                         "stream": False
@@ -10698,13 +10698,13 @@ class LocalAIEngine:
                 choices = data.get("choices", [])
                 if not choices:
                     return "I received an empty response from llama.cpp. Please try again."
-                message = choices[0].get("message", {{}})
+                text = choices[0].get("text")
+                if text:
+                    return text.strip()
+                message = choices[0].get("message", {})
                 content = message.get("content")
                 if content:
                     return content.strip()
-                text_fallback = choices[0].get("text")
-                if text_fallback:
-                    return text_fallback.strip()
                 return "I received an empty response from llama.cpp. Please try again."
 
             except requests.exceptions.Timeout:
