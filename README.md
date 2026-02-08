@@ -18,6 +18,7 @@ Built for **privacy-first professionals**.
 - 🔄 **Multiple Backend Support** - Switch between Ollama, llama.cpp, and HuggingFace Transformers
 - 🎯 **Configurable Model Parameters** - Temperature, context window, response tokens
 - 🚀 **GPU & CPU Compatibility** - Optimized for both hardware configurations
+- 💻 **Now supports integration of Cliud Providers such as OPENAI etc**
 
 ### 🧠 Memory & Context
 - 🧠 **RAG-Enabled Context Memory** (local vector database)
