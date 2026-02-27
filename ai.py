@@ -10,6 +10,7 @@ import os
 import sys
 import json
 import time
+import getpass
 import sqlite3
 import glob
 import subprocess
@@ -23,9 +24,20 @@ import hashlib
 import base64
 import shlex
 from datetime import datetime
-from bs4 import BeautifulSoup
-from transformers import AutoTokenizer, AutoModelForCausalLM
-import torch
+try:
+    from bs4 import BeautifulSoup
+except ImportError:
+    BeautifulSoup = None
+
+try:
+    from transformers import AutoTokenizer, AutoModelForCausalLM
+    import torch
+    TORCH_AVAILABLE = True
+except ImportError:
+    AutoTokenizer = None
+    AutoModelForCausalLM = None
+    torch = None
+    TORCH_AVAILABLE = False
 
 # Encryption imports
 try:
@@ -193,7 +205,7 @@ DEFAULT_CONFIG = {
     "model_name": "gpt2",      # Options: "gpt2", "gpt2-xl", "llama3", "mistral"
     "llama_cpp_base_url": "http://127.0.0.1:8080",
     "fast_chat_mode": True,
-    "system_prompt": "You are a helpful AI assistant. Provide clear, accurate, and concise answers. Only use ACTION tools when the user explicitly asks or the task requires external actions. Do not claim tool outputs or system information you did not actually obtain. When generating scripts (batch, PowerShell, bash, Python, etc.), always write the COMPLETE, FULL script from start to finish - never truncate, cut off, or leave scripts incomplete.",
+    "system_prompt": "You are a helpful AI assistant with full OS awareness and extensive memory capabilities. You have access to a large context window (32K+ tokens) and can maintain context across long conversations and complex projects. You automatically detect the operating system and use platform-appropriate commands. When working on projects, you remember project context, previous decisions, and ongoing work. When asked to perform a task, use the available ACTION tools with OS-specific commands. IMPORTANT: When asked to browse the web or interact with websites, you can use browser interaction commands. For example, to search Google and click results: 1) Use ACTION: BROWSE_SEARCH [query] to search Google, 2) Use ACTION: BROWSE_CLICK_FIRST to click the first result, 3) Use ACTION: BROWSE_WAIT [ms] to wait for pages to load. You can also use BROWSE_CLICK, BROWSE_TYPE, and BROWSE_PRESS to interact with page elements. The browser is VISIBLE so the user can see all your actions in real-time. After completing browser actions, provide your summary/analysis. CRITICAL: When generating scripts (batch, PowerShell, bash, Python, etc.), always write the COMPLETE, FULL script from start to finish - never truncate, cut off, or leave scripts incomplete.",
     "enable_dangerous_commands": False,  # Safety lock for file system/terminal
     "max_context_window": 32768,  # Large context window for project assistance and long conversations
     "max_response_tokens": 2000,  # Increased for script generation and longer responses
@@ -209,20 +221,41 @@ DEFAULT_CONFIG = {
     #   "notepad++"    (Notepad++)
     #   "sublime_text" (Sublime Text)
     #   "notepad"      (Windows Notepad)
-    "default_editor_command": ""
+    "default_editor_command": "",
+    # Cloud API Provider Configuration
+    "cloud_api_keys": {},  # Encrypted: {"openai": "gAAAAAB...", etc}
+    "openai_model": "gpt-4o",
+    "anthropic_model": "claude-3-5-sonnet-20241022",
+    "gemini_model": "gemini-2.0-flash-exp",
+    "openrouter_model": "anthropic/claude-3.5-sonnet",
+    "openai_base_url": "https://api.openai.com/v1",
+    "anthropic_base_url": "https://api.anthropic.com/v1",
+    "gemini_base_url": "https://generativelanguage.googleapis.com/v1beta",
+    "openrouter_base_url": "https://openrouter.ai/api/v1",
+    # Groq (ultra-fast cloud inference)
+    "groq_model": "llama-3.3-70b-versatile",
+    "groq_base_url": "https://api.groq.com/openai/v1",
+    # DeepSeek (Chinese frontier model, OpenAI-compatible API)
+    "deepseek_model": "deepseek-chat",
+    "deepseek_base_url": "https://api.deepseek.com/v1",
+    # HuggingFace Cloud Inference API (distinct from local 'huggingface' backend)
+    "hf_cloud_model": "mistralai/Mistral-7B-Instruct-v0.3",
+    "hf_cloud_base_url": "https://api-inference.huggingface.co/v1"
 }
 
 def apply_torch_threading(config):
     """Apply torch threading knobs for CPU/GPU without changing higher-level logic."""
+    if not TORCH_AVAILABLE:
+        return
     try:
         cpu_threads = int(config.get("cpu_threads", 0) or 0)
         interop_threads = int(config.get("cpu_interop_threads", 0) or 0)
-        
+
         if cpu_threads > 0:
             torch.set_num_threads(cpu_threads)
         if interop_threads > 0:
             torch.set_num_interop_threads(interop_threads)
-        
+
         # GPU-specific micro-optimizations; safe no-ops on CPU
         if torch.cuda.is_available():
             torch.backends.cudnn.benchmark = True
@@ -260,8 +293,15 @@ class ConfigManager:
             json.dump(data, f, indent=4)
 
     def update(self, key, value):
-        self.config[key] = value
+        # Reload from disk first to pick up any external changes (e.g., API key saves)
+        fresh = self.load_config()
+        fresh[key] = value
+        self.config = fresh
         self.save_config_data(self.config)
+
+    def reload(self):
+        """Reload config from disk to pick up external changes."""
+        self.config = self.load_config()
 
     def get(self, key):
         return self.config.get(key, DEFAULT_CONFIG.get(key))
@@ -274,6 +314,8 @@ class MemoryManager:
     """Handles SQLite interaction for Chat History and Document RAG with Self-Healing."""
     def __init__(self, db_path):
         self.db_path = db_path
+        self._encryptor = None          # lazy-initialised on first use
+        self._encryption_ready = None   # None = not yet tested
         self._connect()
         self._init_db()
 
@@ -395,14 +437,64 @@ class MemoryManager:
             self.cursor.execute("SELECT session_id FROM history LIMIT 1")
         except sqlite3.OperationalError:
             self.cursor.execute("ALTER TABLE history ADD COLUMN session_id INTEGER")
-        
+
         # Add project_id to documents if it doesn't exist (migration)
         try:
             self.cursor.execute("SELECT project_id FROM documents LIMIT 1")
         except sqlite3.OperationalError:
             self.cursor.execute("ALTER TABLE documents ADD COLUMN project_id INTEGER")
-        
+
             self.conn.commit()
+
+    # ------------------------------------------------------------------
+    # Encryption helpers — all chat data is encrypted at rest via Fernet
+    # ------------------------------------------------------------------
+
+    def _get_encryptor(self):
+        """Lazy-initialise the Fernet encryptor using the shared .master_key file.
+
+        Returns an EncryptionManager instance, or None if the cryptography
+        library is not installed. Results are cached after the first call.
+        """
+        if self._encryption_ready is not None:
+            return self._encryptor          # return cached result (may be None)
+        try:
+            self._encryptor = EncryptionManager()   # uses api/.master_key auto-file
+            self._encryption_ready = True
+        except Exception:
+            self._encryptor = None
+            self._encryption_ready = False
+        return self._encryptor
+
+    def _encrypt(self, text):
+        """Encrypt a plaintext string for storage. Returns ciphertext string.
+        Falls back to returning the original string if encryption is unavailable.
+        """
+        if not text:
+            return text
+        enc = self._get_encryptor()
+        if enc is None:
+            return text
+        try:
+            return enc.encrypt(str(text))
+        except Exception:
+            return text     # encryption failed — store as-is (degraded mode)
+
+    def _decrypt(self, text):
+        """Decrypt a stored ciphertext string. Returns plaintext string.
+        Silently returns the original value when decryption fails so that
+        legacy plaintext rows (pre-encryption) are surfaced as-is (graceful
+        migration — no data loss for existing databases).
+        """
+        if not text:
+            return text
+        enc = self._get_encryptor()
+        if enc is None:
+            return text
+        try:
+            return enc.decrypt(str(text))
+        except Exception:
+            return text     # legacy plaintext row — pass through unchanged
 
     # Session Management
     def create_session(self, name, project_id=None):
@@ -480,16 +572,23 @@ class MemoryManager:
         return self.cursor.fetchone()
     
     def update_project_memory(self, project_id, memory_bank):
-        """Update project memory bank (dict)."""
-        self.cursor.execute("UPDATE projects SET memory_bank=?, updated_at=CURRENT_TIMESTAMP WHERE id=?", 
-                          (json.dumps(memory_bank), project_id))
+        """Serialise, encrypt, and persist a project's memory bank dict."""
+        serialised = json.dumps(memory_bank)
+        encrypted = self._encrypt(serialised)
+        self.cursor.execute(
+            "UPDATE projects SET memory_bank=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+            (encrypted, project_id))
         self.conn.commit()
-    
+
     def get_project_memory(self, project_id):
-        """Get project memory bank (dict)."""
+        """Retrieve and decrypt a project's memory bank, returning a dict."""
         row = self.get_project(project_id)
         if row and row[3]:
-            return json.loads(row[3])
+            try:
+                decrypted = self._decrypt(row[3])
+                return json.loads(decrypted)
+            except Exception:
+                return {}
         return {}
     
     def save_project_to_file(self, project_id, filepath):
@@ -541,45 +640,84 @@ class MemoryManager:
         return project_id
     
     def save_message(self, session_id, role, content):
-        self.cursor.execute("INSERT INTO history (session_id, role, content) VALUES (?, ?, ?)", 
-                          (session_id, role, content))
+        """Persist a chat turn, encrypting the content before writing to SQLite."""
+        encrypted_content = self._encrypt(content)
+        self.cursor.execute("INSERT INTO history (session_id, role, content) VALUES (?, ?, ?)",
+                          (session_id, role, encrypted_content))
         self.conn.commit()
         if session_id:
             self.update_session(session_id)
 
     def get_recent_history(self, session_id=None, limit=100):
-        # Fetch last N messages for a session (increased default for better context)
+        """Fetch last N messages and decrypt each content field."""
         if session_id:
-            self.cursor.execute("SELECT role, content FROM history WHERE session_id=? ORDER BY id DESC LIMIT ?", 
-                          (session_id, limit))
+            self.cursor.execute(
+                "SELECT role, content FROM history WHERE session_id=? ORDER BY id DESC LIMIT ?",
+                (session_id, limit))
         else:
-            self.cursor.execute("SELECT role, content FROM history ORDER BY id DESC LIMIT ?", (limit,))
+            self.cursor.execute(
+                "SELECT role, content FROM history ORDER BY id DESC LIMIT ?", (limit,))
         rows = self.cursor.fetchall()
-        return rows[::-1]  # Reverse to chronological order
+        # Decrypt every content field; legacy plaintext rows pass through unchanged
+        decrypted = [(role, self._decrypt(content)) for role, content in rows]
+        return decrypted[::-1]  # Reverse to chronological order
     
     def get_all_history(self, session_id=None):
-        """Get all history for a session (no limit)."""
+        """Get all history for a session (no limit), decrypting each content field."""
         if session_id:
-            self.cursor.execute("SELECT role, content FROM history WHERE session_id=? ORDER BY id ASC", 
-                          (session_id,))
+            self.cursor.execute(
+                "SELECT role, content FROM history WHERE session_id=? ORDER BY id ASC",
+                (session_id,))
         else:
             self.cursor.execute("SELECT role, content FROM history ORDER BY id ASC")
-        return self.cursor.fetchall()
+        rows = self.cursor.fetchall()
+        return [(role, self._decrypt(content)) for role, content in rows]
+
+    def add_document(self, content, source_name="", project_id=None):
+        """Chunk, encrypt, and store a raw content string in the document store.
+
+        Called when the app has already read the file contents and just needs
+        to persist them (e.g., from /analyze). For file-path-based ingestion
+        use ingest_file() instead.
+        """
+        try:
+            chunks = [c.strip() for c in content.split('\n\n') if c.strip()]
+            count = 0
+            for chunk in chunks:
+                if len(chunk) > 20:
+                    encrypted_chunk = self._encrypt(chunk)
+                    if project_id:
+                        self.cursor.execute(
+                            "INSERT INTO documents (source_file, content_chunk, project_id) VALUES (?, ?, ?)",
+                            (os.path.basename(source_name), encrypted_chunk, project_id))
+                    else:
+                        self.cursor.execute(
+                            "INSERT INTO documents (source_file, content_chunk) VALUES (?, ?)",
+                            (os.path.basename(source_name), encrypted_chunk))
+                    count += 1
+            self.conn.commit()
+            return count
+        except Exception as e:
+            print(f"{Colors.BRIGHT_RED}[ERROR]{Colors.RESET} add_document failed: {e}")
+            return 0
 
     def ingest_file(self, filepath):
-        """Reads text files, chunks them, and stores in DB."""
+        """Reads text files, chunks them, encrypts, and stores in DB."""
         filename = os.path.basename(filepath)
         try:
             with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
                 text = f.read()
-            
+
             # Split by double newline to approximate paragraphs
             chunks = [c.strip() for c in text.split('\n\n') if c.strip()]
-            
+
             count = 0
             for chunk in chunks:
-                if len(chunk) > 20: # Ignore tiny fragments
-                    self.cursor.execute("INSERT INTO documents (source_file, content_chunk) VALUES (?, ?)", (filename, chunk))
+                if len(chunk) > 20:  # Ignore tiny fragments
+                    encrypted_chunk = self._encrypt(chunk)
+                    self.cursor.execute(
+                        "INSERT INTO documents (source_file, content_chunk) VALUES (?, ?)",
+                        (filename, encrypted_chunk))
                 count += 1
             self.conn.commit()
             return count
@@ -588,37 +726,44 @@ class MemoryManager:
             return 0
 
     def retrieve_context(self, query, project_id=None):
-        """Simple RAG: Keyword matching (SQLite LIKE) to find relevant chunks."""
-        # Extract significant words (len > 3)
-        keywords = [w for w in query.split() if len(w) > 3]
-        if not keywords: 
+        """RAG retrieval: decrypt chunks in Python then keyword-match.
+
+        Because document chunks are stored as Fernet ciphertext, SQL LIKE
+        queries cannot search inside them. Instead we load up to 500 chunks
+        (the practical maximum for a personal RAG corpus), decrypt each one,
+        and filter by keyword in Python — returning up to 3 best matches.
+        """
+        keywords = [w.lower() for w in query.split() if len(w) > 3]
+        if not keywords:
             return ""
-        
-        # Build query dynamically
-        conditions = []
-        params = []
-        for word in keywords:
-            conditions.append("content_chunk LIKE ?")
-            params.append(f"%{word}%")
-        
-        if not conditions: 
-            return ""
-        
-        # Add project filter if specified
+
+        # Load candidate chunks; apply project scope if provided
         if project_id:
-            sql = f"SELECT source_file, content_chunk FROM documents WHERE project_id=? AND ({' OR '.join(conditions)}) LIMIT 3"
-            params = [project_id] + params
+            self.cursor.execute(
+                "SELECT source_file, content_chunk FROM documents WHERE project_id=? LIMIT 500",
+                (project_id,))
         else:
-            sql = f"SELECT source_file, content_chunk FROM documents WHERE {' OR '.join(conditions)} LIMIT 3"
-        
-        self.cursor.execute(sql, params)
-        results = self.cursor.fetchall()
-        
-        if not results: 
+            self.cursor.execute(
+                "SELECT source_file, content_chunk FROM documents LIMIT 500")
+        rows = self.cursor.fetchall()
+
+        if not rows:
             return ""
-        
+
+        matches = []
+        for source, encrypted_chunk in rows:
+            chunk = self._decrypt(encrypted_chunk)  # graceful for legacy plaintext
+            chunk_lower = chunk.lower()
+            if any(kw in chunk_lower for kw in keywords):
+                matches.append((source, chunk))
+            if len(matches) >= 3:
+                break
+
+        if not matches:
+            return ""
+
         context_str = "\n[RELEVANT DOCUMENTS]:\n"
-        for source, chunk in results:
+        for source, chunk in matches:
             context_str += f"Source ({source}): {chunk[:400]}...\n"
         return context_str
 
@@ -1069,6 +1214,60 @@ class EncryptionManager:
         if isinstance(encrypted_data, str):
             encrypted_data = encrypted_data.encode()
         return self.cipher.decrypt(encrypted_data).decode()
+
+
+# ==============================================================================
+#                     CLOUD API KEY MANAGEMENT HELPERS
+# ==============================================================================
+
+def save_api_key(provider_name, api_key):
+    """Encrypt and save API key to config."""
+    try:
+        cfg_mgr = ConfigManager()
+        encryptor = EncryptionManager()
+        api_keys = cfg_mgr.config.get("cloud_api_keys") or {}
+        encrypted_key = encryptor.encrypt(api_key)
+        api_keys[provider_name] = encrypted_key
+        cfg_mgr.update("cloud_api_keys", api_keys)
+        return True, "API key saved successfully"
+    except Exception as e:
+        return False, f"Failed to save API key: {e}"
+
+
+def get_api_key(provider_name):
+    """Decrypt and return API key from config."""
+    try:
+        cfg_mgr = ConfigManager()
+        api_keys = cfg_mgr.config.get("cloud_api_keys") or {}
+        encrypted_key = api_keys.get(provider_name)
+        if not encrypted_key:
+            return None
+        encryptor = EncryptionManager()
+        return encryptor.decrypt(encrypted_key)
+    except Exception as e:
+        print(f"{Colors.YELLOW}[WARN]{Colors.RESET} Failed to decrypt API key: {e}")
+        return None
+
+
+def delete_api_key(provider_name):
+    """Remove API key from config."""
+    try:
+        cfg_mgr = ConfigManager()
+        api_keys = cfg_mgr.config.get("cloud_api_keys") or {}
+        if provider_name in api_keys:
+            del api_keys[provider_name]
+            cfg_mgr.update("cloud_api_keys", api_keys)
+            return True, "API key deleted successfully"
+        return False, "API key not found"
+    except Exception as e:
+        return False, f"Failed to delete API key: {e}"
+
+
+def mask_api_key(api_key):
+    """Mask API key for display: show first 8 + last 4 chars."""
+    if not api_key or len(api_key) < 12:
+        return "***" if api_key else "(not set)"
+    return f"{api_key[:8]}...{api_key[-4:]}"
 
 
 class APIServerManager:
@@ -1638,6 +1837,7 @@ class ToolRegistry:
         self.custom_tool_manager = CustomToolManager()
         self.playwright_browsers_installed = False
         self.browser_manager = BrowserManager() if PLAYWRIGHT_AVAILABLE else None
+        self.working_directory = None  # Set by App when user does /traverse
         self.load_mcp_servers()
         # Check Playwright browsers in background to avoid blocking startup
         threading.Thread(target=self._ensure_playwright_browsers, daemon=True).start()
@@ -1724,7 +1924,7 @@ class ToolRegistry:
         p += "IMPORTANT: Always use OS-appropriate commands for the detected platform!\n"
         
         p += "\n### AVAILABLE TOOLS ###\n"
-        p += "SYNTAX: When using tools, respond with 'ACTION: [Tool_Name] [Arguments]'\n"
+        p += "SYNTAX: Response must start with 'ACTION: [Tool_Name] [Arguments]'\n"
         p += "IMPORTANT: Do NOT wrap file paths in brackets []. Use: FILE_READ ~/Desktop/file.txt\n"
         p += "CRITICAL FOR SCRIPTS: When writing scripts (batch, PowerShell, bash, Python, etc.), write the COMPLETE script!\n"
         p += "                      Include ALL code from start to finish - never truncate or cut off mid-script!\n"
@@ -1775,10 +1975,33 @@ class ToolRegistry:
         else:
             p += "     Note: Playwright not installed - using basic HTTP requests (install with: pip install playwright && python -m playwright install)\n"
         p += "   - ACTION: FILE_READ [path] (Reads file content)\n"
-        p += "   - ACTION: FILE_WRITE [path] | [content] (CREATES file and parent dirs automatically)\n"
-        p += "     Example: ACTION: FILE_WRITE ~/Desktop/test.txt | Hello World\n"
+        p += "   - ACTION: FILE_WRITE [path] | [content] (Creates/overwrites file. MULTI-LINE content supported!)\n"
+        p += "     Example: ACTION: FILE_WRITE myapp/main.py | import sys\n"
+        p += "     def main():\n"
+        p += "         print('Hello World')\n"
+        p += "     if __name__ == '__main__':\n"
+        p += "         main()\n"
         p += "   - ACTION: FILE_LIST [path] (Lists directory contents)\n"
-        
+        p += "   - ACTION: FILE_EDIT [path] ||| [old_text] ||| [new_text] (Edit specific text - PREFERRED for fixes)\n"
+        p += "     Both old_text and new_text support MULTI-LINE content!\n"
+        p += "     Example: ACTION: FILE_EDIT main.py ||| print(\"hello\") ||| print(\"Hello, World!\")\n"
+        p += "     IMPORTANT: Use FILE_EDIT instead of FILE_WRITE when fixing existing files!\n"
+        p += "   - ACTION: FILE_APPEND [path] | [content] (Append content to end of file. MULTI-LINE supported)\n"
+        p += "\n### MULTI-STEP CODING WORKFLOW ###\n"
+        p += "You can chain multiple actions across turns to accomplish complex tasks:\n"
+        p += "\n  FOR FIXING/EDITING EXISTING CODE (preferred):\n"
+        p += "  Step 1: Read the file        → ACTION: FILE_READ path/to/file.py\n"
+        p += "  Step 2: Analyze the code (results are fed back to you automatically)\n"
+        p += "  Step 3: Apply targeted fix   → ACTION: FILE_EDIT path/to/file.py ||| broken_code ||| fixed_code\n"
+        p += "  IMPORTANT: Use FILE_EDIT for fixes! It replaces ONLY the broken part.\n"
+        p += "  NEVER rewrite entire files with FILE_WRITE when fixing - you WILL run out of tokens.\n"
+        p += "  Copy the exact broken text for old_text, then provide the corrected version.\n"
+        p += "\n  FOR CREATING NEW FILES (multi-line content fully supported):\n"
+        p += "  Use ACTION: FILE_WRITE path/to/file.py | [complete file content - write ALL lines]\n"
+        p += "\n  FOR ADDING TO EXISTING FILES:\n"
+        p += "  Use ACTION: FILE_APPEND path/to/file.py | [content to add at end]\n"
+        p += "\n  After each ACTION, the result is fed back to you automatically.\n"
+        p += "  You can perform multiple ACTION calls in a single response.\n"
         p += "\n### DESKTOP INTERACTION EXAMPLES ###\n"
         if is_windows:
             p += "To create a folder on Desktop:\n"
@@ -1837,10 +2060,11 @@ class ToolRegistry:
         1. Strips quotes/brackets (AI hallucinations).
         2. Expands ~ to user home.
         3. Enforces Sandbox if 'enable_dangerous_commands' is False.
+        4. Uses working_directory for relative paths when set.
         """
         # Cleanup AI hallucinations like [path] or "path"
         clean = raw_path.strip().replace('[', '').replace(']', '').replace('"', '').replace("'", "")
-        
+
         # Expand user (~ -> /home/user or C:\Users\user)
         full_path = os.path.expanduser(clean)
         full_path = os.path.normpath(full_path)
@@ -1849,13 +2073,42 @@ class ToolRegistry:
             # SAFE MODE: Force filename into sandbox
             filename = os.path.basename(full_path)
             return os.path.join(SANDBOX_DIR, filename)
-        
+
         # DANGEROUS MODE: Allow absolute paths
         if os.path.isabs(full_path):
             return full_path
-        
-        # Relative path -> anchor to sandbox
-        return os.path.join(SANDBOX_DIR, full_path)
+
+        # Relative path -> anchor to working_directory if set, else sandbox
+        base = self.working_directory if self.working_directory and os.path.isdir(self.working_directory) else SANDBOX_DIR
+        return os.path.join(base, full_path)
+
+    def _clean_code_content(self, raw_content):
+        """Extract clean code from LLM output - strips markdown fences, trailing commentary."""
+        content = raw_content
+        # Strip leading/trailing whitespace
+        content = content.strip()
+
+        # Remove markdown code fences (```python ... ``` or ```lang ... ```)
+        if content.startswith("```"):
+            lines = content.split("\n")
+            # Remove opening fence line
+            if lines[0].strip().startswith("```"):
+                lines = lines[1:]
+            # Remove closing fence
+            if lines and lines[-1].strip() == "```":
+                lines = lines[:-1]
+            content = "\n".join(lines)
+
+        # Handle case where content ends with ``` mid-text
+        if "\n```" in content:
+            # Only strip if it looks like a closing fence (line is just ```)
+            parts = content.rsplit("\n```", 1)
+            after = parts[1].strip() if len(parts) > 1 else ""
+            # If nothing meaningful after the ```, it was a closing fence
+            if not after or all(c in '`\n \t' for c in after):
+                content = parts[0]
+
+        return content.strip()
 
     def execute_native(self, tool_cmd):
         parts = tool_cmd.strip().split(" ", 1)
@@ -1883,7 +2136,8 @@ class ToolRegistry:
                         except Exception as e:
                             return f"Touch Error: {e}"
                 
-                return subprocess.check_output(expanded_args, shell=True, text=True, stderr=subprocess.STDOUT).strip()
+                cwd = self.working_directory if self.working_directory and os.path.isdir(self.working_directory) else None
+                return subprocess.check_output(expanded_args, shell=True, text=True, stderr=subprocess.STDOUT, cwd=cwd).strip()
             except subprocess.CalledProcessError as e:
                 return f"CMD Error: {e.output}"
         
@@ -1984,7 +2238,8 @@ class ToolRegistry:
                 return "Error: BROWSE_WAIT requires a number (milliseconds)"
 
         elif action == "FILE_LIST":
-            target = self.resolve_path(args) if args else SANDBOX_DIR
+            default_dir = self.working_directory if self.working_directory and os.path.isdir(self.working_directory) else SANDBOX_DIR
+            target = self.resolve_path(args) if args else default_dir
             if os.path.exists(target):
                 return str(os.listdir(target))
             return "Directory not found."
@@ -2001,15 +2256,89 @@ class ToolRegistry:
                 return "Error: Use format 'FILE_WRITE path | content'"
             raw_path, content = args.split("|", 1)
             target = self.resolve_path(raw_path)
-            
+            content = self._clean_code_content(content)
+
             try:
                 # Ensure directory exists
-                os.makedirs(os.path.dirname(target), exist_ok=True)
+                target_dir = os.path.dirname(target)
+                if target_dir:
+                    os.makedirs(target_dir, exist_ok=True)
                 with open(target, 'w', encoding='utf-8') as f:
-                    f.write(content.strip())
-                return f"Successfully wrote to {target}"
+                    f.write(content)
+                lines_written = len(content.split('\n'))
+                return f"Successfully wrote {lines_written} lines to {target}"
             except Exception as e:
                 return f"Write Error: {e}"
+
+
+        elif action == "FILE_EDIT":
+            # Targeted find-and-replace edit: FILE_EDIT path ||| old_text ||| new_text
+            if "|||" not in args:
+                return "Error: Use format 'FILE_EDIT path ||| old_text ||| new_text'"
+            parts = args.split("|||")
+            if len(parts) < 3:
+                return "Error: FILE_EDIT requires path ||| old_text ||| new_text"
+            raw_path = parts[0].strip()
+            old_text = self._clean_code_content(parts[1])
+            new_text = self._clean_code_content(parts[2])
+            target = self.resolve_path(raw_path)
+            if not os.path.exists(target):
+                return f"File not found: {target}"
+            try:
+                with open(target, 'r', encoding='utf-8', errors='replace') as f:
+                    content = f.read()
+                if old_text in content:
+                    content = content.replace(old_text, new_text, 1)
+                else:
+                    # Try with normalized whitespace (multi-line aware)
+                    old_normalized = " ".join(old_text.split())
+                    found = False
+                    # Try multi-line block matching with normalized whitespace
+                    content_normalized = " ".join(content.split())
+                    if old_normalized in content_normalized:
+                        # Find the actual position by scanning lines
+                        old_lines = old_text.strip().split("\n")
+                        content_lines = content.split("\n")
+                        for i in range(len(content_lines) - len(old_lines) + 1):
+                            block = content_lines[i:i + len(old_lines)]
+                            block_normalized = " ".join(" ".join(block).split())
+                            if old_normalized == block_normalized or old_normalized in block_normalized:
+                                # Replace this block
+                                content_lines[i:i + len(old_lines)] = new_text.split("\n")
+                                content = "\n".join(content_lines)
+                                found = True
+                                break
+                    if not found:
+                        # Fallback: single-line fuzzy match
+                        for line_content in content.split("\n"):
+                            if old_normalized in " ".join(line_content.split()):
+                                content = content.replace(line_content, new_text, 1)
+                                found = True
+                                break
+                    if not found:
+                        return f"Error: Could not find the text to replace in {target}. Make sure the old_text matches exactly."
+                with open(target, 'w', encoding='utf-8') as f:
+                    f.write(content)
+                return f"Successfully edited {target}"
+            except Exception as e:
+                return f"Edit Error: {e}"
+
+        elif action == "FILE_APPEND":
+            # Append content to file: FILE_APPEND path | content
+            if "|" not in args:
+                return "Error: Use format 'FILE_APPEND path | content'"
+            raw_path, content = args.split("|", 1)
+            target = self.resolve_path(raw_path)
+            content = self._clean_code_content(content)
+            try:
+                target_dir = os.path.dirname(target)
+                if target_dir:
+                    os.makedirs(target_dir, exist_ok=True)
+                with open(target, 'a', encoding='utf-8') as f:
+                    f.write(content + "\n")
+                return f"Successfully appended to {target}"
+            except Exception as e:
+                return f"Append Error: {e}"
 
         return "Unknown Action."
 
@@ -2409,16 +2738,20 @@ class AIEngine:
         print(f"{Colors.BRIGHT_CYAN}[SYSTEM]{Colors.RESET} Loading Backend: {Colors.BRIGHT_WHITE}{self.backend}{Colors.RESET} ({Colors.BRIGHT_WHITE}{self.model_name}{Colors.RESET})...")
         apply_torch_threading(self.config)
         if self.backend == "huggingface":
+            if not TORCH_AVAILABLE:
+                print(f"{Colors.BRIGHT_RED}[CRITICAL]{Colors.RESET} HuggingFace backend requires torch and transformers. Install with: pip install torch transformers")
+                print(f"{Colors.YELLOW}[HINT]{Colors.RESET} Switch to a cloud backend or Ollama in Settings > Change AI Backend.")
+                return
             try:
                 self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
                 if not self.tokenizer.pad_token:
                     self.tokenizer.pad_token = self.tokenizer.eos_token
-            
-                if torch.cuda.is_available(): 
+
+                if torch.cuda.is_available():
                     self.device = "cuda"
-                elif torch.backends.mps.is_available(): 
+                elif torch.backends.mps.is_available():
                     self.device = "mps"
-                
+
                 self.model = AutoModelForCausalLM.from_pretrained(self.model_name)
                 self.model.to(self.device)
                 print(f"{Colors.BRIGHT_GREEN}[SYSTEM]{Colors.RESET} Model loaded on {Colors.BRIGHT_WHITE}{self.device}{Colors.RESET}.")
@@ -2427,8 +2760,25 @@ class AIEngine:
                 sys.exit(1)
         elif self.backend == "ollama":
             try:
-                requests.get("http://localhost:11434")
-                print(f"{Colors.BRIGHT_GREEN}[SYSTEM]{Colors.RESET} Ollama connection established.")
+                requests.get("http://localhost:11434", timeout=3)
+                # Verify the configured model is available
+                available_models = get_ollama_models()
+                if available_models:
+                    if self.model_name and self.model_name in available_models:
+                        print(f"{Colors.BRIGHT_GREEN}[SYSTEM]{Colors.RESET} Ollama connection established. Using model: {self.model_name}")
+                    elif self.model_name and any(self.model_name.split(":")[0] == m.split(":")[0] for m in available_models):
+                        # Partial match (e.g., "llama3" matches "llama3:latest")
+                        matched = next(m for m in available_models if self.model_name.split(":")[0] == m.split(":")[0])
+                        print(f"{Colors.BRIGHT_CYAN}[SYSTEM]{Colors.RESET} Ollama: Matched model {self.model_name} → {matched}")
+                        self.model_name = matched
+                    elif available_models:
+                        # Model not found, auto-select first available
+                        old_model = self.model_name
+                        self.model_name = available_models[0]
+                        print(f"{Colors.YELLOW}[WARNING]{Colors.RESET} Model '{old_model}' not found in Ollama. Auto-selected: {self.model_name}")
+                        print(f"{Colors.DIM}  Available: {', '.join(available_models[:5])}{Colors.RESET}")
+                else:
+                    print(f"{Colors.YELLOW}[WARNING]{Colors.RESET} Ollama running but no models found. Pull a model: ollama pull llama3")
             except:
                 print(f"{Colors.YELLOW}[WARNING]{Colors.RESET} Ollama is not running on localhost:11434.")
         elif self.backend == "llama_cpp":
@@ -2456,10 +2806,29 @@ class AIEngine:
                     print(f"{Colors.YELLOW}[WARNING]{Colors.RESET} llama.cpp server responded with status {response.status_code}.")
             except requests.exceptions.RequestException:
                 print(f"{Colors.YELLOW}[WARNING]{Colors.RESET} llama.cpp server not reachable at {base_url}.")
+        elif self.backend in ["openai", "anthropic", "gemini", "openrouter", "groq", "deepseek", "hf_cloud"]:
+            # Use the backend-specific model key
+            model_key = f"{self.backend}_model"
+            backend_model = self.config.get(model_key)
+            if backend_model:
+                self.model_name = backend_model
+            provider_names = {
+                "openai": "OpenAI", "anthropic": "Anthropic", "gemini": "Gemini",
+                "openrouter": "OpenRouter", "groq": "Groq",
+                "deepseek": "DeepSeek", "hf_cloud": "HuggingFace Cloud"
+            }
+            provider_name = provider_names.get(self.backend, self.backend.upper())
+            api_key = get_api_key(self.backend)
+            if not api_key:
+                print(f"{Colors.YELLOW}[WARNING]{Colors.RESET} {provider_name} API key not configured. Configure in Settings > Manage Cloud API Keys.")
+            else:
+                print(f"{Colors.BRIGHT_GREEN}[SYSTEM]{Colors.RESET} {provider_name} backend ready (model: {self.model_name}, API key configured).")
 
     def generate(self, prompt, timeout=180):
         """Generate AI response with configurable timeout."""
         if self.backend == "huggingface":
+            if not TORCH_AVAILABLE or self.tokenizer is None:
+                return "Error: HuggingFace backend requires torch and transformers. Install with: pip install torch transformers"
             inputs = self.tokenizer(prompt, return_tensors="pt", truncation=True, max_length=2048).to(self.device)
             with torch.no_grad():
                 out = self.model.generate(
@@ -2509,10 +2878,10 @@ class AIEngine:
             try:
                 res = resilient_request(
                     'post',
-                    f"{base_url}/v1/completions",
+                    f"{base_url}/v1/chat/completions",
                     json={
                         "model": self.model_name,
-                        "prompt": prompt,
+                        "messages": [{"role": "user", "content": prompt}],
                         "temperature": self.config.get("temperature"),
                         "max_tokens": self.config.get("max_response_tokens")
                     },
@@ -2524,13 +2893,13 @@ class AIEngine:
                     data = res.json()
                     choices = data.get("choices", [])
                     if choices:
-                        text = choices[0].get("text")
-                        if text:
-                            return text.strip()
                         message = choices[0].get("message", {})
                         content = message.get("content")
                         if content:
                             return content.strip()
+                        text_fallback = choices[0].get("text")
+                        if text_fallback:
+                            return text_fallback.strip()
                     return "No response from llama.cpp server."
                 return f"llama.cpp Error: {res.text}"
             except requests.exceptions.ConnectionError:
@@ -2539,6 +2908,247 @@ class AIEngine:
                 return "Request timed out. The model may be slow or server overloaded."
             except Exception as e:
                 return f"Error: {e}"
+        elif self.backend == "openai":
+            return self._generate_openai(prompt, timeout)
+        elif self.backend == "anthropic":
+            return self._generate_anthropic(prompt, timeout)
+        elif self.backend == "gemini":
+            return self._generate_gemini(prompt, timeout)
+        elif self.backend == "openrouter":
+            return self._generate_openrouter(prompt, timeout)
+        elif self.backend == "groq":
+            return self._generate_groq(prompt, timeout)
+        elif self.backend == "deepseek":
+            return self._generate_deepseek(prompt, timeout)
+        elif self.backend == "hf_cloud":
+            return self._generate_hf_cloud(prompt, timeout)
+
+    def _generate_openai(self, prompt, timeout):
+        """Generate response using OpenAI API."""
+        try:
+            api_key = get_api_key("openai")
+            if not api_key:
+                return "Error: OpenAI API key not configured"
+            base_url = normalize_base_url(self.config.get("openai_base_url", "https://api.openai.com/v1"))
+            model = self.config.get("openai_model", "gpt-4o")
+            headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+            res = resilient_request('post', f"{base_url}/chat/completions", headers=headers,
+                json={"model": model, "messages": [{"role": "user", "content": prompt}],
+                      "temperature": self.config.get("temperature", 0.7),
+                      "max_tokens": self.config.get("max_response_tokens", 2000)},
+                timeout=timeout, max_retries=2, retry_delay=2.0)
+            if res.status_code == 200:
+                data = res.json()
+                if "choices" in data and data["choices"]:
+                    content = data["choices"][0].get("message", {}).get("content", "").strip()
+                    return content if content else "No response from OpenAI"
+                return "Invalid response format from OpenAI"
+            elif res.status_code == 401:
+                return "Error: Invalid OpenAI API key"
+            elif res.status_code == 429:
+                return "Error: OpenAI rate limit exceeded. Try again later."
+            elif res.status_code == 402:
+                return "Error: OpenAI account out of credits"
+            else:
+                return f"OpenAI Error ({res.status_code}): {res.text[:100]}"
+        except requests.exceptions.Timeout:
+            return "Error: OpenAI request timed out"
+        except Exception as e:
+            return f"OpenAI Error: {str(e)[:100]}"
+
+    def _generate_anthropic(self, prompt, timeout):
+        """Generate response using Anthropic API."""
+        try:
+            api_key = get_api_key("anthropic")
+            if not api_key:
+                return "Error: Anthropic API key not configured"
+            base_url = normalize_base_url(self.config.get("anthropic_base_url", "https://api.anthropic.com/v1"))
+            model = self.config.get("anthropic_model", "claude-3-5-sonnet-20241022")
+            headers = {"x-api-key": api_key, "anthropic-version": "2023-06-01", "content-type": "application/json"}
+            res = resilient_request('post', f"{base_url}/messages", headers=headers,
+                json={"model": model, "messages": [{"role": "user", "content": prompt}],
+                      "max_tokens": self.config.get("max_response_tokens", 2000),
+                      "temperature": self.config.get("temperature", 0.7)},
+                timeout=timeout, max_retries=2, retry_delay=2.0)
+            if res.status_code == 200:
+                data = res.json()
+                if "content" in data and data["content"]:
+                    content = data["content"][0].get("text", "").strip()
+                    return content if content else "No response from Anthropic"
+                return "Invalid response format from Anthropic"
+            elif res.status_code == 401:
+                return "Error: Invalid Anthropic API key"
+            elif res.status_code == 429:
+                return "Error: Anthropic rate limit exceeded. Try again later."
+            else:
+                return f"Anthropic Error ({res.status_code}): {res.text[:100]}"
+        except requests.exceptions.Timeout:
+            return "Error: Anthropic request timed out"
+        except Exception as e:
+            return f"Anthropic Error: {str(e)[:100]}"
+
+    def _generate_gemini(self, prompt, timeout):
+        """Generate response using Google Gemini API."""
+        try:
+            api_key = get_api_key("gemini")
+            if not api_key:
+                return "Error: Gemini API key not configured"
+            base_url = normalize_base_url(self.config.get("gemini_base_url", "https://generativelanguage.googleapis.com/v1beta"))
+            model = self.config.get("gemini_model", "gemini-2.0-flash-exp")
+            res = resilient_request('post', f"{base_url}/models/{model}:generateContent",
+                json={"contents": [{"parts": [{"text": prompt}]}],
+                      "generationConfig": {"temperature": self.config.get("temperature", 0.7),
+                                          "maxOutputTokens": self.config.get("max_response_tokens", 2000)}},
+                params={"key": api_key}, timeout=timeout, max_retries=2, retry_delay=2.0)
+            if res.status_code == 200:
+                data = res.json()
+                if "candidates" in data and data["candidates"]:
+                    content = data["candidates"][0].get("content", {}).get("parts", [])
+                    if content and "text" in content[0]:
+                        return content[0]["text"].strip()
+                    return "No response from Gemini"
+                return "Invalid response format from Gemini"
+            elif res.status_code in [401, 403]:
+                return "Error: Invalid Gemini API key"
+            elif res.status_code == 429:
+                return "Error: Gemini rate limit exceeded. Try again later."
+            else:
+                return f"Gemini Error ({res.status_code}): {res.text[:100]}"
+        except requests.exceptions.Timeout:
+            return "Error: Gemini request timed out"
+        except Exception as e:
+            return f"Gemini Error: {str(e)[:100]}"
+
+    def _generate_openrouter(self, prompt, timeout):
+        """Generate response using OpenRouter API."""
+        try:
+            api_key = get_api_key("openrouter")
+            if not api_key:
+                return "Error: OpenRouter API key not configured"
+            base_url = normalize_base_url(self.config.get("openrouter_base_url", "https://openrouter.ai/api/v1"))
+            model = self.config.get("openrouter_model", "anthropic/claude-3.5-sonnet")
+            headers = {"Authorization": f"Bearer {api_key}", "HTTP-Referer": "https://github.com/repackedadmin/ai_terminal_pro",
+                      "X-Title": "AI Terminal Pro", "Content-Type": "application/json"}
+            res = resilient_request('post', f"{base_url}/chat/completions", headers=headers,
+                json={"model": model, "messages": [{"role": "user", "content": prompt}],
+                      "temperature": self.config.get("temperature", 0.7),
+                      "max_tokens": self.config.get("max_response_tokens", 2000)},
+                timeout=timeout, max_retries=2, retry_delay=2.0)
+            if res.status_code == 200:
+                data = res.json()
+                if "choices" in data and data["choices"]:
+                    content = data["choices"][0].get("message", {}).get("content", "").strip()
+                    return content if content else "No response from OpenRouter"
+                return "Invalid response format from OpenRouter"
+            elif res.status_code == 401:
+                return "Error: Invalid OpenRouter API key"
+            elif res.status_code == 402:
+                return "Error: OpenRouter account out of credits"
+            elif res.status_code == 429:
+                return "Error: OpenRouter rate limit exceeded. Try again later."
+            else:
+                return f"OpenRouter Error ({res.status_code}): {res.text[:100]}"
+        except requests.exceptions.Timeout:
+            return "Error: OpenRouter request timed out"
+        except Exception as e:
+            return f"OpenRouter Error: {str(e)[:100]}"
+
+    def _generate_groq(self, prompt, timeout):
+        """Generate response using Groq API (OpenAI-compatible, ultra-fast inference)."""
+        try:
+            api_key = get_api_key("groq")
+            if not api_key:
+                return "Error: Groq API key not configured. Add it via Settings > Manage Cloud API Keys."
+            base_url = normalize_base_url(self.config.get("groq_base_url", "https://api.groq.com/openai/v1"))
+            model = self.config.get("groq_model", "llama-3.3-70b-versatile")
+            headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+            res = resilient_request('post', f"{base_url}/chat/completions", headers=headers,
+                json={"model": model, "messages": [{"role": "user", "content": prompt}],
+                      "temperature": self.config.get("temperature", 0.7),
+                      "max_tokens": self.config.get("max_response_tokens", 2000)},
+                timeout=timeout, max_retries=2, retry_delay=2.0)
+            if res.status_code == 200:
+                data = res.json()
+                if "choices" in data and data["choices"]:
+                    content = data["choices"][0].get("message", {}).get("content", "").strip()
+                    return content if content else "No response from Groq"
+                return "Invalid response format from Groq"
+            elif res.status_code == 401:
+                return "Error: Invalid Groq API key"
+            elif res.status_code == 429:
+                return "Error: Groq rate limit exceeded. Try again later."
+            else:
+                return f"Groq Error ({res.status_code}): {res.text[:100]}"
+        except requests.exceptions.Timeout:
+            return "Error: Groq request timed out"
+        except Exception as e:
+            return f"Groq Error: {str(e)[:100]}"
+
+    def _generate_deepseek(self, prompt, timeout):
+        """Generate response using DeepSeek API (OpenAI-compatible)."""
+        try:
+            api_key = get_api_key("deepseek")
+            if not api_key:
+                return "Error: DeepSeek API key not configured. Add it via Settings > Manage Cloud API Keys."
+            base_url = normalize_base_url(self.config.get("deepseek_base_url", "https://api.deepseek.com/v1"))
+            model = self.config.get("deepseek_model", "deepseek-chat")
+            headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+            res = resilient_request('post', f"{base_url}/chat/completions", headers=headers,
+                json={"model": model, "messages": [{"role": "user", "content": prompt}],
+                      "temperature": self.config.get("temperature", 0.7),
+                      "max_tokens": self.config.get("max_response_tokens", 2000)},
+                timeout=timeout, max_retries=2, retry_delay=2.0)
+            if res.status_code == 200:
+                data = res.json()
+                if "choices" in data and data["choices"]:
+                    content = data["choices"][0].get("message", {}).get("content", "").strip()
+                    return content if content else "No response from DeepSeek"
+                return "Invalid response format from DeepSeek"
+            elif res.status_code == 401:
+                return "Error: Invalid DeepSeek API key"
+            elif res.status_code == 402:
+                return "Error: DeepSeek account out of credits"
+            elif res.status_code == 429:
+                return "Error: DeepSeek rate limit exceeded. Try again later."
+            else:
+                return f"DeepSeek Error ({res.status_code}): {res.text[:100]}"
+        except requests.exceptions.Timeout:
+            return "Error: DeepSeek request timed out"
+        except Exception as e:
+            return f"DeepSeek Error: {str(e)[:100]}"
+
+    def _generate_hf_cloud(self, prompt, timeout):
+        """Generate response using HuggingFace Inference API (OpenAI-compatible v1 endpoint)."""
+        try:
+            api_key = get_api_key("hf_cloud")
+            if not api_key:
+                return "Error: HuggingFace Cloud API key not configured. Add it via Settings > Manage Cloud API Keys."
+            base_url = normalize_base_url(self.config.get("hf_cloud_base_url", "https://api-inference.huggingface.co/v1"))
+            model = self.config.get("hf_cloud_model", "mistralai/Mistral-7B-Instruct-v0.3")
+            headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+            res = resilient_request('post', f"{base_url}/chat/completions", headers=headers,
+                json={"model": model, "messages": [{"role": "user", "content": prompt}],
+                      "temperature": self.config.get("temperature", 0.7),
+                      "max_tokens": self.config.get("max_response_tokens", 2000)},
+                timeout=timeout, max_retries=2, retry_delay=2.0)
+            if res.status_code == 200:
+                data = res.json()
+                if "choices" in data and data["choices"]:
+                    content = data["choices"][0].get("message", {}).get("content", "").strip()
+                    return content if content else "No response from HuggingFace Cloud"
+                return "Invalid response format from HuggingFace Cloud"
+            elif res.status_code == 401:
+                return "Error: Invalid HuggingFace API token"
+            elif res.status_code == 429:
+                return "Error: HuggingFace rate limit exceeded. Try again later."
+            elif res.status_code == 503:
+                return "Error: HuggingFace model is loading. Wait a moment and try again."
+            else:
+                return f"HuggingFace Cloud Error ({res.status_code}): {res.text[:100]}"
+        except requests.exceptions.Timeout:
+            return "Error: HuggingFace Cloud request timed out"
+        except Exception as e:
+            return f"HuggingFace Cloud Error: {str(e)[:100]}"
 
 # ==============================================================================
 #                           6. MODEL DISCOVERY & DOWNLOAD
@@ -3535,6 +4145,84 @@ class ExtensionManager:
 #                           6. MULTI-AGENT APP BUILDER SYSTEM
 # ==============================================================================
 
+def extract_code_from_response(response):
+    """Extract clean code from an LLM response, stripping markdown fences and commentary.
+
+    Handles:
+    - ```python ... ``` blocks
+    - ```lang ... ``` blocks
+    - Multiple code blocks (returns them concatenated)
+    - Inline code without fences
+    - Mixed code + explanation text
+
+    Returns dict with 'code' (clean code string) and 'files' (list of (filename, code) tuples if multiple files detected).
+    """
+    import re
+
+    if not response or not response.strip():
+        return {"code": "", "files": []}
+
+    # Try to extract fenced code blocks first
+    fenced_pattern = re.compile(r'```(?:\w+)?\s*\n(.*?)```', re.DOTALL)
+    fenced_blocks = fenced_pattern.findall(response)
+
+    if fenced_blocks:
+        # Look for filename markers: # File: filename.py or similar
+        files = []
+        for block in fenced_blocks:
+            block = block.strip()
+            filename = None
+            # Check for file markers in first few lines
+            for line in block.split('\n')[:3]:
+                file_match = re.match(r'^#\s*(?:File|Filename|Path)\s*:\s*(.+)', line, re.IGNORECASE)
+                if file_match:
+                    filename = file_match.group(1).strip()
+                    break
+            if not filename:
+                # Try to detect from the content
+                file_match = re.search(r'([a-zA-Z0-9_/\\.-]+\.[a-zA-Z0-9]+)', block.split('\n')[0] if block else "")
+                # Only use if it looks like a real filename
+                if file_match and '.' in file_match.group(1) and len(file_match.group(1)) < 80:
+                    candidate = file_match.group(1)
+                    # Skip common false positives
+                    if candidate not in ("e.g.", "i.e.", "etc.", "0.0", "1.0"):
+                        filename = candidate
+
+            files.append((filename, block))
+
+        combined_code = "\n\n".join(block for _, block in files)
+        return {"code": combined_code, "files": files}
+
+    # No fenced blocks - try to extract code heuristically
+    lines = response.split('\n')
+    code_lines = []
+    in_code_section = False
+
+    for line in lines:
+        stripped = line.strip()
+        # Detect code-like lines
+        is_code = (
+            stripped.startswith(('import ', 'from ', 'def ', 'class ', 'if ', 'for ', 'while ',
+                                'return ', 'print(', 'try:', 'except', 'with ', '#!', '# File:',
+                                '@', '    ', '\t')) or
+            stripped.endswith((':',)) or
+            '=' in stripped and not stripped.startswith(('*', '-', '>'))
+        )
+
+        if is_code or (in_code_section and (stripped == '' or stripped.startswith(('#', '    ', '\t')))):
+            code_lines.append(line)
+            in_code_section = True
+        elif in_code_section and stripped and not is_code:
+            # Might be end of code section
+            in_code_section = False
+
+    if code_lines:
+        return {"code": "\n".join(code_lines).strip(), "files": []}
+
+    # Last resort: return trimmed response
+    return {"code": response.strip(), "files": []}
+
+
 class BaseAgent:
     """Base class for all AI agents."""
 
@@ -3546,20 +4234,24 @@ class BaseAgent:
 
     def think(self, context, max_tokens=500, timeout=120):
         """Generate response based on context with configurable timeout."""
-        # Streamlined prompt format for faster processing
         prompt = f"{self.system_prompt}\n\n{context}\n\nResponse:"
 
-        # Temporarily adjust settings for this agent
+        # Scale token limits for cloud backends
+        backend = self.ai_engine.config.get("backend", "ollama")
+        if backend in ("openrouter", "openai", "anthropic", "gemini", "groq", "deepseek", "hf_cloud"):
+            adjusted_max = min(max_tokens * 3, 8000)
+            adjusted_timeout = max(timeout, 180)
+        else:
+            adjusted_max = max_tokens
+            adjusted_timeout = timeout
+
         original_max = self.ai_engine.config.get('max_response_tokens', 250)
-        self.ai_engine.config['max_response_tokens'] = max_tokens
+        self.ai_engine.config['max_response_tokens'] = adjusted_max
 
-        response = self.ai_engine.generate(prompt, timeout=timeout)
+        response = self.ai_engine.generate(prompt, timeout=adjusted_timeout)
 
-        # Restore original
         self.ai_engine.config['max_response_tokens'] = original_max
-
         return response
-
 
 class SpecificationWriterAgent(BaseAgent):
     """Clarifies requirements and writes specifications."""
@@ -3646,54 +4338,130 @@ class DeveloperAgent(BaseAgent):
     """Plans implementation details for tasks."""
 
     def __init__(self, ai_engine):
-        system_prompt = "You are a Developer. Plan implementation briefly."
+        system_prompt = (
+            "You are a Senior Developer. Create detailed implementation plans.\n"
+            "For each task, provide:\n"
+            "1. TARGET FILE: exact filename and path\n"
+            "2. IMPORTS: required imports and dependencies\n"
+            "3. FUNCTIONS/CLASSES: names, parameters, return types\n"
+            "4. LOGIC: step-by-step implementation logic\n"
+            "5. INTEGRATION: how this connects to existing project files\n"
+            "Be specific - the coder will follow your plan exactly."
+        )
         super().__init__("Developer", "DEVELOPER", system_prompt, ai_engine)
 
     def plan_task(self, task, specification, architecture, existing_files):
         """Plan how to implement a task."""
-        # Minimal context for faster processing
-        spec_short = specification[:300] if len(specification) > 300 else specification
-        arch_short = architecture[:200] if len(architecture) > 200 else architecture
-        files_short = existing_files[:150] if len(existing_files) > 150 else existing_files
-        context = f"Task: {task}\nSpec: {spec_short}\nArch: {arch_short}\nExisting: {files_short}\n\nBrief plan: filename, functions to create."
-        return self.think(context, 300, timeout=90)
+        backend = self.ai_engine.config.get("backend", "ollama")
+        is_cloud = backend in ("openrouter", "openai", "anthropic", "gemini", "groq", "deepseek", "hf_cloud")
+
+        if is_cloud:
+            spec_limit, arch_limit, files_limit, max_tokens = 800, 600, 400, 800
+        else:
+            spec_limit, arch_limit, files_limit, max_tokens = 400, 300, 200, 500
+
+        spec_short = specification[:spec_limit] if specification else ""
+        arch_short = architecture[:arch_limit] if architecture else ""
+        files_short = existing_files[:files_limit] if existing_files else ""
+
+        context = (
+            f"TASK: {task}\n\n"
+            f"PROJECT SPEC:\n{spec_short}\n\n"
+            f"ARCHITECTURE:\n{arch_short}\n\n"
+            f"EXISTING FILES:\n{files_short}\n\n"
+            "Create a detailed implementation plan for this task. "
+            "Include: target filename, imports, function/class definitions, and integration points."
+        )
+        return self.think(context, max_tokens, timeout=120)
 
 
 class CodeMonkeyAgent(BaseAgent):
     """Writes actual code based on developer's plan."""
 
     def __init__(self, ai_engine):
-        system_prompt = "You are a coder. Write clean, working Python code. Output ONLY code, no explanations."
+        system_prompt = (
+            "You are an expert software engineer. Write complete, production-quality code.\n"
+            "RULES:\n"
+            "1. Start EVERY file with: # File: filename.py\n"
+            "2. Include ALL necessary imports at the top\n"
+            "3. Write COMPLETE implementations - no placeholders, no 'pass', no '# TODO'\n"
+            "4. Add proper error handling where needed\n"
+            "5. Follow the architecture and file structure exactly\n"
+            "6. Use consistent naming conventions\n"
+            "7. When referencing other project files, use correct import paths\n"
+            "8. Output ONLY the code - no explanations before or after\n"
+            "9. Wrap code in ```python fences for clarity"
+        )
         super().__init__("Code Monkey", "CODE_MONKEY", system_prompt, ai_engine)
 
-    def write_code(self, implementation_plan, existing_code=""):
-        """Write code based on plan."""
-        # Minimal context for faster code generation
-        plan_short = implementation_plan[:400] if len(implementation_plan) > 400 else implementation_plan
-        existing_short = existing_code[:500] if len(existing_code) > 500 else existing_code
+    def write_code(self, implementation_plan, existing_code="", spec="", architecture="", task_desc="", reviewer_feedback=""):
+        """Write code based on plan with full project context."""
+        backend = self.ai_engine.config.get("backend", "ollama")
+        is_cloud = backend in ("openrouter", "openai", "anthropic", "gemini", "groq", "deepseek", "hf_cloud")
 
-        context = f"Plan: {plan_short}"
+        if is_cloud:
+            plan_limit, code_limit, spec_limit, arch_limit = 2000, 3000, 1000, 800
+            max_tokens = 4096
+        else:
+            plan_limit, code_limit, spec_limit, arch_limit = 600, 800, 300, 200
+            max_tokens = 1500
+
+        plan_short = implementation_plan[:plan_limit]
+        existing_short = existing_code[:code_limit] if existing_code else ""
+
+        context = f"TASK: {task_desc[:300]}\n" if task_desc else ""
+        if spec:
+            context += f"\nPROJECT SPEC: {spec[:spec_limit]}\n"
+        if architecture:
+            context += f"\nARCHITECTURE: {architecture[:arch_limit]}\n"
+        context += f"\nIMPLEMENTATION PLAN:\n{plan_short}\n"
         if existing_short.strip():
-            context += f"\nContext: {existing_short}"
-        context += "\n\nWrite the Python code (include # File: filename.py at top):"
+            context += f"\nEXISTING PROJECT CODE (for reference/imports):\n{existing_short}\n"
+        if reviewer_feedback:
+            context += f"\nREVIEWER FEEDBACK (fix these issues):\n{reviewer_feedback[:500]}\n"
+        context += "\nWrite the COMPLETE code for this task. Start with # File: filename.py"
 
-        # Longer timeout for code generation (3 minutes)
-        return self.think(context, 800, timeout=180)
+        raw_response = self.think(context, max_tokens, timeout=300)
 
+        # Clean the response - extract actual code from markdown/commentary
+        result = extract_code_from_response(raw_response)
+        if result["code"] and len(result["code"].strip()) > 20:
+            return result["code"]
+        return raw_response
 
 class ReviewerAgent(BaseAgent):
     """Reviews code for issues."""
 
     def __init__(self, ai_engine):
-        system_prompt = "You are a Code Reviewer. Reply APPROVED if code looks good, or REJECTED: reason if not."
+        system_prompt = (
+            "You are a Code Reviewer. Check code for:\n"
+            "1. Completeness - no placeholder code, no 'pass', no TODO stubs\n"
+            "2. Correctness - proper logic, no obvious bugs\n"
+            "3. Imports - all needed imports present\n"
+            "4. Functionality - code actually does what the task requires\n\n"
+            "Reply format:\n"
+            "APPROVED - if code is complete and functional\n"
+            "REJECTED: [specific issues] - if code needs fixes. List EXACTLY what to fix."
+        )
         super().__init__("Reviewer", "REVIEWER", system_prompt, ai_engine)
 
     def review_code(self, code, task, implementation_plan):
-        """Review code quality - fast review."""
-        # Quick review - check first part of code
-        code_sample = code[:800] if len(code) > 800 else code
-        context = f"Task: {task[:100]}\nCode:\n{code_sample}\n\nReview: APPROVED or REJECTED: reason"
-        return self.think(context, 150, timeout=60)
+        """Review code quality."""
+        backend = self.ai_engine.config.get("backend", "ollama")
+        is_cloud = backend in ("openrouter", "openai", "anthropic", "gemini", "groq", "deepseek", "hf_cloud")
+
+        code_limit = 2000 if is_cloud else 1000
+        max_tokens = 300 if is_cloud else 200
+        code_sample = code[:code_limit] if len(code) > code_limit else code
+
+        context = (
+            f"TASK: {task[:200]}\n\n"
+            f"PLAN: {implementation_plan[:300]}\n\n"
+            f"CODE TO REVIEW:\n{code_sample}\n\n"
+            "Review this code. Reply APPROVED if it's complete and functional, "
+            "or REJECTED: with specific issues to fix."
+        )
+        return self.think(context, max_tokens, timeout=90)
 
 
 class TroubleshooterAgent(BaseAgent):
@@ -3743,6 +4511,175 @@ class TechnicalWriterAgent(BaseAgent):
         files_short = codebase_summary[:200] if len(codebase_summary) > 200 else codebase_summary
         context = f"Project: {project_name}\nSpec: {spec_short}\nArch: {arch_short}\nFiles: {files_short}\n\nWrite brief README: overview, install, usage."
         return self.think(context, 500, timeout=90)
+
+
+# Cloud API Model Discovery Functions
+def get_openai_models(api_key):
+    """Fetch available models from OpenAI API."""
+    if not api_key:
+        return ["gpt-4o", "gpt-4-turbo", "gpt-4", "gpt-3.5-turbo"]
+
+    try:
+        headers = {"Authorization": f"Bearer {api_key}"}
+        res = resilient_request(
+            'get',
+            'https://api.openai.com/v1/models',
+            headers=headers,
+            timeout=5,
+            max_retries=1
+        )
+        if res and res.status_code == 200:
+            data = res.json()
+            models = [m['id'] for m in data.get('data', [])
+                     if 'gpt' in m['id'].lower()][:15]
+            return models if models else ["gpt-4o", "gpt-4-turbo", "gpt-4", "gpt-3.5-turbo"]
+    except:
+        pass
+    return ["gpt-4o", "gpt-4-turbo", "gpt-4", "gpt-3.5-turbo"]
+
+def get_anthropic_models(api_key):
+    """Get available Claude models from Anthropic (no public endpoint)."""
+    return [
+        "claude-3-5-sonnet-20241022",
+        "claude-3-5-haiku-20241022",
+        "claude-3-opus-20250219",
+        "claude-3-sonnet-20240229",
+        "claude-3-haiku-20240307"
+    ]
+
+def get_gemini_models(api_key):
+    """Fetch available models from Google Gemini API."""
+    if not api_key:
+        return ["gemini-2.0-flash-exp", "gemini-1.5-pro", "gemini-1.5-flash"]
+
+    try:
+        res = resilient_request(
+            'get',
+            f'https://generativelanguage.googleapis.com/v1beta/models?key={api_key}',
+            timeout=5,
+            max_retries=1
+        )
+        if res and res.status_code == 200:
+            data = res.json()
+            models = [m['name'].split('/')[-1] for m in data.get('models', [])
+                     if 'generateContent' in m.get('supportedGenerationMethods', [])][:15]
+            return models if models else ["gemini-2.0-flash-exp", "gemini-1.5-pro", "gemini-1.5-flash"]
+    except:
+        pass
+    return ["gemini-2.0-flash-exp", "gemini-1.5-pro", "gemini-1.5-flash"]
+
+def get_openrouter_models(api_key):
+    """Fetch available models from OpenRouter API."""
+    if not api_key:
+        return [
+            "anthropic/claude-3.5-sonnet",
+            "openai/gpt-4o",
+            "google/gemini-2.0-flash-exp",
+            "meta-llama/llama-3.1-70b-instruct"
+        ]
+
+    try:
+        headers = {"Authorization": f"Bearer {api_key}"}
+        res = resilient_request(
+            'get',
+            'https://openrouter.ai/api/v1/models',
+            headers=headers,
+            timeout=5,
+            max_retries=1
+        )
+        if res and res.status_code == 200:
+            data = res.json()
+            models = [m['id'] for m in data.get('data', [])][:20]
+            return models if models else [
+                "anthropic/claude-3.5-sonnet",
+                "openai/gpt-4o",
+                "google/gemini-2.0-flash-exp"
+            ]
+    except:
+        pass
+    return [
+        "anthropic/claude-3.5-sonnet",
+        "openai/gpt-4o",
+        "google/gemini-2.0-flash-exp"
+    ]
+
+def get_groq_models(api_key):
+    """Fetch available models from Groq API (OpenAI-compatible)."""
+    fallback = [
+        "llama-3.3-70b-versatile",
+        "llama-3.1-70b-versatile",
+        "llama-3.1-8b-instant",
+        "llama3-70b-8192",
+        "llama3-8b-8192",
+        "mixtral-8x7b-32768",
+        "gemma2-9b-it",
+        "gemma-7b-it",
+    ]
+    if not api_key:
+        return fallback
+    try:
+        headers = {"Authorization": f"Bearer {api_key}"}
+        res = resilient_request(
+            'get',
+            'https://api.groq.com/openai/v1/models',
+            headers=headers,
+            timeout=5,
+            max_retries=1
+        )
+        if res and res.status_code == 200:
+            data = res.json()
+            models = [m['id'] for m in data.get('data', [])][:20]
+            return models if models else fallback
+    except:
+        pass
+    return fallback
+
+def get_deepseek_models(api_key):
+    """Fetch available models from DeepSeek API (OpenAI-compatible)."""
+    fallback = [
+        "deepseek-chat",
+        "deepseek-reasoner",
+        "deepseek-coder",
+    ]
+    if not api_key:
+        return fallback
+    try:
+        headers = {"Authorization": f"Bearer {api_key}"}
+        res = resilient_request(
+            'get',
+            'https://api.deepseek.com/v1/models',
+            headers=headers,
+            timeout=5,
+            max_retries=1
+        )
+        if res and res.status_code == 200:
+            data = res.json()
+            models = [m['id'] for m in data.get('data', [])][:20]
+            return models if models else fallback
+    except:
+        pass
+    return fallback
+
+def get_hf_cloud_models(api_key):
+    """Return curated list of HuggingFace Inference API models (chat/completions endpoint)."""
+    # HF Inference API does not expose a simple /models list endpoint for text-generation,
+    # so we return a well-known curated set that supports the v1/chat/completions endpoint.
+    return [
+        "mistralai/Mistral-7B-Instruct-v0.3",
+        "mistralai/Mixtral-8x7B-Instruct-v0.1",
+        "meta-llama/Meta-Llama-3-8B-Instruct",
+        "meta-llama/Meta-Llama-3-70B-Instruct",
+        "meta-llama/Llama-3.1-8B-Instruct",
+        "meta-llama/Llama-3.1-70B-Instruct",
+        "Qwen/Qwen2.5-72B-Instruct",
+        "Qwen/Qwen2.5-7B-Instruct",
+        "google/gemma-2-9b-it",
+        "google/gemma-2-27b-it",
+        "microsoft/Phi-3.5-mini-instruct",
+        "microsoft/Phi-3-medium-4k-instruct",
+        "HuggingFaceH4/zephyr-7b-beta",
+        "NousResearch/Nous-Hermes-2-Mixtral-8x7B-DPO",
+    ]
 
 
 class AppBuilderOrchestrator:
@@ -3855,6 +4792,96 @@ class AppBuilderOrchestrator:
         conn.close()
         return project
     
+    def list_projects(self):
+        """List all app projects."""
+        conn = sqlite3.connect(APP_PROJECTS_DB)
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, name, description, status, created_at FROM app_projects ORDER BY updated_at DESC")
+        projects = cursor.fetchall()
+        conn.close()
+        return projects
+
+    def get_tasks(self, project_id):
+        """Get all tasks for a project."""
+        conn = sqlite3.connect(APP_PROJECTS_DB)
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, task_number, description, status, implementation_plan FROM app_tasks WHERE project_id=? ORDER BY task_number", (project_id,))
+        tasks = cursor.fetchall()
+        conn.close()
+        return tasks
+
+    def get_files(self, project_id):
+        """Get all files for a project (alias for get_project_files)."""
+        return self.get_project_files(project_id)
+
+    def run_agent(self, project_id, agent_name, task_input):
+        """Run a specific agent on demand with task input."""
+        agent_map = {
+            'spec': self.spec_writer, 'specification': self.spec_writer,
+            'specificationwriter': self.spec_writer, 'architect': self.architect,
+            'techlead': self.tech_lead, 'developer': self.developer,
+            'codemonkey': self.code_monkey, 'reviewer': self.reviewer,
+            'troubleshooter': self.troubleshooter, 'debugger': self.debugger,
+            'technicalwriter': self.tech_writer, 'techwriter': self.tech_writer,
+            'writer': self.tech_writer
+        }
+
+        agent_key = agent_name.lower().replace(' ', '').replace('_', '')
+        agent = agent_map.get(agent_key)
+        if not agent:
+            available = "spec, architect, techlead, developer, codemonkey, reviewer, troubleshooter, debugger, techwriter"
+            return f"Unknown agent: {agent_name}. Available: {available}"
+
+        project = self.get_project(project_id)
+        if not project:
+            return "Error: Project not found"
+
+        spec = project[3] or ""
+        architecture = project[4] or ""
+
+        try:
+            if agent == self.spec_writer:
+                result = agent.write_specification(project[1], task_input)
+                self.update_project_field(project_id, "specification", result)
+            elif agent == self.architect:
+                result = agent.design_architecture(spec + "\n" + task_input if spec else task_input)
+                self.update_project_field(project_id, "architecture", result)
+            elif agent == self.tech_lead:
+                result = agent.create_tasks(spec, architecture + "\n" + task_input if architecture else task_input)
+            elif agent == self.developer:
+                files = self.get_project_files(project_id)
+                files_ctx = "\n".join([f"{fp}: {len(c)} chars" for fp, c in files])
+                result = agent.plan_task(task_input, spec, architecture, files_ctx)
+            elif agent == self.code_monkey:
+                files = self.get_project_files(project_id)
+                relevant = self.filter_relevant_context(task_input, files)
+                result = agent.write_code(task_input, relevant, spec=spec, architecture=architecture, task_desc=task_input)
+                # Try to save the generated code
+                filename = self.extract_filename(result, task_input, task_input)
+                if filename and result and len(result.strip()) > 20:
+                    self.save_file(project_id, filename, result)
+            elif agent == self.reviewer:
+                result = agent.review_code(task_input, "Manual review request", "")
+            elif agent == self.troubleshooter:
+                files = self.get_project_files(project_id)
+                state = f"Spec: {spec[:200]}\nFiles: {len(files)}"
+                result = agent.analyze_feedback(task_input, state)
+            elif agent == self.debugger:
+                files = self.get_project_files(project_id)
+                relevant = self.filter_relevant_context(task_input, files, max_context=3000)
+                result = agent.debug_issue(task_input, relevant, f"Project: {project[1]}")
+            elif agent == self.tech_writer:
+                files = self.get_project_files(project_id)
+                files_summary = "\n".join([fp for fp, _ in files])
+                result = agent.write_documentation(project[1], spec, architecture, files_summary)
+                if result and not self._is_ai_error(result):
+                    self.save_file(project_id, "README.md", result)
+            else:
+                result = "Error: Agent routing failed"
+            return result
+        except Exception as e:
+            return f"Error running agent: {str(e)}"
+
     def update_project_field(self, project_id, field, value):
         """Update a project field."""
         lock = getattr(self, "db_lock", None)
@@ -4057,6 +5084,11 @@ class AppBuilderOrchestrator:
             if failed:
                 print(f"{Colors.YELLOW}⚠ Failed: {', '.join(failed)}{Colors.RESET}")
 
+            # Generate initial project scaffolding
+            print(f"{Colors.BRIGHT_CYAN}Setting up project structure...{Colors.RESET}")
+            self._generate_gitignore(project_id)
+            print(f"{Colors.BRIGHT_GREEN}✓ Generated .gitignore{Colors.RESET}")
+
             self.update_project_field(project_id, "status", "tasks")
             print(f"\n{Colors.BRIGHT_GREEN}✓ Architecture complete!{Colors.RESET}")
             input(f"\n{Colors.DIM}Press Enter to continue...{Colors.RESET}")
@@ -4124,11 +5156,12 @@ class AppBuilderOrchestrator:
         return True, "App building process completed"
     
     def develop_tasks(self, project_id):
-        """Develop tasks iteratively."""
+        """Develop tasks iteratively with review feedback loop."""
         project = self.get_project(project_id)
         spec = project[3]
         architecture = project[4]
         builder_threads = getattr(self, "builder_threads", 1)
+        max_retries = 3  # Max code revision attempts per task
 
         conn = sqlite3.connect(APP_PROJECTS_DB)
         cursor = conn.cursor()
@@ -4158,7 +5191,7 @@ class AppBuilderOrchestrator:
             print(f"{Colors.BRIGHT_YELLOW}[Task {task_num}/{len(tasks)}] {task_desc}{Colors.RESET}")
             print(f"{Colors.BRIGHT_CYAN}{Colors.BOLD}{'='*79}{Colors.RESET}\n")
 
-            # Get existing files
+            # Get existing files for context
             existing_files = self.get_project_files(project_id)
             files_context = "\n".join([f"{fp}: {len(content)} chars" for fp, content in existing_files])
 
@@ -4185,103 +5218,144 @@ class AppBuilderOrchestrator:
             conn.commit()
             conn.close()
 
-            # Code Monkey writes code
-            print(f"{Colors.BRIGHT_CYAN}[5/5] Code Monkey writing code...{Colors.RESET}")
-
-            # Get relevant context
+            # Code → Review → Refine loop (up to max_retries attempts)
             relevant_context = self.filter_relevant_context(task_desc + " " + impl_plan, existing_files)
+            reviewer_feedback = ""
+            task_completed = False
 
-            code = self.code_monkey.write_code(impl_plan, relevant_context)
+            for attempt in range(1, max_retries + 1):
+                attempt_label = f"(attempt {attempt}/{max_retries})" if attempt > 1 else ""
+                print(f"{Colors.BRIGHT_CYAN}[5/5] Code Monkey writing code {attempt_label}...{Colors.RESET}")
 
-            # Validate code
-            if self._is_ai_error(code) or len(code.strip()) < 20:
-                print(f"{Colors.BRIGHT_RED}✗ AI Error generating code: {code[:100]}...{Colors.RESET}")
-                retry = input(f"\n{Colors.BRIGHT_GREEN}Retry this task? [Y/n]: {Colors.RESET}").strip().lower()
-                if retry != 'n':
-                    continue
-                else:
-                    print(f"{Colors.YELLOW}Task skipped.{Colors.RESET}")
-                    continue
+                # Pass full project context + reviewer feedback to CodeMonkey
+                code = self.code_monkey.write_code(
+                    impl_plan, relevant_context,
+                    spec=spec, architecture=architecture,
+                    task_desc=task_desc, reviewer_feedback=reviewer_feedback
+                )
 
-            print(f"\n{Colors.CYAN}Code Generated:{Colors.RESET}\n{code[:500]}{'...' if len(code) > 500 else ''}\n")
-
-            # Reviewer reviews code
-            print(f"{Colors.BRIGHT_CYAN}Reviewer checking code...{Colors.RESET}")
-            review = self.reviewer.review_code(code, task_desc, impl_plan)
-            print(f"\n{Colors.CYAN}Review:{Colors.RESET} {review}\n")
-
-            # Check if approved
-            if "APPROVED" in review.upper():
-                # Extract filename from code or plan
-                filename = self.extract_filename(code, impl_plan, task_desc)
-                if filename:
-                    self.save_file(project_id, filename, code)
-                    print(f"{Colors.BRIGHT_GREEN}✓ Code approved and saved: {filename}{Colors.RESET}")
-                else:
-                    # Ask user for filename
-                    filename = input(f"{Colors.BRIGHT_GREEN}Enter filename for this code: {Colors.RESET}").strip()
-                    if filename:
-                        self.save_file(project_id, filename, code)
-                        print(f"{Colors.BRIGHT_GREEN}✓ Code saved: {filename}{Colors.RESET}")
+                # Validate code
+                if self._is_ai_error(code) or len(code.strip()) < 20:
+                    print(f"{Colors.BRIGHT_RED}✗ AI Error generating code: {code[:100]}...{Colors.RESET}")
+                    if attempt < max_retries:
+                        print(f"{Colors.YELLOW}Retrying...{Colors.RESET}")
+                        reviewer_feedback = "Previous attempt failed to generate code. Try again with a complete implementation."
+                        continue
                     else:
-                        # Auto-generate filename
+                        retry = input(f"\n{Colors.BRIGHT_GREEN}All retries exhausted. Skip this task? [Y/n]: {Colors.RESET}").strip().lower()
+                        if retry != 'n':
+                            break
+                        continue
+
+                print(f"\n{Colors.CYAN}Code Generated ({len(code)} chars):{Colors.RESET}\n{code[:500]}{'...' if len(code) > 500 else ''}\n")
+
+                # Reviewer reviews code
+                print(f"{Colors.BRIGHT_CYAN}Reviewer checking code...{Colors.RESET}")
+                review = self.reviewer.review_code(code, task_desc, impl_plan)
+                print(f"\n{Colors.CYAN}Review:{Colors.RESET} {review}\n")
+
+                # Check if approved
+                if "APPROVED" in review.upper():
+                    # Extract filename from code or plan
+                    filename = self.extract_filename(code, impl_plan, task_desc)
+                    if not filename:
+                        filename = input(f"{Colors.BRIGHT_GREEN}Enter filename for this code (or press Enter for auto): {Colors.RESET}").strip()
+                    if not filename:
                         filename = f"task_{task_num}.py"
-                        self.save_file(project_id, filename, code)
-                        print(f"{Colors.BRIGHT_GREEN}✓ Code saved: {filename}{Colors.RESET}")
 
-                # Mark task as completed
-                conn = sqlite3.connect(APP_PROJECTS_DB)
-                cursor = conn.cursor()
-                cursor.execute("UPDATE app_tasks SET status='completed' WHERE id=?", (task_id,))
-                cursor.execute("INSERT INTO app_reviews (project_id, task_id, review_result, feedback) VALUES (?, ?, ?, ?)",
-                              (project_id, task_id, "approved", review))
-                conn.commit()
-                conn.close()
+                    # Clean code before saving (strip any remaining markdown)
+                    cleaned = extract_code_from_response(code)
+                    save_code = cleaned["code"] if cleaned["code"] and len(cleaned["code"].strip()) > 20 else code
 
-            else:
-                print(f"{Colors.BRIGHT_RED}✗ Code rejected. Needs revision.{Colors.RESET}")
-                print(f"{Colors.YELLOW}Feedback:{Colors.RESET} {review}")
+                    self.save_file(project_id, filename, save_code)
+                    print(f"{Colors.BRIGHT_GREEN}✓ Code approved and saved: {filename}{Colors.RESET}")
 
-                # Save review
-                conn = sqlite3.connect(APP_PROJECTS_DB)
-                cursor = conn.cursor()
-                cursor.execute("INSERT INTO app_reviews (project_id, task_id, review_result, feedback) VALUES (?, ?, ?, ?)",
-                              (project_id, task_id, "rejected", review))
-                conn.commit()
-                conn.close()
+                    # Mark task as completed
+                    conn = sqlite3.connect(APP_PROJECTS_DB)
+                    cursor = conn.cursor()
+                    cursor.execute("UPDATE app_tasks SET status='completed' WHERE id=?", (task_id,))
+                    cursor.execute("INSERT INTO app_reviews (project_id, task_id, review_result, feedback) VALUES (?, ?, ?, ?)",
+                                  (project_id, task_id, "approved", review))
+                    conn.commit()
+                    conn.close()
+                    task_completed = True
+                    break
 
-                # Ask user if they want to retry or skip
-                retry = input(f"\n{Colors.BRIGHT_GREEN}Retry this task? [Y/n]: {Colors.RESET}").strip().lower()
-                if retry != 'n':
-                    # Re-run this task (will be picked up in next iteration)
-                    continue
                 else:
-                    print(f"{Colors.YELLOW}Task skipped. You can revisit it later.{Colors.RESET}")
+                    # Code rejected - save review and try again with feedback
+                    print(f"{Colors.BRIGHT_RED}✗ Code rejected.{Colors.RESET}")
+                    print(f"{Colors.YELLOW}Feedback:{Colors.RESET} {review}")
+
+                    conn = sqlite3.connect(APP_PROJECTS_DB)
+                    cursor = conn.cursor()
+                    cursor.execute("INSERT INTO app_reviews (project_id, task_id, review_result, feedback) VALUES (?, ?, ?, ?)",
+                                  (project_id, task_id, "rejected", review))
+                    conn.commit()
+                    conn.close()
+
+                    if attempt < max_retries:
+                        # Feed reviewer feedback back to CodeMonkey for next attempt
+                        reviewer_feedback = review
+                        print(f"\n{Colors.BRIGHT_CYAN}Sending feedback to Code Monkey for revision...{Colors.RESET}")
+                    else:
+                        # All retries exhausted - save best effort and ask user
+                        print(f"\n{Colors.YELLOW}All {max_retries} revision attempts exhausted.{Colors.RESET}")
+                        save_anyway = input(f"{Colors.BRIGHT_GREEN}Save current code anyway? [Y/n]: {Colors.RESET}").strip().lower()
+                        if save_anyway != 'n':
+                            filename = self.extract_filename(code, impl_plan, task_desc) or f"task_{task_num}.py"
+                            cleaned = extract_code_from_response(code)
+                            save_code = cleaned["code"] if cleaned["code"] and len(cleaned["code"].strip()) > 20 else code
+                            self.save_file(project_id, filename, save_code)
+                            print(f"{Colors.BRIGHT_GREEN}✓ Code saved (needs review): {filename}{Colors.RESET}")
+
+                            conn = sqlite3.connect(APP_PROJECTS_DB)
+                            cursor = conn.cursor()
+                            cursor.execute("UPDATE app_tasks SET status='completed' WHERE id=?", (task_id,))
+                            conn.commit()
+                            conn.close()
+                            task_completed = True
+
+            if task_completed:
+                print(f"{Colors.BRIGHT_GREEN}✓ Task {task_num} complete!{Colors.RESET}")
+            else:
+                print(f"{Colors.YELLOW}Task {task_num} skipped.{Colors.RESET}")
 
             input(f"\n{Colors.DIM}Press Enter for next task...{Colors.RESET}")
 
-        # All tasks processed
+        # All tasks processed - finalize project
+        self._finalize_project(project_id, spec, architecture)
+
+    def _finalize_project(self, project_id, spec, architecture):
+        """Finalize a completed project: generate docs, scaffold, summary."""
+        project = self.get_project(project_id)
         self.update_project_field(project_id, "status", "completed")
         print(f"\n{Colors.BRIGHT_GREEN}{Colors.BOLD}✓ All tasks completed!{Colors.RESET}")
 
-        # Generate documentation
-        print(f"\n{Colors.BRIGHT_CYAN}Technical Writer creating documentation...{Colors.RESET}")
         files = self.get_project_files(project_id)
 
         if not files:
-            print(f"{Colors.YELLOW}⚠ No files generated, skipping documentation.{Colors.RESET}")
+            print(f"{Colors.YELLOW}⚠ No files generated, skipping finalization.{Colors.RESET}")
             return
 
-        codebase_summary = "\n".join([f"{fp}: {len(content)} lines" for fp, content in files])
+        # Generate requirements.txt from imports
+        print(f"\n{Colors.BRIGHT_CYAN}Generating project files...{Colors.RESET}")
+        self._generate_requirements(project_id, files)
+        self._generate_init_files(project_id, files)
 
-        docs = self.tech_writer.write_documentation(project[1], spec, architecture, codebase_summary)
+        # Generate documentation
+        print(f"{Colors.BRIGHT_CYAN}Technical Writer creating documentation...{Colors.RESET}")
+        codebase_summary = "\n".join([f"{fp}: {len(content.split(chr(10)))} lines" for fp, content in files])
 
-        # Save documentation
+        docs = self.tech_writer.write_documentation(project[1], spec or "", architecture or "", codebase_summary)
+
         if not self._is_ai_error(docs):
             self.save_file(project_id, "README.md", docs)
             print(f"{Colors.BRIGHT_GREEN}✓ Documentation saved: README.md{Colors.RESET}")
         else:
             print(f"{Colors.YELLOW}⚠ Failed to generate documentation.{Colors.RESET}")
+
+        # Refresh files list (now includes generated files)
+        files = self.get_project_files(project_id)
 
         # Show summary
         print(f"\n{Colors.BRIGHT_CYAN}{Colors.BOLD}{'='*79}{Colors.RESET}")
@@ -4291,7 +5365,100 @@ class AppBuilderOrchestrator:
         print(f"{Colors.CYAN}Location:{Colors.RESET} {Colors.BRIGHT_WHITE}{APPS_DIR}/{project[1]}/{Colors.RESET}")
         print(f"{Colors.CYAN}Files created:{Colors.RESET} {Colors.BRIGHT_WHITE}{len(files)}{Colors.RESET}")
         for fp, content in files:
-            print(f"  {Colors.DIM}- {fp} ({len(content)} chars){Colors.RESET}")
+            lines = len(content.split('\n'))
+            print(f"  {Colors.DIM}- {fp} ({lines} lines){Colors.RESET}")
+
+    def _generate_requirements(self, project_id, files):
+        """Auto-generate requirements.txt from project code imports."""
+        import re
+        # Standard library modules to exclude
+        stdlib = {
+            'os', 'sys', 'json', 'time', 'datetime', 'math', 'random', 're', 'io',
+            'pathlib', 'collections', 'itertools', 'functools', 'typing', 'abc',
+            'argparse', 'logging', 'unittest', 'threading', 'multiprocessing',
+            'subprocess', 'shutil', 'tempfile', 'glob', 'hashlib', 'base64',
+            'csv', 'sqlite3', 'pickle', 'copy', 'string', 'textwrap', 'enum',
+            'dataclasses', 'contextlib', 'traceback', 'socket', 'http', 'urllib',
+            'configparser', 'platform', 'signal', 'struct', 'uuid', 'secrets',
+            'statistics', 'decimal', 'fractions', 'operator', 'pprint', 'ast'
+        }
+        # Map common import names to pip package names
+        pip_name_map = {
+            'cv2': 'opencv-python', 'PIL': 'Pillow', 'sklearn': 'scikit-learn',
+            'yaml': 'PyYAML', 'bs4': 'beautifulsoup4', 'dotenv': 'python-dotenv',
+            'gi': 'PyGObject', 'wx': 'wxPython', 'serial': 'pyserial',
+            'usb': 'pyusb', 'jwt': 'PyJWT', 'magic': 'python-magic',
+            'attr': 'attrs', 'dateutil': 'python-dateutil', 'psutil': 'psutil',
+        }
+
+        all_imports = set()
+        for filepath, content in files:
+            if not filepath.endswith('.py'):
+                continue
+            # Extract import statements
+            for line in content.split('\n'):
+                line = line.strip()
+                match = re.match(r'^import\s+(\S+)', line)
+                if match:
+                    pkg = match.group(1).split('.')[0]
+                    all_imports.add(pkg)
+                match = re.match(r'^from\s+(\S+)\s+import', line)
+                if match:
+                    pkg = match.group(1).split('.')[0]
+                    all_imports.add(pkg)
+
+        # Filter out stdlib, relative imports, and project-internal modules
+        project_modules = {os.path.splitext(fp)[0].replace('/', '.').replace('\\', '.') for fp, _ in files}
+        external = set()
+        for imp in all_imports:
+            if imp.startswith('.') or imp.startswith('_'):
+                continue
+            if imp in stdlib:
+                continue
+            if imp in project_modules:
+                continue
+            # Map to pip name if known
+            pip_name = pip_name_map.get(imp, imp)
+            external.add(pip_name)
+
+        if external:
+            requirements = "\n".join(sorted(external)) + "\n"
+            self.save_file(project_id, "requirements.txt", requirements)
+            print(f"{Colors.BRIGHT_GREEN}✓ Generated requirements.txt ({len(external)} packages){Colors.RESET}")
+
+    def _generate_init_files(self, project_id, files):
+        """Generate __init__.py files for any subdirectories containing Python files."""
+        # Find all directories that contain .py files
+        dirs_with_py = set()
+        for filepath, _ in files:
+            if filepath.endswith('.py') and '/' in filepath:
+                # Get all parent directories
+                parts = filepath.split('/')
+                for i in range(1, len(parts)):
+                    dir_path = '/'.join(parts[:i])
+                    dirs_with_py.add(dir_path)
+
+        # Create __init__.py for each directory
+        for dir_path in sorted(dirs_with_py):
+            init_path = f"{dir_path}/__init__.py"
+            # Check if already exists
+            existing = [fp for fp, _ in files if fp == init_path]
+            if not existing:
+                self.save_file(project_id, init_path, "")
+                print(f"{Colors.DIM}  Created {init_path}{Colors.RESET}")
+
+    def _generate_gitignore(self, project_id):
+        """Generate a .gitignore file for the project."""
+        gitignore = (
+            "# Python\n"
+            "__pycache__/\n*.py[cod]\n*$py.class\n*.so\n"
+            "*.egg-info/\ndist/\nbuild/\n*.egg\n\n"
+            "# Virtual environments\nvenv/\nenv/\n.env\n\n"
+            "# IDE\n.vscode/\n.idea/\n*.swp\n*.swo\n\n"
+            "# OS\n.DS_Store\nThumbs.db\n\n"
+            "# Data\n*.sqlite\n*.db\n*.log\n"
+        )
+        self.save_file(project_id, ".gitignore", gitignore)
 
     def _develop_tasks_threaded(self, project_id, tasks, spec, architecture, builder_threads):
         """Parallelized task development while keeping the original pipeline semantics."""
@@ -4328,7 +5495,10 @@ class AppBuilderOrchestrator:
                         lock.release()
                 
                 relevant_context = self.filter_relevant_context(task_desc + " " + impl_plan, existing_files)
-                code = self.code_monkey.write_code(impl_plan, relevant_context)
+                code = self.code_monkey.write_code(
+                    impl_plan, relevant_context,
+                    spec=spec, architecture=architecture, task_desc=task_desc
+                )
                 # Faster review for threaded mode
                 review = self.reviewer.review_code(code, task_desc, impl_plan)
                 
@@ -4382,18 +5552,7 @@ class AppBuilderOrchestrator:
         conn.close()
         
         if remaining == 0:
-            self.update_project_field(project_id, "status", "completed")
-            print(f"\n{Colors.BRIGHT_GREEN}{Colors.BOLD}✓ All tasks completed!{Colors.RESET}")
-            
-            # Generate documentation (same as sequential flow)
-            print(f"\n{Colors.BRIGHT_CYAN}Technical Writer creating documentation...{Colors.RESET}")
-            files = self.get_project_files(project_id)
-            codebase_summary = "\n".join([f"{fp}: {len(content)} lines" for fp, content in files])
-            
-            project = self.get_project(project_id)
-            docs = self.tech_writer.write_documentation(project[1], spec, architecture, codebase_summary)
-            self.save_file(project_id, "README.md", docs)
-            print(f"{Colors.BRIGHT_GREEN}✓ Documentation saved: README.md{Colors.RESET}")
+            self._finalize_project(project_id, spec, architecture)
         else:
             print(f"{Colors.YELLOW}⚠ Threaded run finished with {remaining} task(s) still pending.{Colors.RESET}")
     
@@ -4826,7 +5985,11 @@ class App:
             print(f"{Colors.BRIGHT_YELLOW}{Colors.BOLD}  MAIN MENU{Colors.RESET}")
             print(f"{Colors.BRIGHT_CYAN}{Colors.BOLD}{'='*79}{Colors.RESET}")
             backend = self.config.get('backend', 'unknown')
-            model = self.config.get('model_name', 'unknown')
+            # Show the correct model based on active backend
+            if backend in ['openai', 'anthropic', 'gemini', 'openrouter', 'groq', 'deepseek', 'hf_cloud']:
+                model = self.config.get(f"{backend}_model", self.config.get('model_name', 'unknown'))
+            else:
+                model = self.config.get('model_name', 'unknown')
             print(f"{Colors.CYAN}Backend:{Colors.RESET} {Colors.BRIGHT_WHITE}{backend}{Colors.RESET} | {Colors.CYAN}Model:{Colors.RESET} {Colors.BRIGHT_WHITE}{model}{Colors.RESET}\n")
             
             print(f"{Colors.BRIGHT_GREEN}  [1]{Colors.RESET} Start Chat")
@@ -4862,7 +6025,21 @@ class App:
         elif selection == "8" or selection == "update":
             self.update_from_github()
         elif selection == "9" or selection == "settings":
+            old_backend = self.config.get("backend")
+            old_model = self.config.get("model_name")
             self.settings_menu()
+            # Reload config and re-initialize engine if backend or model changed
+            self.config = self.cfg_mgr.config
+            new_backend = self.config.get("backend")
+            new_model = self.config.get("model_name")
+            if old_backend != new_backend or old_model != new_model:
+                print(f"\n{Colors.BRIGHT_CYAN}[SYSTEM]{Colors.RESET} Backend/model changed — reinitializing engine...")
+                try:
+                    self.engine = AIEngine(self.config)
+                    print(f"{Colors.BRIGHT_GREEN}[SYSTEM]{Colors.RESET} Engine reloaded successfully.")
+                except Exception as e:
+                    print(f"{Colors.BRIGHT_RED}[ERROR]{Colors.RESET} Engine reload failed: {e}")
+                time.sleep(2)
         elif selection == "10" or selection == "exit":
             print(f"\n{Colors.BRIGHT_YELLOW}Shutting down...{Colors.RESET}")
             if self.registry:
@@ -4965,7 +6142,8 @@ class App:
         print(f"{Colors.BRIGHT_GREEN}  [2]{Colors.RESET} Edit System Prompt")
         print(f"{Colors.BRIGHT_GREEN}  [3]{Colors.RESET} Set Default Editor for Tools/MCP Servers")
         print(f"{Colors.BRIGHT_GREEN}  [4]{Colors.RESET} Change AI Backend")
-        print(f"{Colors.BRIGHT_GREEN}  [5]{Colors.RESET} Back\n")
+        print(f"{Colors.BRIGHT_GREEN}  [5]{Colors.RESET} Manage Cloud API Keys")
+        print(f"{Colors.BRIGHT_GREEN}  [6]{Colors.RESET} Back\n")
         
         c = input(f"{Colors.BRIGHT_GREEN}Choice: {Colors.RESET}")
         if c == "1":
@@ -5055,12 +6233,53 @@ class App:
             time.sleep(1.5)
         elif c == "4":
             print(f"\n{Colors.BRIGHT_CYAN}Select AI Backend:{Colors.RESET}\n")
+            print(f"{Colors.DIM}LOCAL BACKENDS{Colors.RESET}")
             print(f"{Colors.CYAN}  [1]{Colors.RESET} Ollama {Colors.DIM}(http://localhost:11434){Colors.RESET}")
             print(f"{Colors.CYAN}  [2]{Colors.RESET} llama.cpp Server {Colors.DIM}(OpenAI-compatible){Colors.RESET}")
-            print(f"{Colors.CYAN}  [3]{Colors.RESET} Python/HuggingFace {Colors.DIM}(local .py models){Colors.RESET}\n")
+            print(f"{Colors.CYAN}  [3]{Colors.RESET} Python/HuggingFace {Colors.DIM}(local .py models){Colors.RESET}")
+            print(f"\n{Colors.DIM}CLOUD BACKENDS{Colors.RESET}")
+            print(f"{Colors.CYAN}  [4]{Colors.RESET} OpenAI {Colors.DIM}(requires API key){Colors.RESET}")
+            print(f"{Colors.CYAN}  [5]{Colors.RESET} Anthropic {Colors.DIM}(Claude 3.5, requires API key){Colors.RESET}")
+            print(f"{Colors.CYAN}  [6]{Colors.RESET} Google Gemini {Colors.DIM}(requires API key){Colors.RESET}")
+            print(f"{Colors.CYAN}  [7]{Colors.RESET} OpenRouter {Colors.DIM}(multi-model, requires API key){Colors.RESET}")
+            print(f"{Colors.CYAN}  [8]{Colors.RESET} Groq {Colors.DIM}(ultra-fast inference, requires API key){Colors.RESET}")
+            print(f"{Colors.CYAN}  [9]{Colors.RESET} DeepSeek {Colors.DIM}(frontier reasoning model, requires API key){Colors.RESET}")
+            print(f"{Colors.CYAN}  [10]{Colors.RESET} HuggingFace Cloud {Colors.DIM}(Inference API, requires HF token){Colors.RESET}\n")
 
-            backend_choice = input(f"{Colors.BRIGHT_GREEN}Select backend [1/2/3]: {Colors.RESET}").strip()
+            backend_choice = input(f"{Colors.BRIGHT_GREEN}Select backend [1-10]: {Colors.RESET}").strip()
             if backend_choice == "1":
+                # Fetch and display available Ollama models
+                if check_ollama_running():
+                    models = get_ollama_models()
+                    if models:
+                        print(f"\n{Colors.BRIGHT_CYAN}Available Ollama Models:{Colors.RESET}\n")
+                        for i, m in enumerate(models, 1):
+                            print(f"  [{i}] {Colors.BRIGHT_WHITE}{m}{Colors.RESET}")
+                        current = self.config.get("model_name", "")
+                        if current:
+                            print(f"\n{Colors.DIM}Current: {current}{Colors.RESET}")
+                        mchoice = input(f"\n{Colors.BRIGHT_GREEN}Select model [1-{len(models)}] or Enter to keep current: {Colors.RESET}").strip()
+                        if mchoice:
+                            try:
+                                midx = int(mchoice) - 1
+                                if 0 <= midx < len(models):
+                                    self.cfg_mgr.update("model_name", models[midx])
+                                    print(f"{Colors.BRIGHT_GREEN}✓ Model set to: {models[midx]}{Colors.RESET}")
+                                else:
+                                    print(f"{Colors.YELLOW}⚠ Invalid selection. Model unchanged.{Colors.RESET}")
+                            except ValueError:
+                                print(f"{Colors.YELLOW}⚠ Invalid input. Model unchanged.{Colors.RESET}")
+                    else:
+                        print(f"{Colors.YELLOW}⚠ Ollama running but no models found. Pull a model first: ollama pull llama3{Colors.RESET}")
+                        model_name = input(f"{Colors.BRIGHT_GREEN}Enter model name manually (or Enter to skip): {Colors.RESET}").strip()
+                        if model_name:
+                            self.cfg_mgr.update("model_name", model_name)
+                else:
+                    print(f"{Colors.YELLOW}⚠ Ollama is not running on localhost:11434.{Colors.RESET}")
+                    print(f"{Colors.DIM}Start it with: ollama serve{Colors.RESET}")
+                    model_name = input(f"\n{Colors.BRIGHT_GREEN}Enter model name manually (or Enter to skip): {Colors.RESET}").strip()
+                    if model_name:
+                        self.cfg_mgr.update("model_name", model_name)
                 self.cfg_mgr.update("backend", "ollama")
                 print(f"{Colors.BRIGHT_GREEN}✓ Backend set to Ollama{Colors.RESET}")
             elif backend_choice == "2":
@@ -5069,30 +6288,8 @@ class App:
                 if not base_url:
                     base_url = "http://127.0.0.1:8080"
                 self.cfg_mgr.update("llama_cpp_base_url", base_url)
-
-                print(f"{Colors.CYAN}Detecting llama.cpp models...{Colors.RESET}")
-                models = get_llama_cpp_models(base_url)
-                if models:
-                    print(f"\n{Colors.BRIGHT_GREEN}Available llama.cpp Models:{Colors.RESET}\n")
-                    for i, model in enumerate(models[:15], 1):
-                        print(f"  {Colors.CYAN}[{i}]{Colors.RESET} {model}")
-                    print(f"  {Colors.CYAN}[0]{Colors.RESET} Auto-detect (first available)")
-                    selection = input(f"\n{Colors.BRIGHT_GREEN}Select model [1-{min(len(models), 15)}] or 0: {Colors.RESET}").strip()
-                    try:
-                        idx = int(selection)
-                        if idx == 0:
-                            selected_model = "auto"
-                        elif 1 <= idx <= min(len(models), 15):
-                            selected_model = models[idx - 1]
-                        else:
-                            selected_model = "auto"
-                    except ValueError:
-                        selected_model = "auto"
-                else:
-                    print(f"{Colors.YELLOW}⚠ No models detected. Using auto-detect.{Colors.RESET}")
-                    selected_model = "auto"
-
-                self.cfg_mgr.update("model_name", selected_model)
+                model_name = input(f"{Colors.BRIGHT_GREEN}Enter model name (leave blank for auto-detect): {Colors.RESET}").strip()
+                self.cfg_mgr.update("model_name", model_name if model_name else "auto")
                 print(f"{Colors.BRIGHT_GREEN}✓ Backend set to llama.cpp{Colors.RESET}")
             elif backend_choice == "3":
                 self.cfg_mgr.update("backend", "huggingface")
@@ -5100,10 +6297,26 @@ class App:
                 if model_name:
                     self.cfg_mgr.update("model_name", model_name)
                 print(f"{Colors.BRIGHT_GREEN}✓ Backend set to HuggingFace (.py){Colors.RESET}")
+            elif backend_choice == "4":
+                self._configure_cloud_backend("openai", "OpenAI", "openai_model", get_openai_models)
+            elif backend_choice == "5":
+                self._configure_cloud_backend("anthropic", "Anthropic", "anthropic_model", get_anthropic_models)
+            elif backend_choice == "6":
+                self._configure_cloud_backend("gemini", "Google Gemini", "gemini_model", get_gemini_models)
+            elif backend_choice == "7":
+                self._configure_cloud_backend("openrouter", "OpenRouter", "openrouter_model", get_openrouter_models)
+            elif backend_choice == "8":
+                self._configure_cloud_backend("groq", "Groq", "groq_model", get_groq_models)
+            elif backend_choice == "9":
+                self._configure_cloud_backend("deepseek", "DeepSeek", "deepseek_model", get_deepseek_models)
+            elif backend_choice == "10":
+                self._configure_cloud_backend("hf_cloud", "HuggingFace Cloud", "hf_cloud_model", get_hf_cloud_models)
             else:
                 print(f"{Colors.YELLOW}⚠ Invalid selection. Backend not changed.{Colors.RESET}")
             time.sleep(1.5)
         elif c == "5":
+            self._manage_cloud_api_keys()
+        elif c == "6":
             return
     
     def open_in_default_editor(self, filepath):
@@ -5112,7 +6325,7 @@ class App:
         Falls back to OS default if no editor is configured.
         """
         try:
-            editor_cmd = self.config.get("default_editor_command") or self.cfg_mgr.get("default_editor_command")
+            editor_cmd = self.config.get("default_editor_command") or self.cfg_mgr.config.get("default_editor_command")
         except Exception:
             editor_cmd = ""
         
@@ -5143,6 +6356,275 @@ class App:
                 print(f"{Colors.DIM}Opened file with OS default editor: {filepath}{Colors.RESET}")
         except Exception as e:
             print(f"{Colors.BRIGHT_RED}✗ Failed to open editor: {e}{Colors.RESET}")
+
+    def _configure_cloud_backend(self, backend_id, backend_name, model_key, model_func):
+        """Configure a cloud backend - check API key and select model."""
+        print(f"\n{Colors.BRIGHT_CYAN}Configuring {backend_name}...{Colors.RESET}\n")
+
+        # Check if API key exists
+        api_key = get_api_key(backend_id)
+        if not api_key:
+            print(f"{Colors.YELLOW}⚠ No API key configured for {backend_name}.{Colors.RESET}")
+            add_now = input(f"{Colors.BRIGHT_GREEN}Add API key now? [y/n]: {Colors.RESET}").strip().lower()
+            if add_now == 'y':
+                self._add_api_key(backend_id, backend_name)
+                api_key = get_api_key(backend_id)
+                if not api_key:
+                    print(f"{Colors.BRIGHT_RED}✗ API key not configured. Backend not changed.{Colors.RESET}")
+                    time.sleep(1.5)
+                    return
+            else:
+                print(f"{Colors.BRIGHT_RED}✗ API key required. Backend not changed.{Colors.RESET}")
+                time.sleep(1.5)
+                return
+
+        # Fetch available models
+        print(f"{Colors.DIM}Fetching available models...{Colors.RESET}")
+        models = model_func(api_key)
+
+        if not models:
+            print(f"{Colors.YELLOW}⚠ Could not fetch models. Using defaults.{Colors.RESET}")
+            models = model_func(None)  # Get fallback list
+
+        # Show model options
+        print(f"\n{Colors.BRIGHT_CYAN}Available Models:{Colors.RESET}\n")
+        for i, model in enumerate(models, 1):
+            print(f"  [{i}] {Colors.BRIGHT_WHITE}{model}{Colors.RESET}")
+
+        current_model = self.config.get(model_key, "")
+        if current_model:
+            print(f"\n{Colors.DIM}Current: {current_model}{Colors.RESET}\n")
+
+        choice = input(f"{Colors.BRIGHT_GREEN}Select model [1-{len(models)}] or press Enter to keep current: {Colors.RESET}").strip()
+
+        if choice:
+            try:
+                idx = int(choice) - 1
+                if 0 <= idx < len(models):
+                    selected = models[idx]
+                    self.cfg_mgr.update(model_key, selected)
+                    self.cfg_mgr.update("model_name", selected)
+                    self.cfg_mgr.update("backend", backend_id)
+                    print(f"\n{Colors.BRIGHT_GREEN}✓ Backend set to {backend_name}{Colors.RESET}")
+                    print(f"{Colors.BRIGHT_GREEN}✓ Model set to: {selected}{Colors.RESET}")
+                else:
+                    print(f"{Colors.YELLOW}⚠ Invalid selection. Backend not changed.{Colors.RESET}")
+            except ValueError:
+                print(f"{Colors.YELLOW}⚠ Invalid selection. Backend not changed.{Colors.RESET}")
+        else:
+            # Keep current model
+            current_model = self.config.get(model_key, "")
+            if current_model:
+                self.cfg_mgr.update("model_name", current_model)
+            self.cfg_mgr.update("backend", backend_id)
+            print(f"\n{Colors.BRIGHT_GREEN}✓ Backend set to {backend_name}{Colors.RESET}")
+
+        time.sleep(1.5)
+
+    def _manage_cloud_api_keys(self):
+        """Main menu for managing cloud API keys."""
+        while True:
+            self.clear()
+            print(f"\n{Colors.BRIGHT_CYAN}{Colors.BOLD}{'='*79}{Colors.RESET}")
+            print(f"{Colors.BRIGHT_YELLOW}{Colors.BOLD}  CLOUD API KEY MANAGEMENT{Colors.RESET}")
+            print(f"{Colors.BRIGHT_CYAN}{Colors.BOLD}{'='*79}{Colors.RESET}\n")
+
+            # Show status of all providers
+            providers = [
+                ("openai",    "OpenAI",             "https://platform.openai.com/api-keys"),
+                ("anthropic", "Anthropic",           "https://console.anthropic.com/"),
+                ("gemini",    "Google Gemini",       "https://aistudio.google.com/apikey"),
+                ("openrouter","OpenRouter",           "https://openrouter.ai/keys"),
+                ("groq",      "Groq",                "https://console.groq.com/keys"),
+                ("deepseek",  "DeepSeek",            "https://platform.deepseek.com/api_keys"),
+                ("hf_cloud",  "HuggingFace Cloud",  "https://huggingface.co/settings/tokens"),
+            ]
+
+            for provider_id, name, _ in providers:
+                key = get_api_key(provider_id)
+                if key:
+                    status = f"{Colors.BRIGHT_GREEN}✓ Configured{Colors.RESET}"
+                    masked = mask_api_key(key)
+                else:
+                    status = f"{Colors.YELLOW}✗ Not set{Colors.RESET}"
+                    masked = "(not set)"
+                print(f"{Colors.CYAN}{name}:{Colors.RESET} {status} {Colors.DIM}{masked}{Colors.RESET}")
+
+            print(f"\n{Colors.BRIGHT_GREEN}  [1]{Colors.RESET} Add/Update API Key")
+            print(f"{Colors.BRIGHT_GREEN}  [2]{Colors.RESET} Delete API Key")
+            print(f"{Colors.BRIGHT_GREEN}  [3]{Colors.RESET} Back\n")
+
+            choice = input(f"{Colors.BRIGHT_GREEN}Choice [1-3]: {Colors.RESET}").strip()
+
+            if choice == "1":
+                self._add_api_key_menu()
+            elif choice == "2":
+                self._delete_api_key_menu()
+            elif choice == "3":
+                return
+            else:
+                print(f"{Colors.YELLOW}⚠ Invalid choice.{Colors.RESET}")
+                time.sleep(1)
+
+    def _add_api_key_menu(self):
+        """Menu to select which provider's API key to add."""
+        self.clear()
+        print(f"\n{Colors.BRIGHT_CYAN}Add/Update API Key:{Colors.RESET}\n")
+
+        providers = [
+            ("openai",    "OpenAI",            "https://platform.openai.com/api-keys"),
+            ("anthropic", "Anthropic",          "https://console.anthropic.com/"),
+            ("gemini",    "Google Gemini",      "https://aistudio.google.com/apikey"),
+            ("openrouter","OpenRouter",          "https://openrouter.ai/keys"),
+            ("groq",      "Groq",               "https://console.groq.com/keys"),
+            ("deepseek",  "DeepSeek",           "https://platform.deepseek.com/api_keys"),
+            ("hf_cloud",  "HuggingFace Cloud", "https://huggingface.co/settings/tokens"),
+        ]
+
+        for i, (_, name, _) in enumerate(providers, 1):
+            print(f"  [{i}] {name}")
+        back_idx = len(providers) + 1
+        print(f"  [{back_idx}] Back\n")
+
+        valid_choices = [str(i) for i in range(1, back_idx)]
+        choice = input(f"{Colors.BRIGHT_GREEN}Select provider [1-{len(providers)}] or [{back_idx}] to go back: {Colors.RESET}").strip()
+
+        if choice in valid_choices:
+            idx = int(choice) - 1
+            provider_id, provider_name, _ = providers[idx]
+            self._add_api_key(provider_id, provider_name)
+        elif choice != str(back_idx):
+            print(f"{Colors.YELLOW}⚠ Invalid choice.{Colors.RESET}")
+            time.sleep(1)
+
+    def _add_api_key(self, provider_id, provider_name):
+        """Add or update API key for a specific provider."""
+        self.clear()
+        print(f"\n{Colors.BRIGHT_CYAN}Add API Key for {provider_name}:{Colors.RESET}\n")
+
+        # Show provider link based on provider
+        links = {
+            "openai":    "https://platform.openai.com/api-keys",
+            "anthropic": "https://console.anthropic.com/",
+            "gemini":    "https://aistudio.google.com/apikey",
+            "openrouter":"https://openrouter.ai/keys",
+            "groq":      "https://console.groq.com/keys",
+            "deepseek":  "https://platform.deepseek.com/api_keys",
+            "hf_cloud":  "https://huggingface.co/settings/tokens",
+        }
+
+        if provider_id in links:
+            print(f"{Colors.DIM}Get your API key from: {links[provider_id]}{Colors.RESET}\n")
+
+        # Get API key with hidden input
+        api_key = getpass.getpass(f"{Colors.BRIGHT_GREEN}Enter API Key (hidden): {Colors.RESET}")
+
+        if not api_key:
+            print(f"{Colors.YELLOW}⚠ Empty API key. Not saved.{Colors.RESET}")
+            time.sleep(1.5)
+            return
+
+        # Save encrypted key
+        success, message = save_api_key(provider_id, api_key)
+
+        if success:
+            # Reload config so the App picks up the newly saved key
+            self.cfg_mgr.reload()
+            self.config = self.cfg_mgr.config
+            print(f"\n{Colors.BRIGHT_GREEN}✓ {message}{Colors.RESET}")
+            # Offer to switch to this backend and select a model
+            current_backend = self.config.get("backend", "")
+            if current_backend != provider_id:
+                switch = input(f"\n{Colors.BRIGHT_GREEN}Switch to {provider_name} backend now? [y/n]: {Colors.RESET}").strip().lower()
+                if switch == "y":
+                    model_funcs = {
+                        "openai":    ("openai_model",    get_openai_models),
+                        "anthropic": ("anthropic_model", get_anthropic_models),
+                        "gemini":    ("gemini_model",    get_gemini_models),
+                        "openrouter":("openrouter_model",get_openrouter_models),
+                        "groq":      ("groq_model",      get_groq_models),
+                        "deepseek":  ("deepseek_model",  get_deepseek_models),
+                        "hf_cloud":  ("hf_cloud_model",  get_hf_cloud_models),
+                    }
+                    if provider_id in model_funcs:
+                        model_key, model_func = model_funcs[provider_id]
+                        self._configure_cloud_backend(provider_id, provider_name, model_key, model_func)
+                        return
+            else:
+                # Already on this backend, offer to update model selection
+                update = input(f"\n{Colors.BRIGHT_GREEN}Update model selection for {provider_name}? [y/n]: {Colors.RESET}").strip().lower()
+                if update == "y":
+                    model_funcs = {
+                        "openai":    ("openai_model",    get_openai_models),
+                        "anthropic": ("anthropic_model", get_anthropic_models),
+                        "gemini":    ("gemini_model",    get_gemini_models),
+                        "openrouter":("openrouter_model",get_openrouter_models),
+                        "groq":      ("groq_model",      get_groq_models),
+                        "deepseek":  ("deepseek_model",  get_deepseek_models),
+                        "hf_cloud":  ("hf_cloud_model",  get_hf_cloud_models),
+                    }
+                    if provider_id in model_funcs:
+                        model_key, model_func = model_funcs[provider_id]
+                        self._configure_cloud_backend(provider_id, provider_name, model_key, model_func)
+                        return
+        else:
+            print(f"\n{Colors.BRIGHT_RED}✗ {message}{Colors.RESET}")
+
+        time.sleep(1.5)
+
+    def _delete_api_key_menu(self):
+        """Menu to delete API key for a provider."""
+        self.clear()
+        print(f"\n{Colors.BRIGHT_CYAN}Delete API Key:{Colors.RESET}\n")
+
+        providers = [
+            ("openai",    "OpenAI"),
+            ("anthropic", "Anthropic"),
+            ("gemini",    "Google Gemini"),
+            ("openrouter","OpenRouter"),
+            ("groq",      "Groq"),
+            ("deepseek",  "DeepSeek"),
+            ("hf_cloud",  "HuggingFace Cloud"),
+        ]
+
+        # Show only providers with existing keys
+        available = []
+        for provider_id, name in providers:
+            if get_api_key(provider_id):
+                available.append((provider_id, name))
+
+        if not available:
+            print(f"{Colors.YELLOW}ℹ No API keys configured.{Colors.RESET}\n")
+            time.sleep(1.5)
+            return
+
+        for i, (_, name) in enumerate(available, 1):
+            print(f"  [{i}] {name}")
+        print(f"  [{len(available) + 1}] Cancel\n")
+
+        choice = input(f"{Colors.BRIGHT_GREEN}Select provider to delete [1-{len(available)}]: {Colors.RESET}").strip()
+
+        if choice == str(len(available) + 1) or choice.strip() == "":
+            return
+
+        try:
+            idx = int(choice) - 1
+            if 0 <= idx < len(available):
+                provider_id, provider_name = available[idx]
+                confirm = input(f"{Colors.YELLOW}Delete {provider_name} API key? [y/n]: {Colors.RESET}").strip().lower()
+                if confirm == 'y':
+                    success, message = delete_api_key(provider_id)
+                    if success:
+                        # Reload config so App picks up the deletion
+                        self.cfg_mgr.reload()
+                        self.config = self.cfg_mgr.config
+                        print(f"\n{Colors.BRIGHT_GREEN}✓ {message}{Colors.RESET}")
+                    else:
+                        print(f"\n{Colors.BRIGHT_RED}✗ {message}{Colors.RESET}")
+                    time.sleep(1.5)
+        except ValueError:
+            print(f"{Colors.YELLOW}⚠ Invalid choice.{Colors.RESET}")
+            time.sleep(1)
 
     def document_menu(self):
         self.clear()
@@ -6159,49 +7641,257 @@ class App:
             elif c == "6":
                 break
 
-    def _select_ollama_model(self):
-        """Let user select an Ollama model from available models."""
-        if self.engine.backend != "ollama":
-            print(f"{Colors.YELLOW}⚠ Model selection only available for Ollama backend.{Colors.RESET}")
-            print(f"{Colors.DIM}Current backend: {self.engine.backend}{Colors.RESET}")
-            return False
+    def _select_model(self):
+        """Let user select a model from available models for ANY backend."""
+        backend = self.engine.backend
+        cloud_backends = ("openai", "anthropic", "gemini", "openrouter", "groq", "deepseek", "hf_cloud")
 
-        models = get_ollama_models()
-        if not models:
-            print(f"\n{Colors.BRIGHT_RED}✗ No Ollama models found!{Colors.RESET}")
-            print(f"{Colors.YELLOW}Please install a model first:{Colors.RESET}")
-            print(f"{Colors.DIM}  ollama pull llama3.2{Colors.RESET}")
-            print(f"{Colors.DIM}  ollama pull qwen2.5-coder{Colors.RESET}")
-            print(f"{Colors.DIM}  ollama pull codellama{Colors.RESET}")
-            return False
-
-        print(f"\n{Colors.BRIGHT_CYAN}Available Ollama Models:{Colors.RESET}\n")
-        current_model = self.engine.model_name
-        for i, model in enumerate(models, 1):
-            marker = f"{Colors.BRIGHT_GREEN}◀ current{Colors.RESET}" if model == current_model else ""
-            print(f"  {Colors.CYAN}[{i}]{Colors.RESET} {Colors.BRIGHT_WHITE}{model}{Colors.RESET} {marker}")
-
-        print(f"\n  {Colors.DIM}[0] Cancel{Colors.RESET}")
-
-        try:
-            choice = input(f"\n{Colors.BRIGHT_GREEN}Select model [1-{len(models)}]: {Colors.RESET}").strip()
-            if choice == "0" or not choice:
-                return True  # User cancelled, but not an error
-
-            idx = int(choice)
-            if 1 <= idx <= len(models):
-                selected_model = models[idx - 1]
-                self.engine.model_name = selected_model
-                self.engine.config['model_name'] = selected_model
-                print(f"\n{Colors.BRIGHT_GREEN}✓ Model changed to: {selected_model}{Colors.RESET}")
-                return True
-            else:
-                print(f"{Colors.YELLOW}⚠ Invalid selection.{Colors.RESET}")
+        if backend == "ollama":
+            models = get_ollama_models()
+            if not models:
+                print(f"\n{Colors.BRIGHT_RED}\u2717 No Ollama models found!{Colors.RESET}")
+                print(f"{Colors.YELLOW}Please install a model first:{Colors.RESET}")
+                print(f"{Colors.DIM}  ollama pull llama3.2{Colors.RESET}")
+                print(f"{Colors.DIM}  ollama pull qwen2.5-coder{Colors.RESET}")
+                print(f"{Colors.DIM}  ollama pull codellama{Colors.RESET}")
                 return False
-        except ValueError:
-            print(f"{Colors.YELLOW}⚠ Invalid input.{Colors.RESET}")
+
+            print(f"\n{Colors.BRIGHT_CYAN}Available Ollama Models:{Colors.RESET}\n")
+            current_model = self.engine.model_name
+            for i, model in enumerate(models, 1):
+                marker = f"{Colors.BRIGHT_GREEN}\u25c0 current{Colors.RESET}" if model == current_model else ""
+                print(f"  {Colors.CYAN}[{i}]{Colors.RESET} {Colors.BRIGHT_WHITE}{model}{Colors.RESET} {marker}")
+
+            print(f"\n  {Colors.DIM}[0] Cancel{Colors.RESET}")
+
+            try:
+                choice = input(f"\n{Colors.BRIGHT_GREEN}Select model [1-{len(models)}]: {Colors.RESET}").strip()
+                if choice == "0" or not choice:
+                    return True  # User cancelled, but not an error
+
+                idx = int(choice)
+                if 1 <= idx <= len(models):
+                    selected_model = models[idx - 1]
+                    self.engine.model_name = selected_model
+                    self.engine.config['model_name'] = selected_model
+                    print(f"\n{Colors.BRIGHT_GREEN}\u2713 Model changed to: {selected_model}{Colors.RESET}")
+                    return True
+                else:
+                    print(f"{Colors.YELLOW}\u26a0 Invalid selection.{Colors.RESET}")
+                    return False
+            except ValueError:
+                print(f"{Colors.YELLOW}\u26a0 Invalid input.{Colors.RESET}")
+                return False
+
+        elif backend == "llama_cpp":
+            base_url = normalize_base_url(self.config.get("llama_cpp_base_url", "http://127.0.0.1:8080"))
+            try:
+                res = requests.get(f"{base_url}/v1/models", timeout=3)
+                if res.status_code == 200:
+                    data = res.json().get("data", [])
+                    models = [m.get("id") or m.get("name") for m in data if m.get("id") or m.get("name")]
+                else:
+                    models = []
+            except Exception:
+                models = []
+
+            if not models:
+                print(f"\n{Colors.BRIGHT_RED}\u2717 No models found on llama.cpp server at {base_url}{Colors.RESET}")
+                print(f"{Colors.YELLOW}Make sure the server is running with a loaded model.{Colors.RESET}")
+                return False
+
+            print(f"\n{Colors.BRIGHT_CYAN}Available llama.cpp Models:{Colors.RESET}\n")
+            current_model = self.engine.model_name
+            for i, model in enumerate(models, 1):
+                marker = f"{Colors.BRIGHT_GREEN}\u25c0 current{Colors.RESET}" if model == current_model else ""
+                print(f"  {Colors.CYAN}[{i}]{Colors.RESET} {Colors.BRIGHT_WHITE}{model}{Colors.RESET} {marker}")
+
+            print(f"\n  {Colors.DIM}[0] Cancel{Colors.RESET}")
+
+            try:
+                choice = input(f"\n{Colors.BRIGHT_GREEN}Select model [1-{len(models)}]: {Colors.RESET}").strip()
+                if choice == "0" or not choice:
+                    return True
+                idx = int(choice)
+                if 1 <= idx <= len(models):
+                    selected_model = models[idx - 1]
+                    self.engine.model_name = selected_model
+                    self.engine.config['model_name'] = selected_model
+                    print(f"\n{Colors.BRIGHT_GREEN}\u2713 Model changed to: {selected_model}{Colors.RESET}")
+                    return True
+                else:
+                    print(f"{Colors.YELLOW}\u26a0 Invalid selection.{Colors.RESET}")
+                    return False
+            except ValueError:
+                print(f"{Colors.YELLOW}\u26a0 Invalid input.{Colors.RESET}")
+                return False
+
+        elif backend in cloud_backends:
+            # Cloud backend model selection
+            provider_names = {
+                "openai": "OpenAI", "anthropic": "Anthropic",
+                "gemini": "Google Gemini", "openrouter": "OpenRouter",
+                "groq": "Groq", "deepseek": "DeepSeek", "hf_cloud": "HuggingFace Cloud",
+            }
+            model_funcs = {
+                "openai": get_openai_models, "anthropic": get_anthropic_models,
+                "gemini": get_gemini_models, "openrouter": get_openrouter_models,
+                "groq": get_groq_models, "deepseek": get_deepseek_models, "hf_cloud": get_hf_cloud_models,
+            }
+            model_keys = {
+                "openai": "openai_model", "anthropic": "anthropic_model",
+                "gemini": "gemini_model", "openrouter": "openrouter_model",
+                "groq": "groq_model", "deepseek": "deepseek_model", "hf_cloud": "hf_cloud_model",
+            }
+
+            provider_name = provider_names.get(backend, backend)
+            model_func = model_funcs.get(backend)
+            model_key = model_keys.get(backend)
+
+            api_key = get_api_key(backend)
+            if not api_key:
+                print(f"\n{Colors.BRIGHT_RED}\u2717 No API key configured for {provider_name}.{Colors.RESET}")
+                print(f"{Colors.YELLOW}Go to Settings > Manage Cloud API Keys to add one.{Colors.RESET}")
+                return False
+
+            print(f"{Colors.DIM}Fetching available models from {provider_name}...{Colors.RESET}")
+            models = model_func(api_key) if model_func else []
+
+            if not models:
+                print(f"\n{Colors.YELLOW}\u26a0 Could not fetch models. You can enter a model name manually.{Colors.RESET}")
+                custom = input(f"{Colors.BRIGHT_GREEN}Enter model name (or press Enter to cancel): {Colors.RESET}").strip()
+                if custom:
+                    self.engine.model_name = custom
+                    self.engine.config['model_name'] = custom
+                    self.engine.config[model_key] = custom
+                    self.cfg_mgr.update(model_key, custom)
+                    self.cfg_mgr.update("model_name", custom)
+                    print(f"\n{Colors.BRIGHT_GREEN}\u2713 Model changed to: {custom}{Colors.RESET}")
+                    return True
+                return False
+
+            print(f"\n{Colors.BRIGHT_CYAN}Available {provider_name} Models:{Colors.RESET}\n")
+            current_model = self.engine.model_name
+            for i, model in enumerate(models, 1):
+                marker = f"{Colors.BRIGHT_GREEN}\u25c0 current{Colors.RESET}" if model == current_model else ""
+                print(f"  {Colors.CYAN}[{i}]{Colors.RESET} {Colors.BRIGHT_WHITE}{model}{Colors.RESET} {marker}")
+
+            print(f"\n  {Colors.DIM}[0] Cancel | [C] Custom model name{Colors.RESET}")
+
+            try:
+                choice = input(f"\n{Colors.BRIGHT_GREEN}Select model [1-{len(models)}]: {Colors.RESET}").strip()
+                if choice == "0" or not choice:
+                    return True  # User cancelled
+
+                if choice.lower() == 'c':
+                    custom = input(f"{Colors.BRIGHT_GREEN}Enter model name: {Colors.RESET}").strip()
+                    if custom:
+                        self.engine.model_name = custom
+                        self.engine.config['model_name'] = custom
+                        self.engine.config[model_key] = custom
+                        self.cfg_mgr.update(model_key, custom)
+                        self.cfg_mgr.update("model_name", custom)
+                        print(f"\n{Colors.BRIGHT_GREEN}\u2713 Model changed to: {custom}{Colors.RESET}")
+                        return True
+                    return False
+
+                idx = int(choice)
+                if 1 <= idx <= len(models):
+                    selected_model = models[idx - 1]
+                    self.engine.model_name = selected_model
+                    self.engine.config['model_name'] = selected_model
+                    self.engine.config[model_key] = selected_model
+                    self.cfg_mgr.update(model_key, selected_model)
+                    self.cfg_mgr.update("model_name", selected_model)
+                    print(f"\n{Colors.BRIGHT_GREEN}\u2713 Model changed to: {selected_model}{Colors.RESET}")
+                    return True
+                else:
+                    print(f"{Colors.YELLOW}\u26a0 Invalid selection.{Colors.RESET}")
+                    return False
+            except ValueError:
+                print(f"{Colors.YELLOW}\u26a0 Invalid input.{Colors.RESET}")
+                return False
+
+        elif backend == "huggingface":
+            print(f"\n{Colors.BRIGHT_CYAN}Current HuggingFace Model:{Colors.RESET} {Colors.BRIGHT_WHITE}{self.engine.model_name}{Colors.RESET}")
+            new_model = input(f"\n{Colors.BRIGHT_GREEN}Enter new model ID (or press Enter to keep current): {Colors.RESET}").strip()
+            if new_model:
+                self.engine.model_name = new_model
+                self.engine.config['model_name'] = new_model
+                self.cfg_mgr.update("model_name", new_model)
+                print(f"\n{Colors.BRIGHT_GREEN}\u2713 Model changed to: {new_model}{Colors.RESET}")
+                print(f"{Colors.YELLOW}\u26a0 Note: Restart may be required to load the new model.{Colors.RESET}")
+                return True
+            return True  # User kept current
+
+        else:
+            print(f"{Colors.YELLOW}\u26a0 Unknown backend: {backend}{Colors.RESET}")
             return False
 
+    def _verify_backend_ready(self):
+        """Check if the current backend is operational and ready for building."""
+        backend = self.engine.backend
+        cloud_backends = ("openai", "anthropic", "gemini", "openrouter", "groq", "deepseek", "hf_cloud")
+
+        if backend == "ollama":
+            models = get_ollama_models()
+            if not models:
+                print(f"{Colors.BRIGHT_RED}\u2717 No Ollama models installed!{Colors.RESET}")
+                print(f"{Colors.YELLOW}Please install a model first:{Colors.RESET}")
+                print(f"{Colors.DIM}  ollama pull llama3.2{Colors.RESET}")
+                print(f"{Colors.DIM}  ollama pull qwen2.5-coder{Colors.RESET}")
+                return False
+
+            if self.engine.model_name not in models:
+                print(f"{Colors.YELLOW}\u26a0 Current model '{self.engine.model_name}' not found in Ollama.{Colors.RESET}")
+                print(f"{Colors.CYAN}Please select an available model:{Colors.RESET}")
+                return self._select_model()
+            return True
+
+        elif backend == "llama_cpp":
+            base_url = normalize_base_url(self.config.get("llama_cpp_base_url", "http://127.0.0.1:8080"))
+            try:
+                res = requests.get(f"{base_url}/v1/models", timeout=3)
+                if res.status_code == 200:
+                    return True
+            except Exception:
+                pass
+            print(f"{Colors.BRIGHT_RED}\u2717 Cannot connect to llama.cpp server at {base_url}{Colors.RESET}")
+            print(f"{Colors.YELLOW}Make sure the server is running.{Colors.RESET}")
+            return False
+
+        elif backend in cloud_backends:
+            provider_names = {
+                "openai": "OpenAI", "anthropic": "Anthropic",
+                "gemini": "Google Gemini", "openrouter": "OpenRouter",
+                "groq": "Groq", "deepseek": "DeepSeek", "hf_cloud": "HuggingFace Cloud",
+            }
+            provider_name = provider_names.get(backend, backend)
+
+            api_key = get_api_key(backend)
+            if not api_key:
+                print(f"{Colors.BRIGHT_RED}\u2717 No API key configured for {provider_name}.{Colors.RESET}")
+                print(f"{Colors.YELLOW}Go to Settings > Manage Cloud API Keys to add one.{Colors.RESET}")
+                return False
+
+            if not self.engine.model_name:
+                print(f"{Colors.YELLOW}\u26a0 No model selected for {provider_name}.{Colors.RESET}")
+                print(f"{Colors.CYAN}Please select a model:{Colors.RESET}")
+                return self._select_model()
+
+            print(f"{Colors.BRIGHT_GREEN}\u2713 {provider_name} ready{Colors.RESET} {Colors.DIM}(model: {self.engine.model_name}){Colors.RESET}")
+            return True
+
+        elif backend == "huggingface":
+            if self.engine.model is not None:
+                return True
+            print(f"{Colors.BRIGHT_RED}\u2717 HuggingFace model not loaded.{Colors.RESET}")
+            print(f"{Colors.YELLOW}Check your model configuration and restart.{Colors.RESET}")
+            return False
+
+        else:
+            print(f"{Colors.YELLOW}\u26a0 Unknown backend: {backend}{Colors.RESET}")
+            return False
     def app_builder_menu(self):
         """App Builder menu - multi-agent development system."""
         if not self.app_builder:
@@ -6248,7 +7938,7 @@ class App:
             print(f"{Colors.BRIGHT_GREEN}  [4]{Colors.RESET} Add Feature to Existing App")
             print(f"{Colors.BRIGHT_GREEN}  [5]{Colors.RESET} Debug App")
             print(f"{Colors.BRIGHT_GREEN}  [6]{Colors.RESET} Generate Documentation")
-            print(f"{Colors.BRIGHT_GREEN}  [7]{Colors.RESET} Change AI Model")
+            print(f"{Colors.BRIGHT_GREEN}  [7]{Colors.RESET} Change AI Model {Colors.DIM}({self.engine.backend}){Colors.RESET}")
             print(f"{Colors.BRIGHT_GREEN}  [8]{Colors.RESET} Back\n")
 
             c = input(f"{Colors.BRIGHT_GREEN}Choice: {Colors.RESET}")
@@ -6260,25 +7950,10 @@ class App:
                 print(f"{Colors.BRIGHT_YELLOW}{Colors.BOLD}  CREATE NEW APP{Colors.RESET}")
                 print(f"{Colors.BRIGHT_CYAN}{Colors.BOLD}{'='*79}{Colors.RESET}\n")
 
-                # Verify model is available before proceeding
-                if self.engine.backend == "ollama":
-                    models = get_ollama_models()
-                    if not models:
-                        print(f"{Colors.BRIGHT_RED}✗ No Ollama models installed!{Colors.RESET}")
-                        print(f"{Colors.YELLOW}Please install a model first:{Colors.RESET}")
-                        print(f"{Colors.DIM}  ollama pull llama3.2{Colors.RESET}")
-                        print(f"{Colors.DIM}  ollama pull qwen2.5-coder{Colors.RESET}")
-                        input(f"\n{Colors.DIM}Press Enter...{Colors.RESET}")
-                        continue
-
-                    if self.engine.model_name not in models:
-                        print(f"{Colors.YELLOW}⚠ Current model '{self.engine.model_name}' not found.{Colors.RESET}")
-                        print(f"{Colors.CYAN}Please select an available model:{Colors.RESET}")
-                        if not self._select_ollama_model():
-                            input(f"\n{Colors.DIM}Press Enter...{Colors.RESET}")
-                            continue
-                        print()
-
+                # Verify backend is ready before proceeding
+                if not self._verify_backend_ready():
+                    input(f"\n{Colors.DIM}Press Enter...{Colors.RESET}")
+                    continue
                 print(f"{Colors.CYAN}The AI team will help you build this app step by step.{Colors.RESET}")
                 print(f"{Colors.DIM}Agents involved: Spec Writer, Architect, Tech Lead, Developer, Code Monkey, Reviewer{Colors.RESET}")
                 print(f"{Colors.DIM}Using model: {self.engine.model_name}{Colors.RESET}\n")
@@ -6317,23 +7992,10 @@ class App:
                     time.sleep(1.5)
                     continue
 
-                # Verify model is available before proceeding
-                if self.engine.backend == "ollama":
-                    models = get_ollama_models()
-                    if not models:
-                        print(f"\n{Colors.BRIGHT_RED}✗ No Ollama models installed!{Colors.RESET}")
-                        print(f"{Colors.YELLOW}Please install a model first:{Colors.RESET}")
-                        print(f"{Colors.DIM}  ollama pull llama3.2{Colors.RESET}")
-                        input(f"\n{Colors.DIM}Press Enter...{Colors.RESET}")
-                        continue
-
-                    if self.engine.model_name not in models:
-                        print(f"\n{Colors.YELLOW}⚠ Current model '{self.engine.model_name}' not found.{Colors.RESET}")
-                        print(f"{Colors.CYAN}Please select an available model:{Colors.RESET}")
-                        if not self._select_ollama_model():
-                            input(f"\n{Colors.DIM}Press Enter...{Colors.RESET}")
-                            continue
-
+                # Verify backend is ready before proceeding
+                if not self._verify_backend_ready():
+                    input(f"\n{Colors.DIM}Press Enter...{Colors.RESET}")
+                    continue
                 print(f"\n{Colors.CYAN}Select project to continue:{Colors.RESET}\n")
                 for i, (pid, name, desc, status) in enumerate(projects, 1):
                     if status != "completed":
@@ -6416,66 +8078,111 @@ class App:
                     print(f"\n{Colors.YELLOW}⚠ No projects available.{Colors.RESET}")
                     time.sleep(1.5)
                     continue
-                
-                # Filter only completed projects
-                completed_projects = [(pid, name, desc, status) for pid, name, desc, status in projects if status == "completed"]
-                
-                if not completed_projects:
-                    print(f"\n{Colors.YELLOW}⚠ No completed projects to add features to.{Colors.RESET}")
+
+                # Filter projects that have at least reached development stage
+                eligible_projects = [(pid, name, desc, status) for pid, name, desc, status in projects
+                                     if status in ("completed", "development")]
+
+                if not eligible_projects:
+                    print(f"\n{Colors.YELLOW}⚠ No projects ready for new features (must be in development or completed stage).{Colors.RESET}")
                     time.sleep(1.5)
                     continue
-                
+
+                # Verify backend before AI calls
+                if not self._verify_backend_ready():
+                    input(f"\n{Colors.DIM}Press Enter...{Colors.RESET}")
+                    continue
+
                 print(f"\n{Colors.CYAN}Select project:{Colors.RESET}\n")
-                for i, (pid, name, desc, status) in enumerate(completed_projects, 1):
-                    print(f"  {Colors.CYAN}[{i}]{Colors.RESET} {Colors.BRIGHT_WHITE}{name}{Colors.RESET}")
-                
+                for i, (pid, name, desc, status) in enumerate(eligible_projects, 1):
+                    print(f"  {Colors.CYAN}[{i}]{Colors.RESET} {Colors.BRIGHT_WHITE}{name}{Colors.RESET} {Colors.DIM}({status}){Colors.RESET}")
+
                 try:
-                    idx = int(input(f"\n{Colors.BRIGHT_GREEN}Select [1-{len(completed_projects)}]: {Colors.RESET}").strip())
-                    if 1 <= idx <= len(completed_projects):
-                        project_id = completed_projects[idx - 1][0]
-                        
+                    idx = int(input(f"\n{Colors.BRIGHT_GREEN}Select [1-{len(eligible_projects)}]: {Colors.RESET}").strip())
+                    if 1 <= idx <= len(eligible_projects):
+                        project_id = eligible_projects[idx - 1][0]
+
                         feature_desc = input(f"{Colors.BRIGHT_GREEN}Feature Description: {Colors.RESET}").strip()
                         if not feature_desc:
                             print(f"{Colors.YELLOW}⚠ Description cannot be empty.{Colors.RESET}")
                             time.sleep(1)
                             continue
-                        
+
                         # Add feature as new tasks
                         print(f"\n{Colors.BRIGHT_CYAN}Tech Lead analyzing feature...{Colors.RESET}")
                         project = self.app_builder.get_project(project_id)
-                        spec = project[3] + f"\n\nNEW FEATURE: {feature_desc}"
-                        architecture = project[4]
-                        
+                        spec = (project[3] or "") + f"\n\nNEW FEATURE: {feature_desc}"
+                        architecture = project[4] or ""
+
+                        # Show existing files for context
+                        existing_files = self.app_builder.get_project_files(project_id)
+                        if existing_files:
+                            print(f"{Colors.DIM}Existing files: {', '.join(fp for fp, _ in existing_files)}{Colors.RESET}")
+
                         tasks_doc = self.app_builder.tech_lead.create_tasks(feature_desc, architecture)
-                        
+
+                        # Validate AI output
+                        if self.app_builder._is_ai_error(tasks_doc):
+                            print(f"{Colors.BRIGHT_RED}✗ AI failed to generate tasks: {tasks_doc[:100]}{Colors.RESET}")
+                            input(f"\n{Colors.DIM}Press Enter...{Colors.RESET}")
+                            continue
+
+                        print(f"\n{Colors.CYAN}Proposed tasks:{Colors.RESET}\n{tasks_doc}\n")
+
+                        # Enhanced task parsing - handle multiple formats
+                        task_lines = []
+                        for line in tasks_doc.split('\n'):
+                            line = line.strip()
+                            if not line:
+                                continue
+                            if (line[0].isdigit() or line.startswith('-') or line.startswith('*') or
+                                line.startswith('•') or line.lower().startswith('task')):
+                                task_lines.append(line)
+
+                        if not task_lines:
+                            print(f"{Colors.BRIGHT_RED}✗ Could not parse tasks from AI output.{Colors.RESET}")
+                            print(f"{Colors.YELLOW}Try rephrasing your feature description.{Colors.RESET}")
+                            input(f"\n{Colors.DIM}Press Enter...{Colors.RESET}")
+                            continue
+
+                        # Confirm with user before adding
+                        print(f"\n{Colors.CYAN}Parsed {len(task_lines)} tasks:{Colors.RESET}")
+                        for i_t, tl in enumerate(task_lines, 1):
+                            print(f"  {Colors.DIM}{i_t}.{Colors.RESET} {tl}")
+
+                        confirm = input(f"\n{Colors.BRIGHT_GREEN}Add these tasks and start building? [Y/n]: {Colors.RESET}").strip().lower()
+                        if confirm == 'n':
+                            print(f"{Colors.YELLOW}Cancelled.{Colors.RESET}")
+                            input(f"\n{Colors.DIM}Press Enter...{Colors.RESET}")
+                            continue
+
                         # Save new tasks
                         conn = sqlite3.connect(APP_PROJECTS_DB)
                         cursor = conn.cursor()
                         cursor.execute("SELECT MAX(task_number) FROM app_tasks WHERE project_id=?", (project_id,))
                         max_task = cursor.fetchone()[0] or 0
-                        
-                        task_lines = [line.strip() for line in tasks_doc.split('\n') if line.strip() and (line.strip()[0].isdigit() or line.strip().startswith('-'))]
-                        for i, task_line in enumerate(task_lines, 1):
+
+                        for i_t, task_line in enumerate(task_lines, 1):
                             cursor.execute("INSERT INTO app_tasks (project_id, task_number, description, status) VALUES (?, ?, ?, ?)",
-                                          (project_id, max_task + i, task_line, "pending"))
-                        
+                                          (project_id, max_task + i_t, task_line, "pending"))
+
                         conn.commit()
                         conn.close()
-                        
+
+                        # Update spec with feature info
+                        self.app_builder.update_project_field(project_id, "specification", spec)
                         self.app_builder.update_project_field(project_id, "status", "development")
-                        
+
                         print(f"\n{Colors.BRIGHT_GREEN}✓ {len(task_lines)} new tasks created!{Colors.RESET}")
-                        
-                        start_now = input(f"\n{Colors.BRIGHT_GREEN}Start implementing now? [Y/n]: {Colors.RESET}").strip().lower()
-                        if start_now != 'n':
-                            self.app_builder.develop_tasks(project_id)
+
+                        self.app_builder.develop_tasks(project_id)
                     else:
                         print(f"{Colors.YELLOW}⚠ Invalid selection.{Colors.RESET}")
                         time.sleep(1)
                 except ValueError:
                     print(f"{Colors.YELLOW}⚠ Invalid input.{Colors.RESET}")
                     time.sleep(1)
-                
+
                 input(f"\n{Colors.DIM}Press Enter...{Colors.RESET}")
             
             elif c == "5":
@@ -6484,42 +8191,118 @@ class App:
                     print(f"\n{Colors.YELLOW}⚠ No projects available.{Colors.RESET}")
                     time.sleep(1.5)
                     continue
-                
+
+                # Verify backend before AI calls
+                if not self._verify_backend_ready():
+                    input(f"\n{Colors.DIM}Press Enter...{Colors.RESET}")
+                    continue
+
                 print(f"\n{Colors.CYAN}Select project to debug:{Colors.RESET}\n")
                 for i, (pid, name, desc, status) in enumerate(projects, 1):
-                    print(f"  {Colors.CYAN}[{i}]{Colors.RESET} {Colors.BRIGHT_WHITE}{name}{Colors.RESET}")
-                
+                    files_count = len(self.app_builder.get_project_files(pid))
+                    print(f"  {Colors.CYAN}[{i}]{Colors.RESET} {Colors.BRIGHT_WHITE}{name}{Colors.RESET} {Colors.DIM}({files_count} files){Colors.RESET}")
+
                 try:
                     idx = int(input(f"\n{Colors.BRIGHT_GREEN}Select [1-{len(projects)}]: {Colors.RESET}").strip())
                     if 1 <= idx <= len(projects):
                         project_id = projects[idx - 1][0]
-                        
+                        project_name = projects[idx - 1][1]
+
+                        # Show project files for reference
+                        files = self.app_builder.get_project_files(project_id)
+                        if files:
+                            print(f"\n{Colors.CYAN}Project files:{Colors.RESET}")
+                            for fp, content in files:
+                                print(f"  {Colors.DIM}- {fp} ({len(content.split(chr(10)))} lines){Colors.RESET}")
+                        else:
+                            print(f"\n{Colors.YELLOW}⚠ No files in this project yet.{Colors.RESET}")
+
                         error_message = input(f"\n{Colors.BRIGHT_GREEN}Error Message/Issue: {Colors.RESET}").strip()
                         if not error_message:
                             print(f"{Colors.YELLOW}⚠ Please describe the issue.{Colors.RESET}")
                             time.sleep(1)
                             continue
-                        
-                        # Get relevant files
-                        files = self.app_builder.get_project_files(project_id)
-                        relevant_context = self.app_builder.filter_relevant_context(error_message, files, max_context=3000)
-                        
+
+                        # Get relevant files with more context for debugging
+                        relevant_context = self.app_builder.filter_relevant_context(error_message, files, max_context=5000)
+
                         print(f"\n{Colors.BRIGHT_CYAN}Debugger analyzing issue...{Colors.RESET}")
                         debug_result = self.app_builder.debugger.debug_issue(error_message, relevant_context)
-                        
+
+                        # Validate response
+                        if self.app_builder._is_ai_error(debug_result):
+                            print(f"{Colors.BRIGHT_RED}✗ Debugger failed: {debug_result[:100]}{Colors.RESET}")
+                            input(f"\n{Colors.DIM}Press Enter...{Colors.RESET}")
+                            continue
+
                         print(f"\n{Colors.CYAN}Debugger Analysis:{Colors.RESET}\n")
                         print(f"{Colors.BRIGHT_WHITE}{debug_result}{Colors.RESET}\n")
-                        
-                        apply_fix = input(f"{Colors.BRIGHT_GREEN}Apply suggested fix? [y/N]: {Colors.RESET}").strip().lower()
+
+                        apply_fix = input(f"{Colors.BRIGHT_GREEN}Apply fix automatically? [y/N]: {Colors.RESET}").strip().lower()
                         if apply_fix == 'y':
-                            print(f"{Colors.DIM}(Manual code editing required - check the project directory){Colors.RESET}")
+                            # Use CodeMonkey to generate the actual fix based on debugger analysis
+                            print(f"\n{Colors.BRIGHT_CYAN}Code Monkey implementing fix...{Colors.RESET}")
+
+                            project = self.app_builder.get_project(project_id)
+                            spec = project[3] or ""
+                            architecture = project[4] or ""
+
+                            # Build fix plan from debugger output
+                            fix_plan = (
+                                f"BUG FIX TASK:\n"
+                                f"Error/Issue: {error_message}\n\n"
+                                f"Debugger Analysis:\n{debug_result}\n\n"
+                                f"Instructions: Apply the fix described above. "
+                                f"Write the COMPLETE corrected file (not just the changed parts)."
+                            )
+
+                            fix_code = self.app_builder.code_monkey.write_code(
+                                fix_plan, relevant_context,
+                                spec=spec, architecture=architecture,
+                                task_desc=f"Fix bug: {error_message}"
+                            )
+
+                            if self.app_builder._is_ai_error(fix_code) or len(fix_code.strip()) < 20:
+                                print(f"{Colors.BRIGHT_RED}✗ Failed to generate fix code.{Colors.RESET}")
+                                print(f"{Colors.YELLOW}Check the debugger analysis above and apply manually.{Colors.RESET}")
+                                print(f"{Colors.DIM}Project directory: {APPS_DIR}/{project_name}/{Colors.RESET}")
+                            else:
+                                # Extract filename from the fix
+                                filename = self.app_builder.extract_filename(fix_code, fix_plan, error_message)
+                                if not filename:
+                                    # Try to match against existing files
+                                    for fp, _ in files:
+                                        if fp.lower() in error_message.lower() or fp.lower() in debug_result.lower():
+                                            filename = fp
+                                            break
+                                if not filename:
+                                    filename = input(f"{Colors.BRIGHT_GREEN}Which file should be updated? {Colors.RESET}").strip()
+
+                                if filename:
+                                    # Clean code before saving
+                                    cleaned = extract_code_from_response(fix_code)
+                                    save_code = cleaned["code"] if cleaned["code"] and len(cleaned["code"].strip()) > 20 else fix_code
+
+                                    # Review the fix
+                                    print(f"\n{Colors.CYAN}Proposed fix for {filename}:{Colors.RESET}")
+                                    print(f"{Colors.DIM}{save_code[:800]}{'...' if len(save_code) > 800 else ''}{Colors.RESET}\n")
+
+                                    confirm = input(f"{Colors.BRIGHT_GREEN}Save this fix to {filename}? [Y/n]: {Colors.RESET}").strip().lower()
+                                    if confirm != 'n':
+                                        self.app_builder.save_file(project_id, filename, save_code)
+                                        print(f"{Colors.BRIGHT_GREEN}✓ Fix applied and saved: {filename}{Colors.RESET}")
+                                    else:
+                                        print(f"{Colors.YELLOW}Fix not applied.{Colors.RESET}")
+                                else:
+                                    print(f"{Colors.YELLOW}⚠ No filename specified. Fix not applied.{Colors.RESET}")
+                                    print(f"{Colors.DIM}Project directory: {APPS_DIR}/{project_name}/{Colors.RESET}")
                     else:
                         print(f"{Colors.YELLOW}⚠ Invalid selection.{Colors.RESET}")
                         time.sleep(1)
                 except ValueError:
                     print(f"{Colors.YELLOW}⚠ Invalid input.{Colors.RESET}")
                     time.sleep(1)
-                
+
                 input(f"\n{Colors.DIM}Press Enter...{Colors.RESET}")
             
             elif c == "6":
@@ -6528,36 +8311,61 @@ class App:
                     print(f"\n{Colors.YELLOW}⚠ No projects available.{Colors.RESET}")
                     time.sleep(1.5)
                     continue
-                
+
+                # Verify backend before AI calls
+                if not self._verify_backend_ready():
+                    input(f"\n{Colors.DIM}Press Enter...{Colors.RESET}")
+                    continue
+
                 print(f"\n{Colors.CYAN}Select project:{Colors.RESET}\n")
                 for i, (pid, name, desc, status) in enumerate(projects, 1):
-                    print(f"  {Colors.CYAN}[{i}]{Colors.RESET} {Colors.BRIGHT_WHITE}{name}{Colors.RESET}")
-                
+                    files_count = len(self.app_builder.get_project_files(pid))
+                    print(f"  {Colors.CYAN}[{i}]{Colors.RESET} {Colors.BRIGHT_WHITE}{name}{Colors.RESET} {Colors.DIM}({files_count} files, {status}){Colors.RESET}")
+
                 try:
                     idx = int(input(f"\n{Colors.BRIGHT_GREEN}Select [1-{len(projects)}]: {Colors.RESET}").strip())
                     if 1 <= idx <= len(projects):
                         project_id, project_name, desc, status = projects[idx - 1]
                         project = self.app_builder.get_project(project_id)
-                        
-                        print(f"\n{Colors.BRIGHT_CYAN}Technical Writer creating documentation...{Colors.RESET}")
-                        
+
                         files = self.app_builder.get_project_files(project_id)
-                        codebase_summary = "\n".join([f"{fp}: {len(content)} lines" for fp, content in files])
-                        
+                        if not files:
+                            print(f"\n{Colors.YELLOW}⚠ No files in this project yet. Build the app first.{Colors.RESET}")
+                            input(f"\n{Colors.DIM}Press Enter...{Colors.RESET}")
+                            continue
+
+                        print(f"\n{Colors.BRIGHT_CYAN}Technical Writer creating documentation...{Colors.RESET}")
+                        print(f"{Colors.DIM}Analyzing {len(files)} files...{Colors.RESET}")
+
+                        codebase_summary = "\n".join([f"{fp}: {len(content.split(chr(10)))} lines" for fp, content in files])
+
                         docs = self.app_builder.tech_writer.write_documentation(
                             project_name, project[3] or desc, project[4] or "N/A", codebase_summary
                         )
-                        
-                        # Save documentation
-                        self.app_builder.save_file(project_id, "README.md", docs)
-                        print(f"\n{Colors.BRIGHT_GREEN}✓ Documentation saved: README.md{Colors.RESET}")
+
+                        # Validate output before saving
+                        if self.app_builder._is_ai_error(docs):
+                            print(f"\n{Colors.BRIGHT_RED}✗ Failed to generate documentation: {docs[:100]}{Colors.RESET}")
+                            print(f"{Colors.YELLOW}Please check your AI backend and try again.{Colors.RESET}")
+                        else:
+                            # Show preview
+                            print(f"\n{Colors.CYAN}Documentation Preview:{Colors.RESET}")
+                            print(f"{Colors.DIM}{docs[:500]}{'...' if len(docs) > 500 else ''}{Colors.RESET}\n")
+
+                            save_it = input(f"{Colors.BRIGHT_GREEN}Save README.md? [Y/n]: {Colors.RESET}").strip().lower()
+                            if save_it != 'n':
+                                self.app_builder.save_file(project_id, "README.md", docs)
+                                print(f"\n{Colors.BRIGHT_GREEN}✓ Documentation saved: README.md{Colors.RESET}")
+                                print(f"{Colors.DIM}Location: {APPS_DIR}/{project_name}/README.md{Colors.RESET}")
+                            else:
+                                print(f"{Colors.YELLOW}Not saved.{Colors.RESET}")
                     else:
                         print(f"{Colors.YELLOW}⚠ Invalid selection.{Colors.RESET}")
                         time.sleep(1)
                 except ValueError:
                     print(f"{Colors.YELLOW}⚠ Invalid input.{Colors.RESET}")
                     time.sleep(1)
-                
+
                 input(f"\n{Colors.DIM}Press Enter...{Colors.RESET}")
 
             elif c == "7":
@@ -6570,12 +8378,7 @@ class App:
                 print(f"{Colors.CYAN}Current model:{Colors.RESET} {Colors.BRIGHT_WHITE}{self.engine.model_name}{Colors.RESET}")
                 print(f"{Colors.CYAN}Backend:{Colors.RESET} {Colors.BRIGHT_WHITE}{self.engine.backend}{Colors.RESET}\n")
 
-                if self.engine.backend == "ollama":
-                    self._select_ollama_model()
-                else:
-                    print(f"{Colors.YELLOW}Model selection is only available for Ollama backend.{Colors.RESET}")
-                    print(f"{Colors.DIM}To switch backends, use Settings from the main menu.{Colors.RESET}")
-
+                self._select_model()
                 input(f"\n{Colors.DIM}Press Enter...{Colors.RESET}")
 
             elif c == "8":
@@ -6767,19 +8570,97 @@ class App:
                     pass  # Fall through to original help
             
             # Fallback to original help display
-            print(f"\n{Colors.BRIGHT_CYAN}{Colors.BOLD}Available Commands:{Colors.RESET}\n")
-            print(f"  {Colors.BRIGHT_GREEN}/new [name]{Colors.RESET}          - Create new chat session")
-            print(f"  {Colors.BRIGHT_GREEN}/save [filename]{Colors.RESET}     - Save current chat to file")
-            print(f"  {Colors.BRIGHT_GREEN}/load [id|filename]{Colors.RESET} - Load chat session (list if no args)")
-            print(f"  {Colors.BRIGHT_GREEN}/project [name|desc]{Colors.RESET} - Create/switch project (list if no args)")
-            print(f"  {Colors.BRIGHT_GREEN}/project_save [file]{Colors.RESET} - Save current project")
-            print(f"  {Colors.BRIGHT_GREEN}/project_load [id|file]{Colors.RESET} - Load project (list if no args)")
-            print(f"\n{Colors.BRIGHT_YELLOW}{Colors.BOLD}Advanced Features:{Colors.RESET}\n")
-            print(f"  {Colors.BRIGHT_CYAN}/camera{Colors.RESET}             - Launch Camera Assistant (vision only, optimized for low-end PCs)")
-            print(f"  {Colors.BRIGHT_CYAN}/voice{Colors.RESET} or {Colors.BRIGHT_CYAN}/tts{Colors.RESET}        - Launch Voice Assistant (TTS only, no camera)")
-            print(f"  {Colors.BRIGHT_CYAN}/vision{Colors.RESET}              - Launch Vision + Voice Assistant (both camera + voice)")
-            print(f"\n{Colors.BRIGHT_RED}/back, /exit{Colors.RESET}        - Exit chat")
-            print(f"  {Colors.BRIGHT_GREEN}/help{Colors.RESET}               - Show this help")
+            W = Colors.BRIGHT_WHITE
+            G = Colors.BRIGHT_GREEN
+            C = Colors.BRIGHT_CYAN
+            Y = Colors.BRIGHT_YELLOW
+            M = Colors.BRIGHT_MAGENTA
+            D = Colors.DIM
+            R = Colors.RESET
+            B = Colors.BOLD
+
+            print(f"\n{C}{B}{'═'*65}{R}")
+            print(f"{Y}{B}  AI Terminal Pro — Chat Commands{R}")
+            print(f"{C}{B}{'═'*65}{R}\n")
+
+            print(f"{Y}{B}Session & Projects{R}")
+            print(f"  {G}/new [name]{R}              Create new chat session")
+            print(f"  {G}/save [file]{R}             Save session to file")
+            print(f"  {G}/load [id|file]{R}          Load session (list if no args)")
+            print(f"  {G}/resume{R}                  Resume most recent session")
+            print(f"  {G}/project [name]{R}          Create/switch project")
+            print(f"  {G}/project_save [file]{R}     Export project")
+            print(f"  {G}/project_load [id|file]{R}  Import project")
+            print(f"  {G}/compact{R}                 Summarize history to save tokens")
+
+            print(f"\n{Y}{B}File Operations  (Claude Code style){R}")
+            print(f"  {C}/read <file> [file2]{R}     Read file(s) into AI context")
+            print(f"  {C}/write <file> [| content]{R} Write/create a file")
+            print(f"  {C}/edit <file> [instruction]{R} AI-assisted edit with diff preview")
+            print(f"  {C}/diff [file]{R}             Show git diff or file diff")
+            print(f"  {C}/mkdir <dir>{R}             Create directory")
+            print(f"  {D}@filename{R}                Inline: inject file into this message")
+
+            print(f"\n{Y}{B}Code Search{R}")
+            print(f"  {C}/grep <pattern> [path]{R}   Regex search across files")
+            print(f"  {C}/find <name> [path]{R}      Find files by name pattern")
+            print(f"  {C}/glob <pattern>{R}           Find files by glob (e.g. **/*.py)")
+
+            print(f"\n{Y}{B}Git Integration{R}")
+            print(f"  {C}/git status{R}              Working tree status")
+            print(f"  {C}/git log{R}                 Recent commits (graph)")
+            print(f"  {C}/git add [files]{R}         Stage files")
+            print(f"  {C}/git commit <msg>{R}        Commit staged changes")
+            print(f"  {C}/git push/pull{R}           Push/pull from remote")
+            print(f"  {C}/git diff [file]{R}         Show diff")
+            print(f"  {C}/git branch{R}              List branches")
+            print(f"  {C}/git checkout <branch>{R}   Switch branch")
+
+            print(f"\n{Y}{B}Shell Execution{R}")
+            print(f"  {C}/run <command>{R}           Run shell command (output in terminal)")
+            print(f"  {D}!command{R}                 Shorthand: run & inject output into context")
+
+            print(f"\n{Y}{B}AI & Planning{R}")
+            print(f"  {C}/plan [on|off]{R}           Toggle plan-before-act mode")
+            print(f"  {C}/cost{R}                    Token usage & estimated cost")
+            print(f"  {C}/model [name]{R}            Switch model live")
+            print(f"  {C}/persona [name]{R}          Change AI persona")
+            print(f"  {C}/config{R}                  Open settings")
+
+            print(f"\n{Y}{B}Task Management{R}")
+            print(f"  {C}/todo [list]{R}             Show task list")
+            print(f"  {C}/todo add <task>{R}         Add a task")
+            print(f"  {C}/todo done <n>{R}           Mark task complete")
+            print(f"  {C}/todo remove <n>{R}         Remove a task")
+
+            print(f"\n{Y}{B}Navigation{R}")
+            print(f"  {C}/ls [path]{R}               List directory contents")
+            print(f"  {C}/cd [path]{R}               Change working directory")
+            print(f"  {C}/pwd{R}                     Show working directory")
+            print(f"  {C}/traverse{R}                Interactive directory browser")
+
+            print(f"\n{Y}{B}Tools & Integrations{R}")
+            print(f"  {C}/tools{R}                   Manage custom tools")
+            print(f"  {C}/mcp{R}                     MCP server management")
+            print(f"  {C}/rag{R}                     RAG document management")
+            print(f"  {C}/browser{R}                 Web browser automation")
+            print(f"  {C}/api{R}                     API server management")
+            print(f"  {C}/train{R}                   Model training")
+            print(f"  {C}/app{R}                     App builder (multi-agent)")
+
+            print(f"\n{Y}{B}Misc{R}")
+            print(f"  {C}/memory{R}                  Memory/RAG status")
+            print(f"  {C}/history{R}                 Show chat history")
+            print(f"  {C}/status{R}                  System status")
+            print(f"  {C}/sysinfo{R}                 OS/hardware info")
+            print(f"  {C}/clear{R}                   Clear screen")
+            print(f"  {C}/theme{R}                   Change color theme")
+            print(f"  {C}/whisper{R}                 Voice input (Whisper)")
+            print(f"  {C}/camera{R}                  Camera assistant")
+            print(f"  {C}/voice{R} / {C}/tts{R}           Voice/TTS assistant")
+            print(f"  {C}/vision{R}                  Voice + Vision assistant")
+            print(f"  {M}/back{R} / {M}/exit{R}           Return to main menu")
+            print(f"\n{C}{B}{'═'*65}{R}\n")
             return "COMMAND"
 
         elif cmd == "/clear":
@@ -6806,7 +8687,10 @@ class App:
 
             # Model info
             backend = self.config.get('backend', 'unknown')
-            model = self.config.get('model_name', 'unknown')
+            if backend in ['openai', 'anthropic', 'gemini', 'openrouter', 'groq', 'deepseek', 'hf_cloud']:
+                model = self.config.get(f"{backend}_model", self.config.get('model_name', 'unknown'))
+            else:
+                model = self.config.get('model_name', 'unknown')
             print(f"  {Colors.CYAN}Backend:{Colors.RESET} {Colors.BRIGHT_WHITE}{backend}{Colors.RESET}")
             print(f"  {Colors.CYAN}Model:{Colors.RESET} {Colors.BRIGHT_WHITE}{model}{Colors.RESET}")
 
@@ -6830,26 +8714,47 @@ class App:
                 mcp_count = len(self.registry.mcp_clients) if hasattr(self.registry, 'mcp_clients') else 0
                 print(f"  {Colors.CYAN}MCP Servers:{Colors.RESET} {Colors.BRIGHT_WHITE}{mcp_count} configured{Colors.RESET}")
 
+            # Encryption status
+            enc = self.memory._get_encryptor() if hasattr(self, 'memory') and self.memory else None
+            if enc is not None:
+                key_path = os.path.join(API_DIR, ".master_key")
+                enc_status = f"{Colors.BRIGHT_GREEN}✓ Active (Fernet/AES-128){Colors.RESET}"
+                enc_detail = f"{Colors.DIM}key: {key_path}{Colors.RESET}"
+            else:
+                enc_status = f"{Colors.YELLOW}⚠ Unavailable — install cryptography: pip install cryptography{Colors.RESET}"
+                enc_detail = ""
+            print(f"  {Colors.CYAN}Chat Encryption:{Colors.RESET} {enc_status} {enc_detail}")
+            print(f"  {Colors.DIM}All messages, RAG docs and project memory are encrypted at rest.{Colors.RESET}")
+
             print()
             return "COMMAND"
 
         elif cmd == "/model":
-            # Show or change model
-            if not args:
-                # Show current model
-                backend = self.config.get('backend', 'unknown')
-                model = self.config.get('model_name', 'unknown')
-                print(f"\n{Colors.BRIGHT_CYAN}Current Model Configuration:{Colors.RESET}")
-                print(f"  {Colors.CYAN}Backend:{Colors.RESET} {Colors.BRIGHT_WHITE}{backend}{Colors.RESET}")
-                print(f"  {Colors.CYAN}Model:{Colors.RESET} {Colors.BRIGHT_WHITE}{model}{Colors.RESET}")
-                print(f"\n{Colors.DIM}Use /model [name] to switch models{Colors.RESET}")
+            # Show, browse, or change model - no API key re-entry needed
+            backend = self.config.get('backend', 'unknown')
+            cloud_backends = ['openai', 'anthropic', 'gemini', 'openrouter', 'groq', 'deepseek', 'hf_cloud']
+
+            if not args or args.strip().lower() == "list":
+                # Interactive model browser - fetches models using already-stored key
+                print(f"\n{Colors.BRIGHT_CYAN}Model Switcher{Colors.RESET} {Colors.DIM}(backend: {backend}){Colors.RESET}\n")
+                self._select_model()
             else:
-                # Change model
+                # Direct model set by name - updates both config AND live engine immediately
                 new_model = args.strip()
-                old_model = self.config.get('model_name', 'unknown')
+                if backend in cloud_backends:
+                    old_model = self.config.get(f"{backend}_model", self.config.get('model_name', 'unknown'))
+                    # Persist to config
+                    self.cfg_mgr.update(f"{backend}_model", new_model)
+                    # Update live engine in memory (takes effect on next message, no restart needed)
+                    self.engine.config[f"{backend}_model"] = new_model
+                else:
+                    old_model = self.config.get('model_name', 'unknown')
                 self.cfg_mgr.update('model_name', new_model)
-                print(f"\n{Colors.BRIGHT_GREEN}✓ Model changed:{Colors.RESET} {Colors.DIM}{old_model}{Colors.RESET} → {Colors.BRIGHT_WHITE}{new_model}{Colors.RESET}")
-                print(f"{Colors.YELLOW}Note: Model change will take effect on next message or after reload{Colors.RESET}")
+                self.engine.model_name = new_model
+                self.engine.config['model_name'] = new_model
+                self.config = self.cfg_mgr.config  # refresh App-level config view
+                print(f"\n{Colors.BRIGHT_GREEN}✓ Model switched:{Colors.RESET} {Colors.DIM}{old_model}{Colors.RESET} → {Colors.BRIGHT_WHITE}{new_model}{Colors.RESET}")
+                print(f"{Colors.DIM}Active immediately — no restart or API key re-entry needed.{Colors.RESET}")
             return "COMMAND"
 
         elif cmd == "/config":
@@ -8097,6 +10002,7 @@ class App:
                 print(f"  {Colors.CYAN}/app new [name]{Colors.RESET}        - Create new app project")
                 print(f"  {Colors.CYAN}/app list{Colors.RESET}             - List all projects")
                 print(f"  {Colors.CYAN}/app open [id]{Colors.RESET}        - Open project by ID")
+                print(f"  {Colors.CYAN}/app build{Colors.RESET}            - Build project (full multi-agent pipeline)")
                 print(f"  {Colors.CYAN}/app status{Colors.RESET}           - Show current project status")
                 print(f"  {Colors.CYAN}/app agents{Colors.RESET}           - List available agents")
                 print(f"  {Colors.CYAN}/app run [agent]{Colors.RESET}      - Run specific agent")
@@ -8252,6 +10158,38 @@ class App:
                     print(f"{Colors.BRIGHT_GREEN}✓ Exported to: {export_path}{Colors.RESET}")
                 except Exception as e:
                     print(f"{Colors.RED}Export failed: {e}{Colors.RESET}")
+
+            elif subcmd == "build":
+                if not hasattr(self, 'current_app_project') or not self.current_app_project:
+                    print(f"{Colors.YELLOW}No project open. Use /app open [id] or /app new [name] first{Colors.RESET}")
+                    return "COMMAND"
+
+                try:
+                    project = self.app_builder.get_project(self.current_app_project)
+                    if not project:
+                        print(f"{Colors.RED}Error: Project not found{Colors.RESET}")
+                        return "COMMAND"
+
+                    print(f"\n{Colors.BRIGHT_CYAN}Building project: {project[1]}{Colors.RESET}")
+                    print(f"{Colors.DIM}Current status: {project[5]}{Colors.RESET}")
+                    print(f"{Colors.DIM}This will run the full multi-agent build pipeline.{Colors.RESET}\n")
+
+                    confirm = input(f"{Colors.BRIGHT_GREEN}Continue? [Y/n]: {Colors.RESET}").strip().lower()
+                    if confirm == 'n':
+                        print(f"{Colors.YELLOW}Build cancelled{Colors.RESET}")
+                        return "COMMAND"
+
+                    print(f"\n{Colors.BRIGHT_CYAN}Starting multi-agent build...{Colors.RESET}\n")
+                    success, message = self.app_builder.build_app(self.current_app_project)
+
+                    if success:
+                        print(f"\n{Colors.BRIGHT_GREEN}\u2713 Build completed successfully!{Colors.RESET}")
+                        print(f"{Colors.DIM}Use /app files to see generated files{Colors.RESET}")
+                        print(f"{Colors.DIM}Use /app export [path] to export the project{Colors.RESET}")
+                    else:
+                        print(f"\n{Colors.BRIGHT_RED}\u2717 Build failed: {message}{Colors.RESET}")
+                except Exception as e:
+                    print(f"{Colors.RED}Error during build: {e}{Colors.RESET}")
 
             else:
                 print(f"{Colors.YELLOW}Unknown app command: {subcmd}{Colors.RESET}")
@@ -9429,12 +11367,30 @@ class App:
                             if text:
                                 print(f"\n{Colors.BRIGHT_WHITE}You said:{Colors.RESET} {text}")
 
-                                # Process as chat input
-                                print(f"\n{Colors.BRIGHT_CYAN}AI Response:{Colors.RESET}")
-                                # Call the chat processing
-                                response = self._process_chat_input(text)
-                                if response:
-                                    print(response)
+                                # Process as chat input via the engine
+                                try:
+                                    # Build prompt same way as chat_loop
+                                    sys_prompt = self.config.get("system_prompt", "You are a helpful AI assistant.")
+                                    if self.registry:
+                                        sys_prompt += self.registry.get_tool_prompt()
+                                    if hasattr(self, 'working_directory') and self.working_directory:
+                                        sys_prompt += f"\n\nCURRENT WORKING DIRECTORY: {self.working_directory}"
+
+                                    history = self.memory.get_recent_history(self.current_session_id, limit=20) if self.current_session_id else []
+                                    final_prompt = self.context_mgr.build_prompt(sys_prompt, history, "", text) if self.context_mgr else f"{sys_prompt}\n\nUser: {text}\nAssistant:"
+
+                                    print(f"\n{Colors.BRIGHT_CYAN}AI Response:{Colors.RESET}")
+                                    response = self.engine.generate(final_prompt)
+                                    if response:
+                                        print(f"{Colors.BRIGHT_WHITE}{response}{Colors.RESET}")
+                                        # Save to history
+                                        if self.current_session_id:
+                                            self.memory.add_chat(self.current_session_id, "user", text, self.current_project_id)
+                                            self.memory.add_chat(self.current_session_id, "assistant", response, self.current_project_id)
+                                    else:
+                                        print(f"{Colors.YELLOW}No response from AI{Colors.RESET}")
+                                except Exception as e:
+                                    print(f"{Colors.RED}Error processing voice input: {e}{Colors.RESET}")
 
                         try:
                             os.unlink(audio_file)
@@ -9533,6 +11489,9 @@ class App:
 
                 if os.path.isdir(new_path):
                     self.working_directory = new_path
+                    # Sync to ToolRegistry so CMD/FILE actions use this directory
+                    if self.registry:
+                        self.registry.working_directory = new_path
                     print(f"\n{Colors.BRIGHT_GREEN}✓ Changed directory to:{Colors.RESET}")
                     print(f"  {Colors.BRIGHT_WHITE}{self.working_directory}{Colors.RESET}")
 
@@ -9542,6 +11501,10 @@ class App:
                         dirs = [d for d in items if os.path.isdir(os.path.join(new_path, d)) and not d.startswith('.')]
                         files = [f for f in items if os.path.isfile(os.path.join(new_path, f)) and not f.startswith('.')]
                         print(f"\n  {Colors.CYAN}Contains:{Colors.RESET} {len(dirs)} folders, {len(files)} files")
+                        if dirs:
+                            print(f"  {Colors.DIM}Folders: {', '.join(sorted(dirs)[:10])}{' ...' if len(dirs) > 10 else ''}{Colors.RESET}")
+                        if files:
+                            print(f"  {Colors.DIM}Files:   {', '.join(sorted(files)[:10])}{' ...' if len(files) > 10 else ''}{Colors.RESET}")
                     except PermissionError:
                         print(f"  {Colors.YELLOW}(Permission denied to list contents){Colors.RESET}")
                 else:
@@ -9643,6 +11606,785 @@ class App:
         elif cmd == "/cd":
             # Alias for traverse
             return self.handle_chat_command(f"/traverse {args}")
+
+        # ═══════════════════════════════════════════════════════════════════════
+        # CLAUDE CODE CLI FEATURES
+        # ═══════════════════════════════════════════════════════════════════════
+
+        elif cmd == "/read":
+            # Read file(s) into conversation context
+            if not args.strip():
+                print(f"{Colors.YELLOW}Usage: /read <filepath> [filepath2 ...]{Colors.RESET}")
+                print(f"  {Colors.DIM}Reads file contents and injects them into the AI context.{Colors.RESET}")
+                print(f"  {Colors.DIM}Tip: You can also use @filename inline in any message.{Colors.RESET}")
+                return "COMMAND"
+
+            cwd = getattr(self, 'working_directory', None) or os.getcwd()
+            filepaths = args.strip().split()
+            loaded_any = False
+
+            for raw_path in filepaths:
+                path = raw_path if os.path.isabs(raw_path) else os.path.join(cwd, raw_path)
+                path = os.path.normpath(path)
+
+                if not os.path.exists(path):
+                    print(f"{Colors.BRIGHT_RED}✗ File not found: {path}{Colors.RESET}")
+                    continue
+                if os.path.isdir(path):
+                    print(f"{Colors.YELLOW}⚠ {path} is a directory. Use /ls to browse.{Colors.RESET}")
+                    continue
+
+                try:
+                    file_size = os.path.getsize(path)
+                    if file_size > 500_000:
+                        print(f"{Colors.YELLOW}⚠ {raw_path} is large ({file_size // 1024} KB). Reading first 500 lines only.{Colors.RESET}")
+
+                    with open(path, 'r', encoding='utf-8', errors='replace') as fh:
+                        lines = fh.readlines()
+
+                    if file_size > 500_000:
+                        content = ''.join(lines[:500])
+                        truncated = True
+                    else:
+                        content = ''.join(lines)
+                        truncated = False
+
+                    ext = os.path.splitext(path)[1].lstrip('.')
+                    lang = ext if ext else 'text'
+
+                    print(f"\n{Colors.BRIGHT_CYAN}📄 {raw_path}{Colors.RESET} {Colors.DIM}({len(lines)} lines){Colors.RESET}")
+                    print(f"{Colors.DIM}{'─'*60}{Colors.RESET}")
+
+                    # Display with line numbers (first 40 lines preview)
+                    preview_lines = lines[:40]
+                    for i, line in enumerate(preview_lines, 1):
+                        print(f"  {Colors.DIM}{i:3d}│{Colors.RESET} {line}", end='')
+                    if len(lines) > 40:
+                        print(f"\n  {Colors.DIM}... {len(lines) - 40} more lines ...{Colors.RESET}")
+                    if truncated:
+                        print(f"\n  {Colors.YELLOW}[Truncated to 500 lines]{Colors.RESET}")
+
+                    # Inject into context as a system note for the AI
+                    file_context = f"\n\n[FILE CONTEXT: {path}]\n```{lang}\n{content}\n```\n[END FILE CONTEXT]"
+
+                    if not hasattr(self, '_injected_file_contexts'):
+                        self._injected_file_contexts = {}
+                    self._injected_file_contexts[path] = file_context
+
+                    print(f"\n{Colors.BRIGHT_GREEN}✓ {raw_path} loaded into context ({len(content)} chars){Colors.RESET}")
+                    loaded_any = True
+
+                except Exception as e:
+                    print(f"{Colors.BRIGHT_RED}✗ Error reading {raw_path}: {e}{Colors.RESET}")
+
+            if loaded_any:
+                print(f"\n{Colors.DIM}File(s) will be included in your next message to the AI.{Colors.RESET}")
+            return "COMMAND"
+
+        elif cmd == "/write":
+            # Write content directly to a file
+            if not args.strip():
+                print(f"{Colors.YELLOW}Usage: /write <filepath> | <content>{Colors.RESET}")
+                print(f"  {Colors.DIM}If no content given after |, opens an AI-assisted write session.{Colors.RESET}")
+                return "COMMAND"
+
+            cwd = getattr(self, 'working_directory', None) or os.getcwd()
+
+            if '|' in args:
+                raw_path, content = args.split('|', 1)
+                raw_path = raw_path.strip()
+                content = content.strip()
+            else:
+                raw_path = args.strip()
+                content = None
+
+            path = raw_path if os.path.isabs(raw_path) else os.path.join(cwd, raw_path)
+            path = os.path.normpath(path)
+
+            # Permission check for existing files
+            if os.path.exists(path):
+                print(f"{Colors.YELLOW}⚠ File already exists: {path}{Colors.RESET}")
+                confirm = input(f"  Overwrite? [{Colors.BRIGHT_GREEN}y{Colors.RESET}/{Colors.BRIGHT_RED}N{Colors.RESET}]: ").strip().lower()
+                if confirm != 'y':
+                    print(f"{Colors.DIM}Cancelled.{Colors.RESET}")
+                    return "COMMAND"
+
+            if content is None:
+                print(f"{Colors.BRIGHT_CYAN}Enter content (type END on a new line to finish):{Colors.RESET}")
+                lines = []
+                while True:
+                    try:
+                        line = input()
+                        if line.strip() == 'END':
+                            break
+                        lines.append(line)
+                    except EOFError:
+                        break
+                content = '\n'.join(lines)
+
+            try:
+                os.makedirs(os.path.dirname(path) if os.path.dirname(path) else '.', exist_ok=True)
+                with open(path, 'w', encoding='utf-8') as fh:
+                    fh.write(content)
+                print(f"{Colors.BRIGHT_GREEN}✓ Written: {path} ({len(content)} chars, {len(content.splitlines())} lines){Colors.RESET}")
+            except Exception as e:
+                print(f"{Colors.BRIGHT_RED}✗ Write failed: {e}{Colors.RESET}")
+            return "COMMAND"
+
+        elif cmd == "/edit":
+            # AI-assisted file editing with diff display
+            if not args.strip():
+                print(f"{Colors.YELLOW}Usage: /edit <filepath> [instruction]{Colors.RESET}")
+                print(f"  {Colors.DIM}Opens a file for AI-assisted editing. Shows a diff before applying.{Colors.RESET}")
+                return "COMMAND"
+
+            cwd = getattr(self, 'working_directory', None) or os.getcwd()
+            edit_parts = args.strip().split(' ', 1)
+            raw_path = edit_parts[0].strip()
+            instruction = edit_parts[1].strip() if len(edit_parts) > 1 else ""
+
+            path = raw_path if os.path.isabs(raw_path) else os.path.join(cwd, raw_path)
+            path = os.path.normpath(path)
+
+            if not os.path.exists(path):
+                print(f"{Colors.BRIGHT_RED}✗ File not found: {path}{Colors.RESET}")
+                return "COMMAND"
+
+            try:
+                with open(path, 'r', encoding='utf-8', errors='replace') as fh:
+                    original_content = fh.read()
+            except Exception as e:
+                print(f"{Colors.BRIGHT_RED}✗ Cannot read file: {e}{Colors.RESET}")
+                return "COMMAND"
+
+            ext = os.path.splitext(path)[1].lstrip('.')
+            lang = ext if ext else 'text'
+
+            if not instruction:
+                instruction = input(f"{Colors.BRIGHT_CYAN}Edit instruction: {Colors.RESET}").strip()
+                if not instruction:
+                    print(f"{Colors.DIM}Cancelled.{Colors.RESET}")
+                    return "COMMAND"
+
+            print(f"{Colors.BRIGHT_CYAN}⚙ Generating edit for {raw_path}...{Colors.RESET}")
+
+            edit_prompt = (
+                f"You are a precise code editor. The user wants to edit this file:\n\n"
+                f"FILE: {path}\n"
+                f"```{lang}\n{original_content}\n```\n\n"
+                f"INSTRUCTION: {instruction}\n\n"
+                f"Return ONLY the complete updated file content. No explanations, no markdown fences, no commentary. "
+                f"Output the raw file content only."
+            )
+
+            try:
+                new_content = self.engine.generate(edit_prompt)
+                if not new_content or not new_content.strip():
+                    print(f"{Colors.BRIGHT_RED}✗ No response from AI{Colors.RESET}")
+                    return "COMMAND"
+
+                new_content = new_content.strip()
+                # Strip code fences if AI added them
+                if new_content.startswith('```'):
+                    lines_nc = new_content.split('\n')
+                    new_content = '\n'.join(lines_nc[1:])
+                    if new_content.endswith('```'):
+                        new_content = new_content[:-3].rstrip()
+
+                # Show diff
+                import difflib
+                orig_lines = original_content.splitlines(keepends=True)
+                new_lines = new_content.splitlines(keepends=True)
+                diff = list(difflib.unified_diff(orig_lines, new_lines, fromfile=f"a/{raw_path}", tofile=f"b/{raw_path}", lineterm=''))
+
+                if not diff:
+                    print(f"{Colors.YELLOW}⚠ No changes detected.{Colors.RESET}")
+                    return "COMMAND"
+
+                print(f"\n{Colors.BRIGHT_CYAN}Proposed changes:{Colors.RESET}")
+                print(f"{Colors.DIM}{'─'*60}{Colors.RESET}")
+                for line in diff[:80]:
+                    if line.startswith('+') and not line.startswith('+++'):
+                        print(f"{Colors.BRIGHT_GREEN}{line}{Colors.RESET}", end='')
+                    elif line.startswith('-') and not line.startswith('---'):
+                        print(f"{Colors.BRIGHT_RED}{line}{Colors.RESET}", end='')
+                    elif line.startswith('@@'):
+                        print(f"{Colors.BRIGHT_CYAN}{line}{Colors.RESET}", end='')
+                    else:
+                        print(f"{Colors.DIM}{line}{Colors.RESET}", end='')
+                if len(diff) > 80:
+                    print(f"\n{Colors.DIM}... {len(diff) - 80} more diff lines ...{Colors.RESET}")
+
+                print(f"\n{Colors.DIM}{'─'*60}{Colors.RESET}")
+                confirm = input(f"Apply changes? [{Colors.BRIGHT_GREEN}y{Colors.RESET}/{Colors.BRIGHT_RED}N{Colors.RESET}]: ").strip().lower()
+                if confirm == 'y':
+                    with open(path, 'w', encoding='utf-8') as fh:
+                        fh.write(new_content)
+                    print(f"{Colors.BRIGHT_GREEN}✓ File updated: {path}{Colors.RESET}")
+                else:
+                    print(f"{Colors.DIM}Cancelled — no changes made.{Colors.RESET}")
+
+            except Exception as e:
+                print(f"{Colors.BRIGHT_RED}✗ Edit failed: {e}{Colors.RESET}")
+            return "COMMAND"
+
+        elif cmd == "/diff":
+            # Show git diff or file diff
+            cwd = getattr(self, 'working_directory', None) or os.getcwd()
+            import subprocess as _sp
+
+            if not args.strip():
+                # Git diff of working tree
+                print(f"\n{Colors.BRIGHT_CYAN}Git Diff (working tree):{Colors.RESET}")
+                print(f"{Colors.DIM}{'─'*60}{Colors.RESET}")
+                try:
+                    result = _sp.run(['git', 'diff', '--color=always'], capture_output=True, text=True, cwd=cwd)
+                    if result.stdout.strip():
+                        print(result.stdout)
+                    else:
+                        print(f"  {Colors.DIM}No unstaged changes.{Colors.RESET}")
+                    if result.returncode != 0 and result.stderr:
+                        print(f"{Colors.YELLOW}{result.stderr.strip()}{Colors.RESET}")
+                except FileNotFoundError:
+                    print(f"{Colors.YELLOW}Git not found. Use /diff <file1> <file2> for plain diff.{Colors.RESET}")
+            elif args.strip().count(' ') >= 1:
+                # Diff between two files
+                import difflib
+                file_args = args.strip().split()
+                if len(file_args) >= 2:
+                    p1 = file_args[0] if os.path.isabs(file_args[0]) else os.path.join(cwd, file_args[0])
+                    p2 = file_args[1] if os.path.isabs(file_args[1]) else os.path.join(cwd, file_args[1])
+                    try:
+                        with open(p1, 'r', encoding='utf-8', errors='replace') as fh:
+                            lines1 = fh.readlines()
+                        with open(p2, 'r', encoding='utf-8', errors='replace') as fh:
+                            lines2 = fh.readlines()
+                        diff = list(difflib.unified_diff(lines1, lines2, fromfile=file_args[0], tofile=file_args[1]))
+                        if diff:
+                            for line in diff:
+                                if line.startswith('+') and not line.startswith('+++'):
+                                    print(f"{Colors.BRIGHT_GREEN}{line}{Colors.RESET}", end='')
+                                elif line.startswith('-') and not line.startswith('---'):
+                                    print(f"{Colors.BRIGHT_RED}{line}{Colors.RESET}", end='')
+                                elif line.startswith('@@'):
+                                    print(f"{Colors.BRIGHT_CYAN}{line}{Colors.RESET}", end='')
+                                else:
+                                    print(f"{Colors.DIM}{line}{Colors.RESET}", end='')
+                        else:
+                            print(f"{Colors.DIM}Files are identical.{Colors.RESET}")
+                    except Exception as e:
+                        print(f"{Colors.BRIGHT_RED}✗ {e}{Colors.RESET}")
+            else:
+                # Git diff for specific file
+                try:
+                    result = _sp.run(['git', 'diff', '--color=always', args.strip()], capture_output=True, text=True, cwd=cwd)
+                    if result.stdout.strip():
+                        print(result.stdout)
+                    else:
+                        print(f"  {Colors.DIM}No changes in {args.strip()}.{Colors.RESET}")
+                except FileNotFoundError:
+                    print(f"{Colors.YELLOW}Git not found.{Colors.RESET}")
+            return "COMMAND"
+
+        elif cmd == "/git":
+            # Git integration
+            import subprocess as _sp
+            cwd = getattr(self, 'working_directory', None) or os.getcwd()
+
+            git_subcommands = {
+                'status': ['git', 'status'],
+                'log':    ['git', 'log', '--oneline', '--graph', '--decorate', '-20'],
+                'branch': ['git', 'branch', '-a'],
+                'add':    None,   # handled below
+                'commit': None,
+                'push':   None,
+                'pull':   None,
+                'stash':  None,
+                'diff':   None,
+                'reset':  None,
+                'checkout': None,
+            }
+
+            sub = args.strip().split(' ', 1)
+            sub_cmd = sub[0].lower() if sub[0] else 'status'
+            sub_args = sub[1].strip() if len(sub) > 1 else ''
+
+            if not sub_cmd or sub_cmd == 'help':
+                print(f"\n{Colors.BRIGHT_CYAN}Git Commands:{Colors.RESET}")
+                print(f"  {Colors.BRIGHT_GREEN}/git status{Colors.RESET}               - Working tree status")
+                print(f"  {Colors.BRIGHT_GREEN}/git log{Colors.RESET}                  - Recent commits (graph)")
+                print(f"  {Colors.BRIGHT_GREEN}/git branch{Colors.RESET}               - List branches")
+                print(f"  {Colors.BRIGHT_GREEN}/git add <files>{Colors.RESET}          - Stage files (. for all)")
+                print(f"  {Colors.BRIGHT_GREEN}/git commit <msg>{Colors.RESET}         - Commit staged changes")
+                print(f"  {Colors.BRIGHT_GREEN}/git push [remote] [branch]{Colors.RESET} - Push to remote")
+                print(f"  {Colors.BRIGHT_GREEN}/git pull [remote] [branch]{Colors.RESET} - Pull from remote")
+                print(f"  {Colors.BRIGHT_GREEN}/git diff [file]{Colors.RESET}          - Show diff")
+                print(f"  {Colors.BRIGHT_GREEN}/git stash{Colors.RESET}                - Stash changes")
+                print(f"  {Colors.BRIGHT_GREEN}/git checkout <branch>{Colors.RESET}    - Switch branch")
+                print(f"  {Colors.BRIGHT_GREEN}/git reset [--soft|--hard] HEAD~1{Colors.RESET} - Undo commit")
+                return "COMMAND"
+
+            # Build git command
+            if sub_cmd == 'add':
+                git_cmd = ['git', 'add'] + (sub_args.split() if sub_args else ['.'])
+            elif sub_cmd == 'commit':
+                if not sub_args:
+                    sub_args = input(f"{Colors.BRIGHT_CYAN}Commit message: {Colors.RESET}").strip()
+                    if not sub_args:
+                        print(f"{Colors.DIM}Cancelled.{Colors.RESET}")
+                        return "COMMAND"
+                git_cmd = ['git', 'commit', '-m', sub_args]
+            elif sub_cmd == 'push':
+                git_cmd = ['git', 'push'] + (sub_args.split() if sub_args else [])
+            elif sub_cmd == 'pull':
+                git_cmd = ['git', 'pull'] + (sub_args.split() if sub_args else [])
+            elif sub_cmd == 'diff':
+                git_cmd = ['git', 'diff', '--color=always'] + (sub_args.split() if sub_args else [])
+            elif sub_cmd == 'stash':
+                git_cmd = ['git', 'stash'] + (sub_args.split() if sub_args else [])
+            elif sub_cmd == 'checkout':
+                git_cmd = ['git', 'checkout'] + (sub_args.split() if sub_args else [])
+            elif sub_cmd == 'reset':
+                git_cmd = ['git', 'reset'] + (sub_args.split() if sub_args else ['HEAD~1'])
+            elif sub_cmd == 'log':
+                git_cmd = ['git', 'log', '--oneline', '--graph', '--decorate', '-20'] + (sub_args.split() if sub_args else [])
+            elif sub_cmd == 'status':
+                git_cmd = ['git', 'status']
+            elif sub_cmd == 'branch':
+                git_cmd = ['git', 'branch', '-a'] + (sub_args.split() if sub_args else [])
+            else:
+                # Pass-through for any other git subcommand
+                git_cmd = ['git', sub_cmd] + (sub_args.split() if sub_args else [])
+
+            try:
+                result = _sp.run(git_cmd, capture_output=True, text=True, cwd=cwd)
+                output = (result.stdout or '') + (result.stderr or '')
+                if output.strip():
+                    print(f"\n{Colors.DIM}{'─'*60}{Colors.RESET}")
+                    print(output)
+                    print(f"{Colors.DIM}{'─'*60}{Colors.RESET}")
+                else:
+                    print(f"{Colors.DIM}(no output){Colors.RESET}")
+            except FileNotFoundError:
+                print(f"{Colors.BRIGHT_RED}✗ Git is not installed or not in PATH.{Colors.RESET}")
+            except Exception as e:
+                print(f"{Colors.BRIGHT_RED}✗ Git error: {e}{Colors.RESET}")
+            return "COMMAND"
+
+        elif cmd == "/grep":
+            # Search file contents with regex
+            if not args.strip():
+                print(f"{Colors.YELLOW}Usage: /grep <pattern> [path] [--ext=py,js]{Colors.RESET}")
+                print(f"  {Colors.DIM}Searches file contents recursively. Pattern is a regex.{Colors.RESET}")
+                return "COMMAND"
+
+            import re as _re
+            cwd = getattr(self, 'working_directory', None) or os.getcwd()
+
+            # Parse args
+            grep_parts = args.strip().split()
+            pattern = grep_parts[0]
+            search_root = cwd
+            ext_filter = None
+
+            for part in grep_parts[1:]:
+                if part.startswith('--ext='):
+                    ext_filter = [e.strip().lstrip('.') for e in part[6:].split(',')]
+                elif not part.startswith('--'):
+                    candidate = part if os.path.isabs(part) else os.path.join(cwd, part)
+                    if os.path.exists(candidate):
+                        search_root = candidate
+
+            print(f"\n{Colors.BRIGHT_CYAN}Searching for:{Colors.RESET} {Colors.BRIGHT_WHITE}{pattern}{Colors.RESET} {Colors.DIM}in {search_root}{Colors.RESET}")
+            print(f"{Colors.DIM}{'─'*60}{Colors.RESET}")
+
+            try:
+                compiled = _re.compile(pattern, _re.IGNORECASE)
+            except _re.error as e:
+                print(f"{Colors.BRIGHT_RED}✗ Invalid regex: {e}{Colors.RESET}")
+                return "COMMAND"
+
+            match_count = 0
+            file_count = 0
+            skip_dirs = {'.git', '__pycache__', 'node_modules', '.venv', 'venv', '.env'}
+
+            for dirpath, dirnames, filenames in os.walk(search_root):
+                dirnames[:] = [d for d in dirnames if d not in skip_dirs]
+                for fname in filenames:
+                    if ext_filter:
+                        fext = os.path.splitext(fname)[1].lstrip('.')
+                        if fext not in ext_filter:
+                            continue
+                    fpath = os.path.join(dirpath, fname)
+                    rel_path = os.path.relpath(fpath, cwd)
+                    try:
+                        with open(fpath, 'r', encoding='utf-8', errors='ignore') as fh:
+                            file_lines = fh.readlines()
+                    except Exception:
+                        continue
+
+                    file_matches = []
+                    for lineno, line in enumerate(file_lines, 1):
+                        if compiled.search(line):
+                            file_matches.append((lineno, line.rstrip()))
+
+                    if file_matches:
+                        file_count += 1
+                        print(f"\n  {Colors.BRIGHT_CYAN}{rel_path}{Colors.RESET}")
+                        for lineno, mline in file_matches[:10]:
+                            highlighted = compiled.sub(lambda m: f"{Colors.BRIGHT_YELLOW}{m.group()}{Colors.RESET}", mline)
+                            print(f"    {Colors.DIM}{lineno:4d}:{Colors.RESET} {highlighted}")
+                        if len(file_matches) > 10:
+                            print(f"    {Colors.DIM}... {len(file_matches) - 10} more matches in this file{Colors.RESET}")
+                        match_count += len(file_matches)
+
+                    if match_count > 500:
+                        print(f"\n{Colors.YELLOW}⚠ Truncated at 500 matches.{Colors.RESET}")
+                        break
+
+            print(f"\n{Colors.DIM}{'─'*60}{Colors.RESET}")
+            if match_count:
+                print(f"{Colors.BRIGHT_GREEN}Found {match_count} match(es) in {file_count} file(s){Colors.RESET}")
+            else:
+                print(f"{Colors.DIM}No matches found.{Colors.RESET}")
+            return "COMMAND"
+
+        elif cmd == "/find":
+            # Find files by name pattern
+            if not args.strip():
+                print(f"{Colors.YELLOW}Usage: /find <name-pattern> [path]{Colors.RESET}")
+                print(f"  {Colors.DIM}Example: /find *.py   /find config.json src/{Colors.RESET}")
+                return "COMMAND"
+
+            import fnmatch as _fnmatch
+            cwd = getattr(self, 'working_directory', None) or os.getcwd()
+            find_parts = args.strip().split()
+            name_pattern = find_parts[0]
+            search_root = cwd
+            if len(find_parts) > 1:
+                candidate = find_parts[1] if os.path.isabs(find_parts[1]) else os.path.join(cwd, find_parts[1])
+                if os.path.exists(candidate):
+                    search_root = candidate
+
+            print(f"\n{Colors.BRIGHT_CYAN}Finding:{Colors.RESET} {Colors.BRIGHT_WHITE}{name_pattern}{Colors.RESET} {Colors.DIM}in {search_root}{Colors.RESET}")
+            print(f"{Colors.DIM}{'─'*60}{Colors.RESET}")
+
+            skip_dirs = {'.git', '__pycache__', 'node_modules', '.venv', 'venv'}
+            found = []
+            for dirpath, dirnames, filenames in os.walk(search_root):
+                dirnames[:] = [d for d in dirnames if d not in skip_dirs]
+                for fname in filenames:
+                    if _fnmatch.fnmatch(fname, name_pattern):
+                        fpath = os.path.join(dirpath, fname)
+                        rel = os.path.relpath(fpath, cwd)
+                        size = os.path.getsize(fpath)
+                        sz = f"{size // 1024} KB" if size >= 1024 else f"{size} B"
+                        found.append((rel, sz))
+
+            if found:
+                for rel, sz in found[:100]:
+                    print(f"  {Colors.BRIGHT_WHITE}{rel}{Colors.RESET} {Colors.DIM}({sz}){Colors.RESET}")
+                if len(found) > 100:
+                    print(f"  {Colors.DIM}... and {len(found) - 100} more{Colors.RESET}")
+                print(f"\n{Colors.BRIGHT_GREEN}Found {len(found)} file(s){Colors.RESET}")
+            else:
+                print(f"  {Colors.DIM}No files matching '{name_pattern}'{Colors.RESET}")
+            return "COMMAND"
+
+        elif cmd == "/glob":
+            # Find files by glob pattern
+            if not args.strip():
+                print(f"{Colors.YELLOW}Usage: /glob <pattern>{Colors.RESET}")
+                print(f"  {Colors.DIM}Example: /glob src/**/*.py   /glob **/*.json{Colors.RESET}")
+                return "COMMAND"
+
+            import glob as _glob
+            cwd = getattr(self, 'working_directory', None) or os.getcwd()
+            pattern = args.strip()
+
+            # Make pattern relative to cwd
+            if not os.path.isabs(pattern):
+                full_pattern = os.path.join(cwd, pattern)
+            else:
+                full_pattern = pattern
+
+            print(f"\n{Colors.BRIGHT_CYAN}Glob:{Colors.RESET} {Colors.BRIGHT_WHITE}{pattern}{Colors.RESET}")
+            print(f"{Colors.DIM}{'─'*60}{Colors.RESET}")
+
+            matches = _glob.glob(full_pattern, recursive=True)
+            matches.sort()
+
+            if matches:
+                for match in matches[:100]:
+                    rel = os.path.relpath(match, cwd)
+                    is_dir = os.path.isdir(match)
+                    suffix = '/' if is_dir else ''
+                    if is_dir:
+                        print(f"  {Colors.BRIGHT_CYAN}{rel}{suffix}{Colors.RESET}")
+                    else:
+                        try:
+                            size = os.path.getsize(match)
+                            sz = f"{size // 1024} KB" if size >= 1024 else f"{size} B"
+                        except Exception:
+                            sz = '?'
+                        print(f"  {Colors.BRIGHT_WHITE}{rel}{Colors.RESET} {Colors.DIM}({sz}){Colors.RESET}")
+                if len(matches) > 100:
+                    print(f"  {Colors.DIM}... and {len(matches) - 100} more{Colors.RESET}")
+                print(f"\n{Colors.BRIGHT_GREEN}{len(matches)} match(es){Colors.RESET}")
+            else:
+                print(f"  {Colors.DIM}No matches for '{pattern}'{Colors.RESET}")
+            return "COMMAND"
+
+        elif cmd == "/mkdir":
+            # Create directory
+            if not args.strip():
+                print(f"{Colors.YELLOW}Usage: /mkdir <directory>{Colors.RESET}")
+                return "COMMAND"
+            cwd = getattr(self, 'working_directory', None) or os.getcwd()
+            dir_path = args.strip() if os.path.isabs(args.strip()) else os.path.join(cwd, args.strip())
+            try:
+                os.makedirs(dir_path, exist_ok=True)
+                print(f"{Colors.BRIGHT_GREEN}✓ Directory created: {dir_path}{Colors.RESET}")
+            except Exception as e:
+                print(f"{Colors.BRIGHT_RED}✗ Failed: {e}{Colors.RESET}")
+            return "COMMAND"
+
+        elif cmd == "/todo" or cmd == "/task":
+            # In-session task/todo list management
+            if not hasattr(self, '_todo_list'):
+                self._todo_list = []
+
+            sub = args.strip().split(' ', 1)
+            action = sub[0].lower() if sub[0] else 'list'
+            todo_args = sub[1].strip() if len(sub) > 1 else ''
+
+            if action in ('', 'list', 'ls'):
+                if not self._todo_list:
+                    print(f"\n{Colors.DIM}No tasks yet. Add with: /todo add <task>{Colors.RESET}")
+                else:
+                    print(f"\n{Colors.BRIGHT_CYAN}{Colors.BOLD}Tasks:{Colors.RESET}")
+                    for i, (done, text) in enumerate(self._todo_list, 1):
+                        if done:
+                            print(f"  {Colors.DIM}[✓] {i}. {text}{Colors.RESET}")
+                        else:
+                            print(f"  {Colors.BRIGHT_WHITE}[ ] {i}. {text}{Colors.RESET}")
+                    total = len(self._todo_list)
+                    done = sum(1 for d, _ in self._todo_list if d)
+                    print(f"\n  {Colors.DIM}{done}/{total} completed{Colors.RESET}")
+
+            elif action == 'add':
+                if not todo_args:
+                    print(f"{Colors.YELLOW}Usage: /todo add <task description>{Colors.RESET}")
+                else:
+                    self._todo_list.append((False, todo_args))
+                    print(f"{Colors.BRIGHT_GREEN}✓ Added task {len(self._todo_list)}: {todo_args}{Colors.RESET}")
+
+            elif action in ('done', 'check', 'complete'):
+                try:
+                    idx = int(todo_args) - 1
+                    if 0 <= idx < len(self._todo_list):
+                        _, text = self._todo_list[idx]
+                        self._todo_list[idx] = (True, text)
+                        print(f"{Colors.BRIGHT_GREEN}✓ Completed: {text}{Colors.RESET}")
+                    else:
+                        print(f"{Colors.YELLOW}⚠ Task {todo_args} not found{Colors.RESET}")
+                except ValueError:
+                    print(f"{Colors.YELLOW}Usage: /todo done <number>{Colors.RESET}")
+
+            elif action in ('remove', 'rm', 'delete', 'del'):
+                try:
+                    idx = int(todo_args) - 1
+                    if 0 <= idx < len(self._todo_list):
+                        removed = self._todo_list.pop(idx)
+                        print(f"{Colors.BRIGHT_GREEN}✓ Removed: {removed[1]}{Colors.RESET}")
+                    else:
+                        print(f"{Colors.YELLOW}⚠ Task {todo_args} not found{Colors.RESET}")
+                except ValueError:
+                    print(f"{Colors.YELLOW}Usage: /todo remove <number>{Colors.RESET}")
+
+            elif action == 'clear':
+                self._todo_list.clear()
+                print(f"{Colors.DIM}Task list cleared.{Colors.RESET}")
+
+            else:
+                # Treat as 'add' if action looks like a task description
+                full_task = args.strip()
+                self._todo_list.append((False, full_task))
+                print(f"{Colors.BRIGHT_GREEN}✓ Added task {len(self._todo_list)}: {full_task}{Colors.RESET}")
+
+            return "COMMAND"
+
+        elif cmd == "/compact":
+            # Compact/summarize conversation history to save tokens
+            if not self.current_session_id:
+                print(f"{Colors.YELLOW}⚠ No active session{Colors.RESET}")
+                return "COMMAND"
+
+            history = self.memory.get_all_history(self.current_session_id)
+            if not history:
+                print(f"{Colors.DIM}No conversation history to compact.{Colors.RESET}")
+                return "COMMAND"
+
+            msg_count = len(history)
+            if msg_count < 6:
+                print(f"{Colors.DIM}Conversation is short ({msg_count} messages). No compaction needed.{Colors.RESET}")
+                return "COMMAND"
+
+            print(f"{Colors.BRIGHT_CYAN}⚙ Compacting {msg_count} messages into a summary...{Colors.RESET}")
+
+            # Build a summary prompt
+            history_text = '\n'.join([f"{role.upper()}: {content[:500]}" for role, content in history[-40:]])
+            summary_prompt = (
+                f"Summarize the following conversation into a concise bullet-point list "
+                f"of key facts, decisions, code produced, and current state. "
+                f"This summary will replace the full history to save tokens. Be precise and complete.\n\n"
+                f"CONVERSATION:\n{history_text}\n\nSUMMARY:"
+            )
+
+            try:
+                summary = self.engine.generate(summary_prompt)
+                if not summary or not summary.strip():
+                    print(f"{Colors.BRIGHT_RED}✗ Failed to generate summary{Colors.RESET}")
+                    return "COMMAND"
+
+                # Save summary as a system message in a new session
+                old_name = self.memory.get_session(self.current_session_id)[1]
+                new_name = f"{old_name} [compacted]"
+                new_session_id = self.memory.create_session(new_name, self.current_project_id)
+                self.memory.save_message(new_session_id, 'system',
+                    f"[CONVERSATION SUMMARY — {msg_count} messages compacted]\n{summary}")
+                self.current_session_id = new_session_id
+
+                print(f"\n{Colors.BRIGHT_GREEN}✓ Compacted {msg_count} messages into summary{Colors.RESET}")
+                print(f"{Colors.CYAN}New session:{Colors.RESET} {Colors.BRIGHT_WHITE}{new_name}{Colors.RESET}")
+                print(f"\n{Colors.DIM}Summary:{Colors.RESET}")
+                print(f"{Colors.DIM}{summary[:600]}{'...' if len(summary) > 600 else ''}{Colors.RESET}")
+
+            except Exception as e:
+                print(f"{Colors.BRIGHT_RED}✗ Compact failed: {e}{Colors.RESET}")
+            return "COMMAND"
+
+        elif cmd == "/cost":
+            # Show token usage and estimated cost
+            backend = self.config.get('backend', 'ollama')
+            model = self.config.get(f"{backend}_model", self.config.get('model_name', 'unknown'))
+            max_tokens = self.config.get('max_response_tokens', 2000)
+            ctx_window = self.config.get('max_context_window', 8192)
+
+            # Per-million token pricing (approximate, mid-2025)
+            pricing = {
+                'openai':    {'gpt-4o': (2.50, 10.00), 'gpt-4o-mini': (0.15, 0.60), 'gpt-4-turbo': (10.00, 30.00)},
+                'anthropic': {'claude-3-5-sonnet': (3.00, 15.00), 'claude-3-opus': (15.00, 75.00), 'claude-3-haiku': (0.25, 1.25)},
+                'gemini':    {'gemini-2.0-flash': (0.075, 0.30), 'gemini-1.5-pro': (1.25, 5.00)},
+                'openrouter': {},
+                'groq':      {'llama3-8b-8192': (0.05, 0.10), 'llama3-70b-8192': (0.59, 0.79)},
+                'deepseek':  {'deepseek-chat': (0.14, 0.28)},
+            }
+
+            print(f"\n{Colors.BRIGHT_CYAN}{Colors.BOLD}Token & Cost Info{Colors.RESET}")
+            print(f"{Colors.DIM}{'─'*50}{Colors.RESET}")
+            print(f"  {Colors.CYAN}Backend:{Colors.RESET}        {Colors.BRIGHT_WHITE}{backend}{Colors.RESET}")
+            print(f"  {Colors.CYAN}Model:{Colors.RESET}          {Colors.BRIGHT_WHITE}{model}{Colors.RESET}")
+            print(f"  {Colors.CYAN}Max Response:{Colors.RESET}   {Colors.BRIGHT_WHITE}{max_tokens:,} tokens{Colors.RESET}")
+            print(f"  {Colors.CYAN}Context Window:{Colors.RESET} {Colors.BRIGHT_WHITE}{ctx_window:,} tokens{Colors.RESET}")
+
+            # Session message count / approx tokens
+            if self.current_session_id:
+                history = self.memory.get_all_history(self.current_session_id)
+                total_chars = sum(len(c) for _, c in history)
+                approx_tokens = total_chars // 4
+                print(f"\n  {Colors.CYAN}Session messages:{Colors.RESET} {Colors.BRIGHT_WHITE}{len(history)}{Colors.RESET}")
+                print(f"  {Colors.CYAN}Approx history tokens:{Colors.RESET} {Colors.BRIGHT_WHITE}{approx_tokens:,}{Colors.RESET}")
+
+            # Price lookup
+            if backend in pricing:
+                for model_key, (inp_price, out_price) in pricing[backend].items():
+                    if model_key in model.lower():
+                        print(f"\n  {Colors.CYAN}Input price:{Colors.RESET}  {Colors.BRIGHT_WHITE}${inp_price:.4f} / 1M tokens{Colors.RESET}")
+                        print(f"  {Colors.CYAN}Output price:{Colors.RESET} {Colors.BRIGHT_WHITE}${out_price:.4f} / 1M tokens{Colors.RESET}")
+                        if self.current_session_id:
+                            est_cost = (approx_tokens / 1_000_000) * inp_price
+                            print(f"  {Colors.CYAN}Est. session cost:{Colors.RESET} {Colors.BRIGHT_WHITE}${est_cost:.6f}{Colors.RESET}")
+                        break
+                else:
+                    print(f"\n  {Colors.DIM}No price data for this model. Check provider pricing page.{Colors.RESET}")
+            else:
+                print(f"\n  {Colors.DIM}Local model — no API cost.{Colors.RESET}")
+
+            print(f"\n  {Colors.DIM}Tip: Use /compact to reduce session token usage.{Colors.RESET}")
+            return "COMMAND"
+
+        elif cmd == "/plan":
+            # Toggle plan mode — AI reasons through a plan before acting
+            if not hasattr(self, '_plan_mode'):
+                self._plan_mode = False
+
+            if args.strip().lower() in ('on', 'enable', 'true', '1'):
+                self._plan_mode = True
+            elif args.strip().lower() in ('off', 'disable', 'false', '0'):
+                self._plan_mode = False
+            else:
+                self._plan_mode = not self._plan_mode
+
+            if self._plan_mode:
+                print(f"\n{Colors.BRIGHT_GREEN}✓ Plan mode ON{Colors.RESET}")
+                print(f"  {Colors.DIM}The AI will outline a plan and wait for your approval before acting.{Colors.RESET}")
+            else:
+                print(f"\n{Colors.YELLOW}✗ Plan mode OFF{Colors.RESET}")
+                print(f"  {Colors.DIM}The AI will respond and act immediately.{Colors.RESET}")
+            return "COMMAND"
+
+        elif cmd == "/resume":
+            # Resume the most recent session
+            sessions = self.memory.get_sessions()
+            if not sessions:
+                print(f"{Colors.YELLOW}No sessions to resume.{Colors.RESET}")
+                return "COMMAND"
+
+            # Get most recent session (first in list)
+            last_sid, last_name = sessions[0]
+            if last_sid == self.current_session_id:
+                if len(sessions) > 1:
+                    last_sid, last_name = sessions[1]
+                else:
+                    print(f"{Colors.DIM}Already in the most recent session: {last_name}{Colors.RESET}")
+                    return "COMMAND"
+
+            self.current_session_id = last_sid
+            print(f"{Colors.BRIGHT_GREEN}✓ Resumed session:{Colors.RESET} {Colors.BRIGHT_WHITE}{last_name}{Colors.RESET}")
+
+            # Show last 3 messages
+            history = self.memory.get_recent_history(last_sid, limit=6)
+            if history:
+                print(f"\n{Colors.DIM}Last messages:{Colors.RESET}")
+                for role, content in history[-4:]:
+                    prefix = f"{Colors.BRIGHT_GREEN}You:{Colors.RESET}" if role == 'user' else f"{Colors.BRIGHT_CYAN}AI:{Colors.RESET}"
+                    preview = content[:120].replace('\n', ' ')
+                    if len(content) > 120:
+                        preview += '...'
+                    print(f"  {prefix} {Colors.DIM}{preview}{Colors.RESET}")
+            return "COMMAND"
+
+        elif cmd == "/run" or cmd == "!":
+            # Execute a shell command directly
+            if not args.strip():
+                print(f"{Colors.YELLOW}Usage: /run <command>{Colors.RESET}")
+                print(f"  {Colors.DIM}Tip: You can also prefix with ! inline: !ls -la{Colors.RESET}")
+                return "COMMAND"
+            import subprocess as _sp
+            cwd = getattr(self, 'working_directory', None) or os.getcwd()
+            print(f"{Colors.DIM}$ {args.strip()}{Colors.RESET}")
+            try:
+                result = _sp.run(args.strip(), shell=True, capture_output=True, text=True, cwd=cwd)
+                if result.stdout:
+                    print(result.stdout)
+                if result.stderr:
+                    print(f"{Colors.YELLOW}{result.stderr}{Colors.RESET}")
+                if result.returncode != 0:
+                    print(f"{Colors.DIM}Exit code: {result.returncode}{Colors.RESET}")
+            except Exception as e:
+                print(f"{Colors.BRIGHT_RED}✗ Command failed: {e}{Colors.RESET}")
+            return "COMMAND"
 
         else:
             print(f"{Colors.YELLOW}⚠ Unknown command: {cmd}. Type {Colors.BRIGHT_WHITE}/help{Colors.YELLOW} for available commands.{Colors.RESET}")
@@ -9800,6 +12542,8 @@ class App:
                 # Select current
                 if choice.lower() in ('s', 'select'):
                     self.working_directory = current_path
+                    if self.registry:
+                        self.registry.working_directory = current_path
                     print(f"\n{Colors.BRIGHT_GREEN}✓ Selected directory:{Colors.RESET}")
                     print(f"  {Colors.BRIGHT_WHITE}{self.working_directory}{Colors.RESET}")
                     time.sleep(1)
@@ -9942,12 +12686,24 @@ class App:
         # Working directory (if set)
         if hasattr(self, 'working_directory') and self.working_directory:
             print(f"{Colors.CYAN}Directory:{Colors.RESET} {Colors.DIM}{self.working_directory}{Colors.RESET}")
+        else:
+            self.working_directory = os.getcwd()
+            print(f"{Colors.CYAN}Directory:{Colors.RESET} {Colors.DIM}{self.working_directory}{Colors.RESET}")
 
-        print(f"\n{Colors.DIM}Type '/help' for commands, '/back' to exit{Colors.RESET}\n")
+        print(f"\n{Colors.DIM}Type '/help' for commands, '/back' to exit | @file to inject file | !cmd to run shell{Colors.RESET}\n")
         
         while True:
             try:
-                user_input = input(f"\n{Colors.BRIGHT_GREEN}{Colors.BOLD}You:{Colors.RESET} ")
+                # Build a context-aware prompt prefix
+                _prompt_parts = []
+                if getattr(self, '_plan_mode', False):
+                    _prompt_parts.append(f"{Colors.BRIGHT_YELLOW}[PLAN]{Colors.RESET}")
+                if hasattr(self, '_todo_list') and self._todo_list:
+                    _pending = sum(1 for d, _ in self._todo_list if not d)
+                    if _pending:
+                        _prompt_parts.append(f"{Colors.BRIGHT_CYAN}[{_pending} task{'s' if _pending != 1 else ''}]{Colors.RESET}")
+                _prompt_prefix = ' '.join(_prompt_parts) + ' ' if _prompt_parts else ''
+                user_input = input(f"\n{_prompt_prefix}{Colors.BRIGHT_GREEN}{Colors.BOLD}You:{Colors.RESET} ")
                 if not user_input.strip():
                     continue
                 
@@ -9957,7 +12713,53 @@ class App:
                     if result == "EXIT":
                         break
                     continue
-                
+
+                # ! prefix: execute shell command directly, inject output into context
+                if user_input.startswith("!") and len(user_input) > 1:
+                    import subprocess as _sp
+                    shell_cmd = user_input[1:].strip()
+                    cwd = getattr(self, 'working_directory', None) or os.getcwd()
+                    print(f"{Colors.DIM}$ {shell_cmd}{Colors.RESET}")
+                    try:
+                        _result = _sp.run(shell_cmd, shell=True, capture_output=True, text=True, cwd=cwd, timeout=30)
+                        _output = (_result.stdout or '') + (_result.stderr or '')
+                        if _output.strip():
+                            print(_output)
+                        if _result.returncode != 0:
+                            print(f"{Colors.DIM}Exit code: {_result.returncode}{Colors.RESET}")
+                        # Inject output into next message context
+                        if _output.strip():
+                            _injection = f"\n[SHELL OUTPUT from `{shell_cmd}`]\n```\n{_output[:3000]}\n```\n[END SHELL OUTPUT]"
+                            if not hasattr(self, '_injected_file_contexts'):
+                                self._injected_file_contexts = {}
+                            self._injected_file_contexts[f"!{shell_cmd}"] = _injection
+                            print(f"{Colors.DIM}(Output will be included in your next message){Colors.RESET}")
+                    except Exception as _e:
+                        print(f"{Colors.BRIGHT_RED}✗ {_e}{Colors.RESET}")
+                    continue
+
+                # @filename inline: inject file contents into this message's context
+                _at_injections = []
+                _processed_input = user_input
+                if '@' in user_input:
+                    import re as _re_at
+                    _at_refs = _re_at.findall(r'@([\w./\-]+)', user_input)
+                    _cwd_at = getattr(self, 'working_directory', None) or os.getcwd()
+                    for _ref in _at_refs:
+                        _fpath = _ref if os.path.isabs(_ref) else os.path.join(_cwd_at, _ref)
+                        _fpath = os.path.normpath(_fpath)
+                        if os.path.isfile(_fpath):
+                            try:
+                                with open(_fpath, 'r', encoding='utf-8', errors='replace') as _fh:
+                                    _fcontent = _fh.read(50000)  # Cap at 50KB per file
+                                _ext = os.path.splitext(_fpath)[1].lstrip('.')
+                                _at_injections.append(
+                                    f"\n[FILE: {_ref}]\n```{_ext}\n{_fcontent}\n```\n[END FILE: {_ref}]"
+                                )
+                                print(f"{Colors.DIM}📄 @{_ref} ({len(_fcontent)} chars){Colors.RESET}")
+                            except Exception:
+                                pass
+
                 # 1. Retrieve RAG (skip in fast mode for snappier chat unless in project)
                 fast_chat_mode = self.config.get("fast_chat_mode", True)
                 if fast_chat_mode and not self.current_project_id:
@@ -9979,142 +12781,303 @@ class App:
                     project_memory = self.memory.get_project_memory(self.current_project_id)
                 
                 # 3. Build Prompt with project memory
-                sys_prompt = self.config.get("system_prompt") + self.registry.get_tool_prompt()
-                if fast_chat_mode and not self.current_project_id:
-                    final_prompt = f"{sys_prompt}\n\nUser: {user_input}\nAssistant:"
-                else:
-                    final_prompt = self.context_mgr.build_prompt(sys_prompt, history, rag_context, user_input, project_memory)
+                sys_prompt = self.config.get("system_prompt", "You are a helpful AI assistant.")
+                if self.registry:
+                    sys_prompt += self.registry.get_tool_prompt()
+                # Inject working directory context so the AI knows the current location
+                if hasattr(self, 'working_directory') and self.working_directory:
+                    sys_prompt += f"\n\nCURRENT WORKING DIRECTORY: {self.working_directory}\nAll relative paths and commands should be relative to this directory."
+                # 3.4. Ensure cloud backends use reasonable token minimums
+                chat_backend = self.config.get("backend", "ollama")
+                if chat_backend in ("openai", "anthropic", "gemini", "openrouter", "groq", "deepseek", "hf_cloud"):
+                    # Cloud models support large contexts - enforce sensible minimums
+                    if self.context_mgr.max_tokens < 8192:
+                        self.context_mgr.max_tokens = 8192
+                    if self.config.get("max_response_tokens", 250) < 1000:
+                        self.config["max_response_tokens"] = 1000
+                        self.engine.config["max_response_tokens"] = 1000
 
-                # 3.5. Detect script generation and adjust token limit
+                # 3.5. Detect script/code requests and adjust token limits
                 script_keywords = ["script", "batch", "powershell", "ps1", "bat", "bash", "sh", "python", "py"]
                 is_script_request = any(keyword in user_input.lower() for keyword in script_keywords)
-                
+                code_keywords = ["review", "fix", "debug", "refactor", "analyze", "error", "bug",
+                                 "implement", "examine", "inspect", "check code", "look at", "read file",
+                                 "edit file", "update file", "modify", "rewrite", "improve", "optimize",
+                                 "what's wrong", "find the issue", "diagnose", "patch", "correct"]
+                is_code_request = any(kw in user_input.lower() for kw in code_keywords)
+
                 original_max_tokens = self.config.get("max_response_tokens", 2000)
                 if is_script_request:
-                    # Temporarily increase token limit for script generation
                     self.config["max_response_tokens"] = 4000
                     self.engine.config["max_response_tokens"] = 4000
+                elif is_code_request:
+                    code_tokens = max(original_max_tokens, 2000)
+                    self.config["max_response_tokens"] = code_tokens
+                    self.engine.config["max_response_tokens"] = code_tokens
                 elif fast_chat_mode:
-                    trimmed_tokens = min(original_max_tokens, 512)
+                    trimmed_tokens = min(original_max_tokens, 1024) if chat_backend in ("openai", "anthropic", "gemini", "openrouter", "groq", "deepseek", "hf_cloud") else min(original_max_tokens, 512)
                     self.config["max_response_tokens"] = trimmed_tokens
                     self.engine.config["max_response_tokens"] = trimmed_tokens
 
-                # 4. Generate with animated loading
-                frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
-                
-                # Simple loading indicator
-                print(f"{Colors.BRIGHT_CYAN}⠋ Thinking...{Colors.RESET}", end='', flush=True)
-                response = self.engine.generate(final_prompt)
-                if not response or not response.strip():
-                    retry_prompt = final_prompt + "\n\nPlease respond succinctly."
-                    response = self.engine.generate(retry_prompt)
-                    if not response or not response.strip():
-                        response = "I didn't get a response from the model. Please try again."
-                
-                # Restore original token limit
-                if is_script_request:
-                    self.config["max_response_tokens"] = original_max_tokens
-                    self.engine.config["max_response_tokens"] = original_max_tokens
-                elif fast_chat_mode:
-                    self.config["max_response_tokens"] = original_max_tokens
-                    self.engine.config["max_response_tokens"] = original_max_tokens
-                print(f"\r{Colors.BRIGHT_GREEN}✓ Response ready{Colors.RESET}" + " " * 30)
-                
-                # 5. Action Logic
-                if "ACTION:" in response:
-                    print(f"\n{Colors.BRIGHT_BLUE}{Colors.BOLD}AI:{Colors.RESET} {Colors.BRIGHT_WHITE}{response}{Colors.RESET}")
-                    
-                    # Robust Parsing
-                    try:
-                        cmd_part = response.split("ACTION:")[1].strip()
-                        # Handling "ACTION: TYPE ARG"
-                        parts = cmd_part.split(" ", 2)
-                        action_type = parts[0]
-                        
-                        output = "Error: Invalid Action Format"
-                        
-                        # Dispatch
-                        if action_type == "MCP" and len(parts) >= 3:
-                            # ACTION: MCP server tool {json}
-                            srv = parts[1]
-                            # Extract JSON part (find first {)
-                            rest = parts[2]
-                            if "{" in rest:
-                                tool = rest.split("{", 1)[0].strip()
-                                json_part = "{" + rest.split("{", 1)[1]
-                                output = self.registry.execute_mcp(srv, tool, json_part)
-                            else:
-                                output = "Error: JSON arguments required for MCP."
-                                
-                        elif action_type == "CUSTOM" and len(parts) >= 2:
-                            script = parts[1]
-                            args = parts[2] if len(parts) > 2 else ""
-                            output = self.registry.execute_custom(script, args)
-                            
-                        else:
-                            # Native Tools (CMD, FILE_READ, BROWSE, etc)
-                            output = self.registry.execute_native(cmd_part)
-                
-                    except Exception as e:
-                        output = f"Execution Error: {str(e)}"
-                    
-                    # Special handling for BROWSE: don't dump full page content, generate a summary instead
-                    if action_type == "BROWSE":
-                        # Print concise system status
-                        print(f"\n{Colors.BRIGHT_YELLOW}{Colors.BOLD}SYSTEM:{Colors.RESET} {Colors.BRIGHT_WHITE}Browsing complete. Generating summary based on page content...{Colors.RESET}")
-                        
-                        # Build a focused summarization prompt
-                        summary_instruction = (
-                            "You are summarizing a web page that was just browsed using a browser tool.\n"
-                            "The user originally asked:\n"
-                            f"\"{user_input}\"\n\n"
-                            "You have the following raw page content (truncated if very long):\n"
-                            "----- PAGE CONTENT START -----\n"
-                            f"{str(output)[:8000]}\n"
-                            "----- PAGE CONTENT END -----\n\n"
-                            "Based on this content, provide a concise, high-level summary of the website in 3-5 sentences.\n"
-                            "- Focus on what the site is, what it offers, and who it's for.\n"
-                            "- Do NOT mention tools, Playwright, browsers, or that you are summarizing content.\n"
-                            "- Do NOT repeat large chunks of the page; just describe it.\n"
-                        )
-                        
-                        # Use the existing system prompt plus the tool prompt for consistent behavior
-                        summary_sys = self.config.get("system_prompt") + "\n\n" + summary_instruction
-                        summary_prompt = self.context_mgr.build_prompt(
-                            summary_sys,
-                            history,          # include recent history for extra context
-                            "",               # no additional RAG for summary
-                            user_input        # keep the original user request visible
-                        )
-                        
-                        # Temporarily bump response tokens for a good summary
-                        original_max = self.engine.config.get("max_response_tokens", 2000)
-                        self.engine.config["max_response_tokens"] = max(original_max, 512)
-                        try:
-                            summary = self.engine.generate(summary_prompt)
-                        finally:
-                            self.engine.config["max_response_tokens"] = original_max
-                        
-                        # Print AI summary (this is what the user sees)
-                        print(f"\n{Colors.BRIGHT_BLUE}{Colors.BOLD}AI (Summary):{Colors.RESET} {Colors.BRIGHT_WHITE}{summary}{Colors.RESET}")
-                        
-                        # Save conversation history
-                        self.memory.save_message(self.current_session_id, "You", user_input)
-                        self.memory.save_message(self.current_session_id, "AI", response)
-                        self.memory.save_message(self.current_session_id, "System", str(output))
-                        self.memory.save_message(self.current_session_id, "AI", summary)
+                # Boost context window for agentic tasks (file contents need room)
+                original_context_window = self.context_mgr.max_tokens
+                if is_code_request or is_script_request:
+                    if chat_backend in ("openai", "anthropic", "gemini", "openrouter", "groq", "deepseek", "hf_cloud"):
+                        self.context_mgr.max_tokens = max(self.context_mgr.max_tokens, 16384)
                     else:
-                        # Default behavior for non-BROWSE actions
-                        print(f"\n{Colors.BRIGHT_YELLOW}{Colors.BOLD}SYSTEM:{Colors.RESET} {Colors.BRIGHT_WHITE}{output}{Colors.RESET}")
-                        self.memory.save_message(self.current_session_id, "You", user_input)
-                        self.memory.save_message(self.current_session_id, "AI", response)
-                        self.memory.save_message(self.current_session_id, "System", str(output))
-                    
+                        self.context_mgr.max_tokens = max(self.context_mgr.max_tokens, 4096)
+
+                # Inject @filename references and /read pre-loaded files into rag_context
+                _extra_ctx_parts = []
+                if _at_injections:
+                    _extra_ctx_parts.extend(_at_injections)
+                if hasattr(self, '_injected_file_contexts') and self._injected_file_contexts:
+                    _extra_ctx_parts.extend(self._injected_file_contexts.values())
+                    self._injected_file_contexts.clear()  # consume once
+                if _extra_ctx_parts:
+                    rag_context = ('\n'.join(_extra_ctx_parts) + '\n\n' + rag_context).strip()
+
+                # Plan mode: have AI draft a plan first and await approval
+                _plan_approved = True
+                if getattr(self, '_plan_mode', False):
+                    _plan_sys = sys_prompt + (
+                        "\n\nPLAN MODE: Before responding or taking any action, output ONLY a numbered plan "
+                        "of the steps you intend to take. Do NOT execute anything yet. End with: "
+                        "'Reply YES to proceed, or give feedback to adjust.'"
+                    )
+                    _plan_prompt = self.context_mgr.build_prompt(_plan_sys, history, rag_context, user_input, project_memory)
+                    print(f"{Colors.BRIGHT_CYAN}⚙ Planning...{Colors.RESET}", end='', flush=True)
+                    _plan_response = self.engine.generate(_plan_prompt)
+                    print(f"\r{' '*30}\r", end='', flush=True)
+                    if _plan_response and _plan_response.strip():
+                        print(f"\n{Colors.BRIGHT_CYAN}{Colors.BOLD}Plan:{Colors.RESET}")
+                        print(_plan_response.strip())
+                        _plan_confirm = input(f"\n{Colors.DIM}[YES to proceed / feedback to adjust / SKIP to cancel]: {Colors.RESET}").strip()
+                        if _plan_confirm.upper() == 'SKIP':
+                            _plan_approved = False
+                        elif _plan_confirm.upper() != 'YES' and _plan_confirm:
+                            user_input = user_input + f"\n\n[User feedback on plan]: {_plan_confirm}"
+
+                # Build prompt AFTER context window and token adjustments
+                final_prompt = self.context_mgr.build_prompt(sys_prompt, history, rag_context, user_input, project_memory)
+
+                if not _plan_approved:
+                    print(f"{Colors.DIM}Skipped.{Colors.RESET}")
+                    continue
+
+                # Adaptive iteration limit based on request type
+                project_build_keywords = ["app", "application", "project", "program", "game", "website", "api", "server", "bot"]
+                project_request_keywords = ["build", "create", "make", "develop", "scaffold", "generate"]
+                is_multi_file = any(kw in user_input.lower() for kw in project_build_keywords)
+                is_build_request = any(kw in user_input.lower() for kw in project_request_keywords)
+
+                if is_multi_file and is_build_request:
+                    max_tool_iterations = 50  # Multi-file project building
+                elif is_build_request or is_multi_file:
+                    max_tool_iterations = 30  # Moderate project work
+                elif is_code_request:
+                    max_tool_iterations = 15  # Code editing/fixing tasks
                 else:
+                    max_tool_iterations = 10  # Regular tasks
+                iteration = 0
+                conversation_turns = []  # Track (role, message) pairs for this interaction
+                current_prompt = final_prompt
+
+
+                # Add project-building guidance to system prompt if detected
+                if is_multi_file and is_build_request:
+                    sys_prompt += (
+                        "\n\nPROJECT BUILDING MODE: The user wants to build a multi-file project.\n"
+                        "WORKFLOW:\n"
+                        "1. PLAN: First outline the project structure (files, folders, dependencies)\n"
+                        "2. CREATE: Use ACTION: FILE_WRITE for each file - write COMPLETE implementations\n"
+                        "3. CONNECT: Ensure imports between files are correct\n"
+                        "4. DOCUMENT: Include a README.md with setup/run instructions\n\n"
+                        "FILE CREATION RULES:\n"
+                        "- Create each file with ACTION: FILE_WRITE path/to/file.py | <complete code>\n"
+                        "- The content after | can be multi-line - write the ENTIRE file content\n"
+                        "- Create separate files: main.py, config.py, models.py, utils.py, etc.\n"
+                        "- Include ALL imports at the top of each file\n"
+                        "- Write COMPLETE functions/classes - no placeholders or TODO stubs\n"
+                        "- Create requirements.txt with pip dependencies\n"
+                        "- You have up to 50 tool iterations - use them to build the full project\n"
+                        "- Create ONE file per ACTION: FILE_WRITE call for clarity\n"
+                    )
+                    # Rebuild prompt with updated system prompt
+                    current_prompt = self.context_mgr.build_prompt(sys_prompt, history, rag_context, user_input, project_memory)
+
+                while iteration <= max_tool_iterations:
+                    # Generate response with loading indicator
+                    if iteration == 0:
+                        print(f"{Colors.BRIGHT_CYAN}\u2819 Thinking...{Colors.RESET}", end='', flush=True)
+                    else:
+                        print(f"\n{Colors.BRIGHT_CYAN}\u2819 Analyzing results (step {iteration + 1})...{Colors.RESET}", end='', flush=True)
+
+                    response = self.engine.generate(current_prompt)
+                    if not response or not response.strip():
+                        retry_prompt = current_prompt + "\n\nPlease respond succinctly."
+                        response = self.engine.generate(retry_prompt)
+                        if not response or not response.strip():
+                            response = "I didn't get a response from the model. Please try again."
+
+                    print(f"\r{Colors.BRIGHT_GREEN}\u2713 Response ready{Colors.RESET}" + " " * 30)
+
+                    # --- No ACTION: final response, print and break ---
+                    if "ACTION:" not in response:
+                        print(f"\n{Colors.BRIGHT_BLUE}{Colors.BOLD}AI:{Colors.RESET} {Colors.BRIGHT_WHITE}{response}{Colors.RESET}")
+                        conversation_turns.append(("AI", response))
+                        break
+
+                    # --- Has ACTION(s): process them ---
                     print(f"\n{Colors.BRIGHT_BLUE}{Colors.BOLD}AI:{Colors.RESET} {Colors.BRIGHT_WHITE}{response}{Colors.RESET}")
-                    self.memory.save_message(self.current_session_id, "You", user_input)
-                    self.memory.save_message(self.current_session_id, "AI", response)
-                    
+                    conversation_turns.append(("AI", response))
+
+                    # Parse ALL actions in the response
+                    action_segments = response.split("ACTION:")
+                    all_outputs = []
+
+                    for seg_idx, segment in enumerate(action_segments[1:], 1):  # Skip text before first ACTION
+                        try:
+                            cmd_part = segment.strip()
+
+                            # Determine action type from first word
+                            first_word = cmd_part.split()[0] if cmd_part.split() else "UNKNOWN"
+
+                            # Multi-line actions: FILE_WRITE, FILE_EDIT, FILE_APPEND need full content
+                            # These use | or ||| delimiters so content after delimiter can span lines
+                            multiline_actions = ("FILE_WRITE", "FILE_EDIT", "FILE_APPEND")
+                            if first_word in multiline_actions:
+                                # Keep multi-line content but strip trailing AI commentary
+                                # Content ends at: end of segment, or a line that looks like AI commentary
+                                lines = cmd_part.split("\n")
+                                content_lines = [lines[0]]  # First line always included (has the path | delimiter)
+                                for line in lines[1:]:
+                                    stripped = line.strip()
+                                    # Stop at next ACTION: reference
+                                    if "ACTION:" in stripped:
+                                        break
+                                    # Stop at markdown formatting (AI commentary, not code)
+                                    if stripped.startswith(("**", "---", "===")):
+                                        break
+                                    # Stop at closing code fence (end of fenced block)
+                                    if stripped == "```":
+                                        break
+                                    # Stop at obvious AI prose - must NOT look like code
+                                    # Code indicators: starts with #, indented, has operators/brackets/keywords
+                                    is_code_like = (
+                                        not stripped or  # empty lines are fine
+                                        stripped.startswith(('#', '//', '/*', '*', '"', "'", '@', '    ', '\t')) or
+                                        any(c in stripped for c in ('=', '(', ')', '{', '}', '[', ']', ';'))
+                                    )
+                                    if not is_code_like and stripped.startswith((
+                                        "This will ", "This creates ", "This file ",
+                                        "The above ", "Now let me", "Now I'll", "Now I will",
+                                        "Next, I", "Next I'll", "Here is ", "Here's ",
+                                        "Let me ", "I will ", "I'll ", "I have "
+                                    )):
+                                        break
+                                    content_lines.append(line)
+                                cmd_part = "\n".join(content_lines).rstrip()
+                            else:
+                                # Single-line actions: CMD, FILE_READ, FILE_LIST, BROWSE, etc.
+                                if "\n" in cmd_part:
+                                    cmd_part = cmd_part.split("\n")[0].strip()
+
+                            parts = cmd_part.split(" ", 2)
+                            action_type = parts[0] if parts else "UNKNOWN"
+
+                            output = "Error: Invalid Action Format"
+
+                            # Dispatch based on action type
+                            if action_type == "MCP" and len(parts) >= 3:
+                                srv = parts[1]
+                                rest = parts[2]
+                                if "{" in rest:
+                                    tool = rest.split("{", 1)[0].strip()
+                                    json_part = "{" + rest.split("{", 1)[1]
+                                    output = self.registry.execute_mcp(srv, tool, json_part)
+                                else:
+                                    output = "Error: JSON arguments required for MCP."
+                            elif action_type == "CUSTOM" and len(parts) >= 2:
+                                script = parts[1]
+                                args = parts[2] if len(parts) > 2 else ""
+                                output = self.registry.execute_custom(script, args)
+                            else:
+                                # Native Tools (CMD, FILE_READ, FILE_WRITE, BROWSE, FILE_LIST, etc.)
+                                output = self.registry.execute_native(cmd_part)
+
+                            all_outputs.append((action_type, cmd_part[:200], str(output)))
+                        except Exception as e:
+                            all_outputs.append(("ERROR", segment.strip()[:80], f"Execution Error: {str(e)}"))
+
+                    # Display tool results and accumulate for follow-up
+                    tool_results_for_ai = ""
+                    for act_type, act_cmd, act_output in all_outputs:
+                        # Truncate display for user (don't flood terminal)
+                        display_output = act_output
+                        if len(display_output) > 3000:
+                            display_output = display_output[:3000] + f"\n... (truncated, {len(act_output)} total chars)"
+
+                        if act_type == "BROWSE":
+                            print(f"\n{Colors.BRIGHT_YELLOW}{Colors.BOLD}SYSTEM:{Colors.RESET} {Colors.BRIGHT_WHITE}Page loaded ({len(act_output)} chars).{Colors.RESET}")
+                        else:
+                            print(f"\n{Colors.BRIGHT_YELLOW}{Colors.BOLD}SYSTEM:{Colors.RESET} {Colors.BRIGHT_WHITE}{display_output}{Colors.RESET}")
+
+                        # For AI context: include full output but capped at reasonable size
+                        ai_output = act_output[:8000] if len(act_output) > 8000 else act_output
+                        tool_results_for_ai += f"\n[TOOL RESULT for ACTION: {act_cmd}]:\n{ai_output}\n"
+                        conversation_turns.append(("System", act_output))
+
+                    iteration += 1
+
+                    # Check iteration limit
+                    if iteration >= max_tool_iterations:
+                        print(f"\n{Colors.BRIGHT_YELLOW}(Reached maximum tool iterations - {max_tool_iterations} steps){Colors.RESET}")
+                        break
+
+                    # Build follow-up prompt: feed tool results back to AI for next reasoning step
+                    followup_history = list(history)  # Start from original history
+                    for role, msg in conversation_turns:
+                        followup_history.append((role, msg))
+
+                    # Ensure enough tokens for follow-up response
+                    followup_tokens = max(self.config.get("max_response_tokens", 2000), 4000)
+                    self.config["max_response_tokens"] = followup_tokens
+                    self.engine.config["max_response_tokens"] = followup_tokens
+
+                    followup_sys = sys_prompt + (
+                        "\n\nYou have received TOOL RESULTS above from your previous actions. "
+                        "You MUST continue working to complete the user's request.\n\n"
+                        "NEXT STEPS:\n"
+                        "1. If you read a file, now ANALYZE it and provide your findings or write the fix.\n"
+                        "2. For fixing existing code: use ACTION: FILE_EDIT path ||| old_text ||| new_text (multi-line supported)\n"
+                        "3. For creating new files: use ACTION: FILE_WRITE path | <complete content> (multi-line supported)\n"
+                        "4. For adding to files: use ACTION: FILE_APPEND path | <content to add>\n"
+                        "5. If building a project, continue creating the NEXT file.\n"
+                        "6. If you have completed ALL tasks, provide a clear summary.\n\n"
+                        "IMPORTANT:\n"
+                        "- DO NOT just acknowledge results - take the next concrete action\n"
+                        "- DO NOT repeat tool output verbatim\n"
+                        "- Write COMPLETE file contents in FILE_WRITE - no placeholders\n"
+                        "- If you read a file and user asked to fix it, write the fix NOW"
+                    )
+
+                    current_prompt = self.context_mgr.build_prompt(
+                        followup_sys, followup_history, rag_context, user_input, project_memory
+                    )
+
+                # Restore original context window
+                self.context_mgr.max_tokens = original_context_window
+
+                # Restore original token limits
+                self.config["max_response_tokens"] = original_max_tokens
+                self.engine.config["max_response_tokens"] = original_max_tokens
+
+                # Save all conversation turns to history
+                self.memory.save_message(self.current_session_id, "You", user_input)
+                for role, msg in conversation_turns:
+                    self.memory.save_message(self.current_session_id, role, msg)
+
             except KeyboardInterrupt:
                 break
 
@@ -10678,10 +13641,10 @@ class LocalAIEngine:
             try:
                 response = resilient_request(
                     'post',
-                    f"{base_url}/v1/completions",
+                    f"{base_url}/v1/chat/completions",
                     json={
                         "model": self.model_name,
-                        "prompt": prompt,
+                        "messages": [{"role": "user", "content": prompt}],
                         "temperature": self.config.get("temperature", 0.7),
                         "max_tokens": self.config.get("max_response_tokens", 200),
                         "stream": False
@@ -10698,13 +13661,13 @@ class LocalAIEngine:
                 choices = data.get("choices", [])
                 if not choices:
                     return "I received an empty response from llama.cpp. Please try again."
-                text = choices[0].get("text")
-                if text:
-                    return text.strip()
-                message = choices[0].get("message", {})
+                message = choices[0].get("message", {{}})
                 content = message.get("content")
                 if content:
                     return content.strip()
+                text_fallback = choices[0].get("text")
+                if text_fallback:
+                    return text_fallback.strip()
                 return "I received an empty response from llama.cpp. Please try again."
 
             except requests.exceptions.Timeout:

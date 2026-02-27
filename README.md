@@ -1,24 +1,20 @@
 # 🛡️ AI Terminal Pro 🛡️
 
-A **privacy-first**, terminal-based AI assistant you actually control. Run LLMs locally via **Ollama**, **llama.cpp servers**, or through self-hosted endpoints like **Hugging Face**, no cloud lock-in, no data collection, no nonsense.
+A **privacy-first**, terminal-based AI assistant you actually control. Run LLMs locally via **Ollama** or through self-hosted endpoints like **Hugging Face**, no cloud lock-in, no data collection, no nonsense.
 
-Built for **developers**,
-Built for **power users**,
+Built for **developers**,  
+Built for **power users**,  
 Built for **privacy-first professionals**.
 
 ---
 
-## 🔑 Features 🔑
-
-
 ## 🔑 Core Features 🔑
 
 ### 🤖 AI & Model Support
-- 💻 **Local or Self-Hosted Model Support** (Ollama, llama.cpp, Hugging Face)
-- 🔄 **Multiple Backend Support** - Switch between Ollama, llama.cpp, and HuggingFace Transformers
+- 💻 **Local or Self-Hosted Model Support** (Ollama, Hugging Face)
+- 🔄 **Multiple Backend Support** - Switch between Ollama and HuggingFace Transformers
 - 🎯 **Configurable Model Parameters** - Temperature, context window, response tokens
 - 🚀 **GPU & CPU Compatibility** - Optimized for both hardware configurations
-- 💻 **Now supports integration of Cliud Providers such as OPENAI etc**
 
 ### 🧠 Memory & Context
 - 🧠 **RAG-Enabled Context Memory** (local vector database)
@@ -76,12 +72,30 @@ Built for **privacy-first professionals**.
 - 🎥 **Vision Assistant** - Combined voice and vision capabilities
 - 🎙️ **Enhanced TTS Pro Mode** - Professional-grade voice interaction with RAG
 
+### 🔄 Dual Implementation
+- 🐍 **Python Version** - Full-featured production-ready application
+- ⚡ **TypeScript/Bun Version** - Modern, fast TypeScript implementation (in progress)
+- 🔀 **Shared Architecture** - Compatible configurations and features
+- 🎯 **Feature Parity** - Core features available in both versions
+
 ---
+
+## ⚙️ Tech Stack ⚙️
+
+### Python Version
+`Python 3.8+` · `PyTorch` · `Transformers` · `SQLite` · `Flask` · `Textual` · `Rich` · `Cryptography` · `Playwright` · `OpenCV` · `Whisper`
+
+### TypeScript/Bun Version
+`TypeScript` · `Bun` · `React/Ink` · `better-sqlite3` · `Hono` · `@xenova/transformers`
+
+---
+
 ## 🚀 Quick Start 🚀
 
 ### Prerequisites
-- **Python 3.8+**
-- **Ollama** (recommended), **llama.cpp servers**, or HuggingFace models
+- **Python 3.8+** (for Python version)
+- **Bun** (for TypeScript version, optional)
+- **Ollama** (recommended) or HuggingFace models
 
 ### Installation
 
@@ -93,9 +107,10 @@ Built for **privacy-first professionals**.
 
 2. **Install dependencies**
    ```bash
+   # For Python version
    pip install -r requirements.txt
-
-   # Or for minimal installation (core features only)
+   
+   # For minimal installation (core features only)
    pip install requests beautifulsoup4 transformers torch cryptography flask flask-cors textual rich
    ```
 
@@ -144,27 +159,9 @@ python -m playwright install chromium
 ```bash
 pip install peft datasets accelerate trl
 ```
----
-
-## ⚙️ Tech Stack ⚙️
-
-`Python` · `PyTorch` · `Transformers` · `SQLite` · `Flask` · `Textual` · `Cryptography`
 
 ---
 
-## 🔑 To Do 🔑 (Not in order && mainly just noting idea's, want to add some? Let me know!)
-
-- 💻 **Multi purpose terminal GUI??**  
-- 🧠 **Full Automation**  
-- 🛠️ **Background Agent** 
-- 🔐 ~~**TTS**~~  
-- 📁 ~~**Sight** camera enabled functionality~~ 
-- 🌐 **Vision** image generation
-- 🔌 **API Gateway** 
-- 🧪 **GPU + CPU compatability** for user performance  
-- 🎨 **You got any idea's??**
-
----
 ## 📖 Usage Guide 📖
 
 ### Main Menu Options
@@ -228,12 +225,23 @@ ACTION: TOOL_NAME arg1 arg2 ...
 - **Authentication**: API key support
 - **CORS**: Configurable cross-origin resource sharing
 - **Multiple Instances**: Run multiple API servers on different ports
-  
+
 ---
+
+## 📚 Documentation 📚
+
+For detailed documentation, see:
+- **[WIKI.md](WIKI.md)** - Comprehensive documentation and guides
+- **[CONTRIBUTING.md](CONTRIBUTING.md)** - Contribution guidelines
+- **[TUI_INTEGRATION.md](TUI_INTEGRATION.md)** - Terminal UI integration details
+- **[MEMORYBANK.md](MEMORYBANK.md)** - Architecture and memory system
+
+---
+
 ## 🔑 Roadmap 🔑
 
 ### Completed ✅
-- ✅ Local model support (Ollama, llama.cpp, HuggingFace)
+- ✅ Local model support (Ollama, HuggingFace)
 - ✅ RAG system with vector database
 - ✅ Custom tooling (Python, JSON, YAML)
 - ✅ MCP server integration
@@ -248,6 +256,7 @@ ACTION: TOOL_NAME arg1 arg2 ...
 - ✅ Session and project management
 
 ### In Progress 🔄
+- 🔄 TypeScript/Bun version completion
 - 🔄 Full Textual menu system
 - 🔄 Enhanced settings UI
 
@@ -258,17 +267,17 @@ ACTION: TOOL_NAME arg1 arg2 ...
 - 📋 Vision (image generation)
 - 📋 API Gateway
 - 📋 GPU + CPU compatibility optimizations
+
+**Have ideas?** Let us know! Check out [CONTRIBUTING.md](CONTRIBUTING.md) to contribute.
+
 ---
 
-<img width="655" height="969" alt="Ai Terminal Pro - Code reviewer concerns" src="https://github.com/user-attachments/assets/d909b4bb-f6b2-461e-861a-24858dad0799" />
-<img width="662" height="389" alt="AI Terminal Pro - menu " src="https://github.com/user-attachments/assets/29a7d44a-5c89-4129-8557-a03b73c219b2" />
-<img width="971" height="949" alt="AI Terminal Pro - menu in chat " src="https://github.com/user-attachments/assets/45f0ed87-332e-4524-884b-6291a4881333" />
-<img width="1281" height="947" alt="AI Terminal Pro - menu in chat1 " src="https://github.com/user-attachments/assets/4189b475-e392-4503-bc49-1347951c45e9" />
+## 📸 Screenshots 📸
+
 <img width="1296" height="576" alt="FMJ9J61" src="https://github.com/user-attachments/assets/fbbc5ea5-451d-40b9-942a-8d0af8986478" />
 <img width="1296" height="576" alt="xjGMhsH" src="https://github.com/user-attachments/assets/8f42fc81-b09b-4ed4-b081-1e5881a09d0b" />
 <img width="1296" height="576" alt="xN0yKbW" src="https://github.com/user-attachments/assets/d3db41d6-d751-4f1f-a072-2aaab3e5af40" />
 
----
 ---
 
 ## 👥 Contributing 👥

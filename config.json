@@ -1,12 +1,27 @@
 {
     "first_run": false,
-    "backend": "ollama",
-    "model_name": "qwen2.5-coder:latest",
+    "backend": "openrouter",
+    "model_name": "google/gemini-3.1-pro-preview",
     "llama_cpp_base_url": "http://127.0.0.1:8080",
     "fast_chat_mode": true,
     "system_prompt": "You are a helpful AI assistant. Provide clear, accurate, and concise answers. Only use ACTION tools when the user explicitly asks or the task requires external actions. Do not claim tool outputs or system information you did not actually obtain.",
     "enable_dangerous_commands": true,
-    "max_context_window": 2048,
-    "max_response_tokens": 250,
-    "temperature": 0.7
+    "max_context_window": 8192,
+    "max_response_tokens": 2000,
+    "temperature": 0.7,
+    "cpu_threads": 8,
+    "cpu_interop_threads": 2,
+    "builder_threads": 1,
+    "default_editor_command": "",
+    "cloud_api_keys": {
+        "openrouter": "gAAAAABpmuIqsSlQAHZ-R3K8d2TbGOrCAdWFvHPMvGhK6Rj94-esYPLdwXWxGfTtcSg9TVxsPviE99RwY2C7nA2ct574cWIgi-zxCynqQOkJZN-BknhnKdSqJBMzNUoVbG5XoZ0xYoaf0PTbz2jNNZg22iKJXeij6lTh7hs9xOplvYcE3H_6ryU="
+    },
+    "openai_model": "gpt-4o",
+    "anthropic_model": "claude-3-5-sonnet-20241022",
+    "gemini_model": "gemini-2.0-flash-exp",
+    "openrouter_model": "google/gemini-3.1-pro-preview",
+    "openai_base_url": "https://api.openai.com/v1",
+    "anthropic_base_url": "https://api.anthropic.com/v1",
+    "gemini_base_url": "https://generativelanguage.googleapis.com/v1beta",
+    "openrouter_base_url": "https://openrouter.ai/api/v1"
 }
