@@ -4705,6 +4705,20 @@ class AppBuilderOrchestrator:
         self.db_lock = threading.Lock()
         self.current_project = None
         self.init_app_database()
+
+    def update_engine(self, ai_engine):
+        """Propagate a new AI engine to the orchestrator and all agents."""
+        self.ai_engine = ai_engine
+        self.spec_writer.ai_engine = ai_engine
+        self.architect.ai_engine = ai_engine
+        self.tech_lead.ai_engine = ai_engine
+        self.developer.ai_engine = ai_engine
+        self.code_monkey.ai_engine = ai_engine
+        self.reviewer.ai_engine = ai_engine
+        self.troubleshooter.ai_engine = ai_engine
+        self.debugger.ai_engine = ai_engine
+        self.tech_writer.ai_engine = ai_engine
+        self.builder_threads = max(1, int(ai_engine.config.get("builder_threads", 1)))
     
     def init_app_database(self):
         """Initialize app projects database."""
@@ -4989,6 +5003,18 @@ class AppBuilderOrchestrator:
         response_lower = response.lower()
         return any(indicator in response_lower for indicator in error_indicators)
 
+    def _is_backend_error(self, response):
+        """Check if a backend ping response indicates a real failure.
+        Unlike _is_ai_error, this does not penalise short valid responses."""
+        if not response or not response.strip():
+            return True
+        error_indicators = [
+            "connection error", "cannot connect", "error:", "ollama error", "llama.cpp error",
+            "request timed out", "failed to", "exception", "traceback"
+        ]
+        response_lower = response.lower()
+        return any(indicator in response_lower for indicator in error_indicators)
+
     def build_app(self, project_id):
         """Main app building workflow."""
         project = self.get_project(project_id)
@@ -5006,11 +5032,19 @@ class AppBuilderOrchestrator:
         # Quick AI backend check before starting
         print(f"{Colors.DIM}Verifying AI backend...{Colors.RESET}", end="", flush=True)
         test_response = self.ai_engine.generate("Say 'ready' if you can respond.")
-        if self._is_ai_error(test_response):
+        if self._is_backend_error(test_response):
             print(f" {Colors.BRIGHT_RED}FAILED{Colors.RESET}")
-            print(f"\n{Colors.BRIGHT_RED}✗ AI Backend Error: {test_response[:100]}{Colors.RESET}")
-            print(f"{Colors.YELLOW}Please ensure your AI backend (Ollama/HuggingFace/llama.cpp) is running properly.{Colors.RESET}")
-            print(f"{Colors.YELLOW}For Ollama, run: ollama serve{Colors.RESET}")
+            print(f"\n{Colors.BRIGHT_RED}✗ AI Backend Error: {test_response[:100] if test_response else 'No response'}{Colors.RESET}")
+            backend = self.ai_engine.config.get("backend", "ollama")
+            cloud_backends = {"openai", "anthropic", "gemini", "openrouter", "groq", "deepseek", "hf_cloud"}
+            if backend in cloud_backends:
+                print(f"{Colors.YELLOW}Please check your {backend} API key is set correctly in Settings → Manage Cloud API Keys.{Colors.RESET}")
+            else:
+                print(f"{Colors.YELLOW}Please ensure your AI backend ({backend}) is running properly.{Colors.RESET}")
+                if backend == "ollama":
+                    print(f"{Colors.YELLOW}Run: ollama serve{Colors.RESET}")
+                elif backend == "llama_cpp":
+                    print(f"{Colors.YELLOW}Start your llama.cpp server and check the base URL in Settings.{Colors.RESET}")
             return False, "AI backend not available"
         print(f" {Colors.BRIGHT_GREEN}OK{Colors.RESET}\n")
 
@@ -5022,7 +5056,7 @@ class AppBuilderOrchestrator:
             # Check for AI errors
             if self._is_ai_error(analysis):
                 print(f"{Colors.BRIGHT_RED}✗ AI Error: {analysis[:100]}...{Colors.RESET}")
-                print(f"{Colors.YELLOW}Please check your AI backend (Ollama/HuggingFace/llama.cpp) is running.{Colors.RESET}")
+                print(f"{Colors.YELLOW}Please check your AI backend is configured correctly in Settings.{Colors.RESET}")
                 return False, "AI generation failed"
 
             print(f"\n{Colors.CYAN}Analysis:{Colors.RESET}\n{analysis}\n")
@@ -6036,6 +6070,12 @@ class App:
                 print(f"\n{Colors.BRIGHT_CYAN}[SYSTEM]{Colors.RESET} Backend/model changed — reinitializing engine...")
                 try:
                     self.engine = AIEngine(self.config)
+                    # Propagate new engine to all dependent components
+                    self.context_mgr = ContextManager(self.engine.tokenizer, self.config.get("max_context_window"))
+                    if self.app_builder:
+                        self.app_builder.update_engine(self.engine)
+                    if self.registry:
+                        self.registry.config = self.config
                     print(f"{Colors.BRIGHT_GREEN}[SYSTEM]{Colors.RESET} Engine reloaded successfully.")
                 except Exception as e:
                     print(f"{Colors.BRIGHT_RED}[ERROR]{Colors.RESET} Engine reload failed: {e}")
