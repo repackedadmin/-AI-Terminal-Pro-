@@ -14,8 +14,8 @@
     "builder_threads": 1,
     "default_editor_command": "",
     "cloud_api_keys": {
-        "groq": "gAAAAABpodNDCQBaE1MbrW-Z1fAGOqSwN9N8F76-1i_WITt-JAU0QX8mxkT3mQpWrr20CwGgmeKVWoJUcYpMlaXt0TLWfK3ZEcwo5Vo7KFrE5jZmRsVrNdG60FykzNtv7gFBUkSnp3XAAf83qbo7LKWnLH87hFF9-Q==",
-        "openrouter": "gAAAAABpodWS9h-PjQucylGBocuTJrvHWy4ihUnP8lvs6dLm2ofteJJBILEhh0tuTo4jtfOYKLyxxA14s86w2XUpx1n731neRGZSMcy0vB1zQ6-8T9RtwXR-epKlRCjmOVMSKwLThXaj6lnrsbbC-eYMVYwv2iYfesJdDqRFpkJraGH9bi3Yoog="
+        "groq": "",
+        "openrouter": ""
     },
     "openai_model": "gpt-4o",
     "anthropic_model": "claude-3-5-sonnet-20241022",
