@@ -24,6 +24,7 @@ import hashlib
 import base64
 import shlex
 from datetime import datetime
+import configparser
 try:
     from bs4 import BeautifulSoup
 except ImportError:
@@ -193,6 +194,7 @@ API_KEYS_FILE = os.path.join(API_DIR, "api_keys.json")
 APPS_DIR = os.path.join(BASE_DIR, "apps")
 APP_PROJECTS_DB = os.path.join(BASE_DIR, "app_projects.sqlite")
 EXTENSIONS_DIR = os.path.join(BASE_DIR, "extensions")  # Extension storage directory
+SOFTWARE_REGISTRY_DB = os.path.join(BASE_DIR, "software_registry.sqlite")  # Installed software cache
 
 # Ensure all workspace directories exist
 for directory in [SANDBOX_DIR, DOCS_DIR, CUSTOM_TOOLS_DIR, TRAINING_DIR, TRAINING_DATA_DIR, MODELS_DIR, BASE_MODELS_DIR, LORA_DIR, REINFORCEMENT_DIR, API_DIR, APPS_DIR, EXTENSIONS_DIR]:
@@ -1829,6 +1831,413 @@ class BrowserManager:
         except:
             return None
 
+
+# ==============================================================================
+#                    SOFTWARE REGISTRY (Installed Apps Detection & Launch)
+# ==============================================================================
+
+def _format_frame_output(title, content, width=72):
+    """Format output in an I-Frame style bordered box for terminal display."""
+    lines = str(content).split('\n')
+    wrapped = []
+    for line in lines:
+        while len(line) > width - 4:
+            wrapped.append(line[:width - 4])
+            line = line[width - 4:]
+        wrapped.append(line)
+    top = "┌" + "─" * (width - 2) + "┐"
+    bot = "└" + "─" * (width - 2) + "┘"
+    mid = "│" + " " * (width - 2) + "│"
+    title_line = "│ " + (title[:width - 4] or "Output").ljust(width - 4) + " │"
+    sep = "├" + "─" * (width - 2) + "┤"
+    result = [top, title_line, sep]
+    for line in wrapped[:50]:  # Cap at 50 lines
+        result.append("│ " + line[:width - 4].ljust(width - 4) + " │")
+    if len(wrapped) > 50:
+        result.append("│ " + f"... ({len(wrapped) - 50} more lines)".ljust(width - 4) + " │")
+    result.append(bot)
+    return "\n".join(result)
+
+
+class SoftwareRegistry:
+    """
+    Auto-detects installed software on Windows/Linux, stores in SQLite,
+    and provides launch + I-Frame interaction (CLI output capture, GUI launch).
+    """
+    def __init__(self, db_path=None):
+        self.db_path = db_path or SOFTWARE_REGISTRY_DB
+        self.conn = None
+        self.cursor = None
+        self._connect()
+        self._init_db()
+
+    def _connect(self):
+        try:
+            self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
+            self.conn.execute("PRAGMA journal_mode=WAL")
+            self.cursor = self.conn.cursor()
+        except sqlite3.Error as e:
+            self.conn = None
+            self.cursor = None
+            print(f"{Colors.BRIGHT_RED}[SOFTWARE_REGISTRY]{Colors.RESET} DB connect failed: {e}")
+
+    def _init_db(self):
+        if not self.conn or not self.cursor:
+            return
+        try:
+            self.cursor.execute('''
+                CREATE TABLE IF NOT EXISTS installed_software (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL,
+                    display_name TEXT,
+                    exec_path TEXT NOT NULL,
+                    exec_args TEXT DEFAULT '',
+                    category TEXT,
+                    app_type TEXT DEFAULT 'gui',
+                    last_detected DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    platform TEXT,
+                    UNIQUE(name, platform)
+                )
+            ''')
+            self.cursor.execute('CREATE INDEX IF NOT EXISTS idx_sw_name ON installed_software(name)')
+            self.cursor.execute('CREATE INDEX IF NOT EXISTS idx_sw_platform ON installed_software(platform)')
+            self.conn.commit()
+        except sqlite3.Error as e:
+            print(f"{Colors.BRIGHT_RED}[SOFTWARE_REGISTRY]{Colors.RESET} Init failed: {e}")
+
+    def _detect_windows(self):
+        """Detect installed apps on Windows via Start Menu and common paths."""
+        apps = []
+        plat = "Windows"
+        try:
+            # Start Menu - ProgramData and user
+            start_dirs = [
+                os.path.join(os.environ.get("ProgramData", "C:\\ProgramData"), "Microsoft", "Windows", "Start Menu", "Programs"),
+                os.path.join(os.environ.get("APPDATA", ""), "Microsoft", "Windows", "Start Menu", "Programs"),
+            ]
+            for start_dir in start_dirs:
+                if not os.path.isdir(start_dir):
+                    continue
+                for root, _, files in os.walk(start_dir):
+                    for f in files:
+                        if f.lower().endswith('.lnk'):
+                            lnk_path = os.path.join(root, f)
+                            name = os.path.splitext(f)[0]
+                            # Resolve .lnk target via PowerShell (avoids win32com dependency)
+                            try:
+                                ps_path = lnk_path.replace('\\', '\\\\').replace('"', '`"')
+                                ps = f'(New-Object -ComObject WScript.Shell).CreateShortcut("{ps_path}").TargetPath'
+                                out = subprocess.run(
+                                    ["powershell", "-NoProfile", "-Command", ps],
+                                    capture_output=True, text=True, timeout=5
+                                )
+                                target = (out.stdout or "").strip()
+                                if target and target.lower().endswith(('.exe', '.bat', '.cmd')):
+                                    apps.append({
+                                        "name": re.sub(r'[^\w\-]', '_', name.lower())[:64],
+                                        "display_name": name,
+                                        "exec_path": target,
+                                        "exec_args": "",
+                                        "category": "application",
+                                        "app_type": "gui",
+                                        "platform": plat,
+                                    })
+                            except Exception:
+                                pass
+            # Common CLI tools via where
+            for cmd in ["code", "cursor", "notepad", "cmd", "powershell", "python", "git", "node", "npm"]:
+                try:
+                    out = subprocess.run(["where", cmd], capture_output=True, text=True, timeout=3)
+                    if out.returncode == 0 and out.stdout:
+                        path = out.stdout.strip().split('\n')[0].strip()
+                        if path and os.path.isfile(path):
+                            apps.append({
+                                "name": cmd,
+                                "display_name": cmd,
+                                "exec_path": path,
+                                "exec_args": "",
+                                "category": "cli",
+                                "app_type": "cli",
+                                "platform": plat,
+                            })
+                except Exception:
+                    pass
+        except Exception as e:
+            print(f"{Colors.YELLOW}[SOFTWARE_REGISTRY]{Colors.RESET} Windows detection: {e}")
+        return apps
+
+    def _strip_desktop_placeholders(self, s):
+        """Remove .desktop Exec placeholders (%f, %F, %u, %U, %i, %c, %k, etc.)."""
+        return re.sub(r'%[a-zA-Z]', '', s).strip()
+
+    def _parse_desktop_exec(self, exec_line):
+        """Parse Exec line: resolve env prefix, get command path, filter placeholders from args."""
+        exec_line = self._strip_desktop_placeholders(exec_line)
+        if not exec_line:
+            return None, ""
+        try:
+            parts = shlex.split(exec_line)
+            if not parts:
+                return None, ""
+            idx = 0
+            while idx < len(parts) and parts[idx] == "env":
+                idx += 1
+                while idx < len(parts) and "=" in parts[idx]:
+                    idx += 1
+            if idx >= len(parts):
+                return None, ""
+            cmd = parts[idx]
+            if cmd.startswith('/') and os.path.isfile(cmd):
+                exec_path = cmd
+            else:
+                which_out = subprocess.run(["which", cmd], capture_output=True, text=True, timeout=2)
+                exec_path = which_out.stdout.strip() if which_out.returncode == 0 else cmd
+            args = " ".join(self._strip_desktop_placeholders(p) for p in parts[idx + 1:] if self._strip_desktop_placeholders(p))
+            return exec_path, args
+        except Exception:
+            return None, ""
+
+    def _detect_linux(self):
+        """Detect installed apps on Linux via .desktop files and which."""
+        apps = []
+        plat = "Linux"
+        try:
+            desktop_dirs = [
+                "/usr/share/applications",
+                os.path.expanduser("~/.local/share/applications"),
+            ]
+            for d in desktop_dirs:
+                if not os.path.isdir(d):
+                    continue
+                for f in glob.glob(os.path.join(d, "*.desktop")):
+                    try:
+                        cp = configparser.ConfigParser()
+                        cp.read(f, encoding='utf-8')
+                        if 'Desktop Entry' not in cp:
+                            continue
+                        de = cp['Desktop Entry']
+                        if de.get('NoDisplay', 'false').lower() == 'true':
+                            continue
+                        if de.get('Hidden', 'false').lower() == 'true':
+                            continue
+                        exec_line = de.get('Exec', '').strip()
+                        if not exec_line:
+                            continue
+                        exec_path, exec_args = self._parse_desktop_exec(exec_line)
+                        if not exec_path:
+                            continue
+                        name = de.get('Name', os.path.basename(f).replace('.desktop', ''))
+                        canonical = re.sub(r'[^\w\-]', '_', name.lower())[:64]
+                        app_type = "cli" if de.get('Terminal', 'false').lower() == 'true' else "gui"
+                        apps.append({
+                            "name": canonical,
+                            "display_name": name,
+                            "exec_path": exec_path,
+                            "exec_args": exec_args,
+                            "category": (de.get("Categories", "Application") or "Application").split(";")[0] or "Application",
+                            "app_type": app_type,
+                            "platform": plat,
+                        })
+                    except Exception:
+                        pass
+            # Common CLI tools
+            for cmd in ["code", "cursor", "xdg-open", "nautilus", "gnome-terminal", "konsole", "xterm", "python3", "python", "git", "node", "npm", "nvim", "vim", "nano"]:
+                try:
+                    out = subprocess.run(["which", cmd], capture_output=True, text=True, timeout=2)
+                    if out.returncode == 0 and out.stdout:
+                        path = out.stdout.strip()
+                        if path:
+                            apps.append({
+                                "name": cmd,
+                                "display_name": cmd,
+                                "exec_path": path,
+                                "exec_args": "",
+                                "category": "cli",
+                                "app_type": "cli",
+                                "platform": plat,
+                            })
+                except Exception:
+                    pass
+        except Exception as e:
+            print(f"{Colors.YELLOW}[SOFTWARE_REGISTRY]{Colors.RESET} Linux detection: {e}")
+        return apps
+
+    def _detect_darwin(self):
+        """Detect installed apps on macOS via /Applications and common CLI tools."""
+        apps = []
+        plat = "Darwin"
+        try:
+            app_dir = "/Applications"
+            if os.path.isdir(app_dir):
+                for name in os.listdir(app_dir):
+                    if name.endswith(".app"):
+                        app_path = os.path.join(app_dir, name)
+                        if os.path.isdir(app_path):
+                            exec_name = name.replace(".app", "")
+                            canonical = re.sub(r'[^\w\-]', '_', exec_name.lower())[:64]
+                            apps.append({
+                                "name": canonical,
+                                "display_name": exec_name,
+                                "exec_path": "/usr/bin/open",
+                                "exec_args": f"-a \"{exec_name}\"",
+                                "category": "application",
+                                "app_type": "gui",
+                                "platform": plat,
+                            })
+            for cmd in ["code", "cursor", "python3", "python", "git", "node", "npm", "vim", "nano", "open"]:
+                try:
+                    out = subprocess.run(["which", cmd], capture_output=True, text=True, timeout=2)
+                    if out.returncode == 0 and out.stdout:
+                        path = out.stdout.strip()
+                        if path and os.path.isfile(path):
+                            apps.append({
+                                "name": cmd,
+                                "display_name": cmd,
+                                "exec_path": path,
+                                "exec_args": "",
+                                "category": "cli",
+                                "app_type": "cli",
+                                "platform": plat,
+                            })
+                except Exception:
+                    pass
+        except Exception as e:
+            print(f"{Colors.YELLOW}[SOFTWARE_REGISTRY]{Colors.RESET} macOS detection: {e}")
+        return apps
+
+    def detect_and_store(self):
+        """Scan OS for installed software and save to DB."""
+        if not self.conn or not self.cursor:
+            return 0
+        plat = platform.system()
+        if plat == "Windows":
+            apps = self._detect_windows()
+        elif plat == "Linux":
+            apps = self._detect_linux()
+        elif plat == "Darwin":
+            apps = self._detect_darwin()
+        else:
+            apps = []
+        now = datetime.now().isoformat()
+        stored = 0
+        seen = set()
+        for a in apps:
+            key = (a["name"], plat)
+            if key in seen:
+                continue
+            seen.add(key)
+            try:
+                self.cursor.execute('''
+                    INSERT OR REPLACE INTO installed_software
+                    (name, display_name, exec_path, exec_args, category, app_type, last_detected, platform)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    a["name"], a["display_name"], a["exec_path"], a.get("exec_args", ""),
+                    a.get("category", "application"), a.get("app_type", "gui"), now, plat
+                ))
+                stored += 1
+            except sqlite3.Error:
+                pass
+        self.conn.commit()
+        return stored
+
+    def get_apps(self, filter_text=None, limit=100):
+        """Return list of installed apps, optionally filtered."""
+        if not self.conn or not self.cursor:
+            return []
+        plat = platform.system()
+        try:
+            if filter_text:
+                self.cursor.execute(
+                    "SELECT name, display_name, exec_path, app_type FROM installed_software WHERE platform=? AND (name LIKE ? OR display_name LIKE ?) ORDER BY display_name LIMIT ?",
+                    (plat, f"%{filter_text}%", f"%{filter_text}%", limit)
+                )
+            else:
+                self.cursor.execute(
+                    "SELECT name, display_name, exec_path, app_type FROM installed_software WHERE platform=? ORDER BY display_name LIMIT ?",
+                    (plat, limit)
+                )
+            return self.cursor.fetchall()
+        except sqlite3.Error:
+            return []
+
+    def get_app_by_name(self, name):
+        """Get app by canonical name; prefers exact match, then fuzzy."""
+        if not self.conn or not self.cursor:
+            return None
+        plat = platform.system()
+        name = name.strip().lower()
+        if not name:
+            return None
+        try:
+            self.cursor.execute(
+                "SELECT name, display_name, exec_path, exec_args, app_type FROM installed_software WHERE platform=? AND name=?",
+                (plat, name)
+            )
+            row = self.cursor.fetchone()
+            if row:
+                return row
+            self.cursor.execute(
+                "SELECT name, display_name, exec_path, exec_args, app_type FROM installed_software WHERE platform=? AND (name LIKE ? OR display_name LIKE ?) ORDER BY CASE WHEN name=? THEN 0 WHEN name LIKE ? THEN 1 ELSE 2 END, LENGTH(name) LIMIT 1",
+                (plat, f"%{name}%", f"%{name}%", name, f"{name}%")
+            )
+            return self.cursor.fetchone()
+        except sqlite3.Error:
+            return None
+
+    def launch_app(self, name, extra_args="", capture_output=False, timeout_sec=30):
+        """
+        Launch an app by name. For CLI apps with capture_output=True, returns output in I-Frame format.
+        For GUI apps, launches detached and returns status.
+        """
+        if not self.conn or not self.cursor:
+            return None, "Software registry database unavailable."
+        app = self.get_app_by_name(name)
+        if not app:
+            return None, f"App not found: {name}. Use APPS_DETECT to scan, or APPS_LIST to see available apps."
+        _, display_name, exec_path, exec_args, app_type = app
+        args_list = []
+        if exec_args:
+            args_list.extend(shlex.split(exec_args))
+        if extra_args:
+            args_list.extend(shlex.split(extra_args))
+        try:
+            if app_type == "cli" and capture_output:
+                result = subprocess.run(
+                    [exec_path] + args_list,
+                    capture_output=True, text=True, timeout=timeout_sec,
+                    cwd=os.path.expanduser("~")
+                )
+                out = (result.stdout or "") + (result.stderr or "")
+                return _format_frame_output(f"{display_name} (CLI)", out or "(no output)"), None
+            else:
+                if platform.system() == "Windows":
+                    try:
+                        flags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+                        subprocess.Popen([exec_path] + args_list, creationflags=flags, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    except (AttributeError, TypeError):
+                        subprocess.Popen([exec_path] + args_list, shell=False, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                else:
+                    subprocess.Popen([exec_path] + args_list, start_new_session=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                return _format_frame_output(f"{display_name}", f"Launched successfully in new window."), None
+        except subprocess.TimeoutExpired:
+            return None, "Launch timed out."
+        except Exception as e:
+            return None, str(e)
+
+    def ensure_detected(self):
+        """Ensure DB has apps; run detection if empty."""
+        if not self.conn or not self.cursor:
+            return
+        try:
+            plat = platform.system()
+            self.cursor.execute("SELECT COUNT(*) FROM installed_software WHERE platform=?", (plat,))
+            if self.cursor.fetchone()[0] == 0:
+                self.detect_and_store()
+        except sqlite3.Error:
+            pass
+
+
 class ToolRegistry:
     """Manages Native Tools, Custom Scripts, and MCP Clients."""
     def __init__(self, config):
@@ -1837,10 +2246,13 @@ class ToolRegistry:
         self.custom_tool_manager = CustomToolManager()
         self.playwright_browsers_installed = False
         self.browser_manager = BrowserManager() if PLAYWRIGHT_AVAILABLE else None
+        self.software_registry = SoftwareRegistry()
         self.working_directory = None  # Set by App when user does /traverse
         self.load_mcp_servers()
         # Check Playwright browsers in background to avoid blocking startup
         threading.Thread(target=self._ensure_playwright_browsers, daemon=True).start()
+        # Auto-detect installed software in background (saves to DB)
+        threading.Thread(target=self._ensure_software_detected, daemon=True).start()
 
     def load_mcp_servers(self):
         if os.path.exists(MCP_CONFIG_FILE):
@@ -1893,6 +2305,13 @@ class ToolRegistry:
         except Exception as e:
             print(f"{Colors.BRIGHT_YELLOW}[SYSTEM]{Colors.RESET} Playwright browser installation check failed: {e}")
             print(f"{Colors.DIM}You can manually install browsers with: python -m playwright install chromium{Colors.RESET}")
+
+    def _ensure_software_detected(self):
+        """Ensure installed software is detected and stored in DB."""
+        try:
+            self.software_registry.ensure_detected()
+        except Exception as e:
+            print(f"{Colors.YELLOW}[SOFTWARE_REGISTRY]{Colors.RESET} Detection: {e}")
 
     def get_tool_prompt(self):
         """Returns the help text injected into the System Prompt."""
@@ -2018,6 +2437,14 @@ class ToolRegistry:
             p += "  ACTION: FILE_WRITE ~/Desktop/file.txt | content here\n"
             p += "To read a file from Desktop:\n"
             p += "  ACTION: FILE_READ ~/Desktop/file.txt\n"
+        
+        p += "\n   INSTALLED SOFTWARE (auto-detected, stored in DB):\n"
+        p += "   - ACTION: APPS_LIST [filter] (List installed apps; filter optional)\n"
+        p += "   - ACTION: APPS_DETECT (Re-scan OS for installed software, save to DB)\n"
+        p += "   - ACTION: LAUNCH_APP [name] (Launch app by name in new window)\n"
+        p += "   - ACTION: LAUNCH_APP [name] | [args] (Launch with extra arguments)\n"
+        p += "   - ACTION: LAUNCH_APP [name] | --capture (CLI apps: capture output in I-Frame)\n"
+        p += "     Apps are auto-detected on startup. Use APPS_LIST to see available apps.\n"
         
         # Custom tools
         custom_tools = self.custom_tool_manager.list_tools()
@@ -2339,6 +2766,43 @@ class ToolRegistry:
                 return f"Successfully appended to {target}"
             except Exception as e:
                 return f"Append Error: {e}"
+
+        elif action == "APPS_LIST":
+            # List installed apps: APPS_LIST [filter]
+            filter_text = args.strip() if args else None
+            apps = self.software_registry.get_apps(filter_text=filter_text)
+            if not apps:
+                return _format_frame_output("Installed Software", "No apps found. Use APPS_DETECT to scan.")
+            lines = [f"{dname} ({name}) [{atype}]" for name, dname, _, atype in apps]
+            return _format_frame_output("Installed Software", "\n".join(lines))
+
+        elif action == "APPS_DETECT":
+            # Re-scan and store installed software
+            count = self.software_registry.detect_and_store()
+            return _format_frame_output("Software Detection", f"Detected and stored {count} applications.")
+
+        elif action == "LAUNCH_APP":
+            # Launch app: LAUNCH_APP name | [extra_args] or LAUNCH_APP name
+            # Optional: LAUNCH_APP name | --capture for CLI output in I-Frame
+            extra_args = ""
+            capture = False
+            if "|" in args:
+                name_part, rest = args.split("|", 1)
+                name = name_part.strip()
+                rest = rest.strip()
+                if "--capture" in rest:
+                    capture = True
+                    extra_args = re.sub(r'--capture\s*', '', rest).strip()
+                else:
+                    extra_args = rest
+            else:
+                name = args.strip()
+            if not name:
+                return "Error: LAUNCH_APP requires app name. Use APPS_LIST to see available apps."
+            framed, err = self.software_registry.launch_app(name, extra_args=extra_args, capture_output=capture)
+            if err:
+                return f"Error: {err}"
+            return framed
 
         return "Unknown Action."
 

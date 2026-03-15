@@ -1,297 +1,390 @@
 # 🛡️ AI Terminal Pro 🛡️
 
-A **privacy-first**, terminal-based AI assistant you actually control. Run LLMs locally via **Ollama** or through self-hosted endpoints like **Hugging Face**, no cloud lock-in, no data collection, no nonsense.
+A **local-first**, terminal-based AI assistant with full **cloud flexibility**. Run LLMs privately via **Ollama**, **llama.cpp**, or **HuggingFace** — or connect to **OpenAI, Anthropic, Gemini, Groq, DeepSeek, and more**. Your choice. Your control.
 
-Built for **developers**,  
-Built for **power users**,  
-Built for **privacy-first professionals**.
+Built for **developers**, **power users**, and **professionals who want options**.
+
+---
+
+## 📋 Table of Contents
+
+- [Core Features](#-core-features-)
+- [Tech Stack](#-tech-stack-)
+- [Quick Start](#-quick-start-)
+- [Backend Configuration](#-backend-configuration-)
+- [Usage Guide](#-usage-guide-)
+- [ACTION Reference](#-action-reference-)
+- [Project Structure](#-project-structure-)
+- [Optional Features](#optional-features-installation)
+- [Troubleshooting](#troubleshooting)
+- [Documentation](#-documentation-)
+- [Contributing](#-contributing-)
+- [License](#-license-)
 
 ---
 
 ## 🔑 Core Features 🔑
 
 ### 🤖 AI & Model Support
-- 💻 **Local or Self-Hosted Model Support** (Ollama, Hugging Face)
-- 🔄 **Multiple Backend Support** - Switch between Ollama and HuggingFace Transformers
-- 🎯 **Configurable Model Parameters** - Temperature, context window, response tokens
-- 🚀 **GPU & CPU Compatibility** - Optimized for both hardware configurations
-
-### 🧠 Memory & Context
-- 🧠 **RAG-Enabled Context Memory** (local vector database)
-- 📁 **Session & Project Management** with persistent memory
-- 🔍 **Semantic Search** - Vector embeddings for intelligent context retrieval
-- 💾 **Persistent Storage** - SQLite-based memory with automatic backups
-- 📚 **Document Ingestion** - Load documents, code, and text files for context
-
-### 🛠️ Custom Tooling & Automation
-- 🛠️ **Custom Tooling** (Python, JSON, YAML)
-- 🔌 **MCP Server Integration** (file systems, APIs, GitHub, databases)
-- ⚡ **Action System** - Execute tools with `ACTION:` syntax
-- 🛡️ **Safety Controls** - Dangerous command protection with sandboxing
-- 🌐 **Web Browsing** - Playwright-powered browser automation
-
-### 🎨 User Interface
-- 🎨 **Modern Terminal UI** built with Textual
-- 📱 **Rich Terminal Output** - Color-coded, formatted responses
-- ⌨️ **Keyboard Shortcuts** - Efficient navigation and commands
-- 🎭 **Enhanced Help System** - Comprehensive command documentation
-- 🎬 **Splash Screen** - Animated startup experience
+- **10 Backends** — Local and cloud from one interface
+- **Local**: Ollama, llama.cpp (OpenAI-compatible), HuggingFace Transformers
+- **Cloud**: OpenAI, Anthropic, Google Gemini, OpenRouter, Groq, DeepSeek, HuggingFace Cloud
+- **Live Switching** — Change backend and model from Settings (menu 9 → option 4)
+- **Configurable** — Temperature, context window, response tokens per backend
+- **GPU & CPU** — Optimized for both
 
 ### 🔐 Privacy & Security
-- 🔐 **No Telemetry or Tracking** — Your data stays with you
-- 🔒 **Encrypted API Access** for remote/mobile use (Fernet encryption)
-- 🛡️ **Sandboxed Execution** - Safe tool execution environment
-- 🔑 **IP Whitelisting** - Secure API access control
-- 🔐 **Authentication Support** - API key protection
+- **Local Mode** — Zero telemetry when using local backends
+- **Encrypted Keys** — Cloud API keys encrypted at rest (Fernet, PBKDF2-derived)
+- **Sandboxed Execution** — Tool execution in restricted environment
+- **IP Whitelisting** — Optional API access control
+- **API Authentication** — Key protection for local API server
+
+### 🧠 Memory & Context
+- **RAG** — Local vector database with semantic search
+- **Session & Project Management** — Persistent memory
+- **Document Ingestion** — PDFs, text, code, markdown
+- **Self-Healing SQLite** — Automatic database recovery
+
+### 🛠️ Custom Tooling & Automation
+- **Custom Tools** — Python, JSON, YAML definitions
+- **MCP Integration** — Model Context Protocol servers (file systems, APIs, GitHub)
+- **ACTION Syntax** — `ACTION: TOOL_NAME args` for tool execution
+- **Safety Controls** — Dangerous command protection (enable in Settings)
+- **Web Browsing** — Playwright visible browser (auto-installs Chromium)
+- **Desktop Automation** — OS-aware CMD, file ops (Windows, Linux, macOS)
+- **Software Registry** — Auto-detect installed apps, launch with I-Frame output
+
+### 🧩 Extension System
+- **Extensions Directory** — `extensions/` for plugin auto-loading
+- **Extension Manifests** — JSON config (`gemini-extension.json` format)
+- **MCP Servers** — Extensions can expose their own MCP
+- **Lifecycle** — Started and managed by `ExtensionManager`
+
+### 🎨 User Interface
+- **Rich Terminal** — Color-coded, formatted output
+- **Keyboard-Driven** — Efficient text navigation
+- **Help System** — `/help` for in-chat command docs
+- **Splash Screen** — Animated startup
+- **Configurable Editor** — VS Code, Cursor, Sublime, etc. for tools/MCP
 
 ### 🌐 API & Remote Access
-- 🌐 **RESTful API Server** - Flask-based API endpoints
-- 📱 **Mobile/Remote Access** - Encrypted API for remote connections
-- 🔒 **CORS Support** - Configurable cross-origin resource sharing
-- 🏥 **Health Endpoints** - Monitoring and status checks
-- 🔑 **Multiple API Instances** - Run multiple API servers simultaneously
+- **REST Endpoints** — `/chat`, `/health`, `/info`
+- **Fernet Encryption** — Secure API communication
+- **Multiple Instances** — Run on different ports
+- **CORS** — Configurable cross-origin
 
-### 🧪 Model Training & Fine-Tuning
-- 🧪 **Fine-Tuning Support** - Train models on custom datasets
-- 📊 **LoRA (Low-Rank Adaptation)** - Efficient parameter-efficient fine-tuning
-- 🎓 **RLHF (Reinforcement Learning from Human Feedback)** - Train with human preferences
-- 📁 **Dataset Management** - Organize and manage training data
-- 💾 **Model Checkpoints** - Save and load training progress
+### 🧪 Model Training
+- **Fine-Tuning** — Custom datasets
+- **LoRA** — Parameter-efficient fine-tuning
+- **RLHF** — PPO-based reinforcement learning
+- **Checkpoints** — Save/load in `.claude/models/`
 
-### 🏗️ Development Tools
-- 🏗️ **Multi-Agent App Builder** - Orchestrated development system
-- 👥 **Specialized Agents** - SpecificationWriter, Architect, TechLead, Developer, Reviewer, and more
-- 📝 **Project Management** - Track and manage development projects
-- 🔄 **Auto-Update** - Update from GitHub with automatic backups
-- 📦 **Project Export/Import** - Save and share project configurations
+### 🏗️ Multi-Agent App Builder
+- **Agents** — SpecificationWriter, Architect, TechLead, Developer, CodeMonkey, Reviewer, Troubleshooter, Debugger, TechnicalWriter
+- **Project Tracking** — Persistent state
+- **Code Generation** — Automated pipeline
 
 ### 🎤 Voice & Vision (Optional)
-- 🎤 **Text-to-Speech (TTS)** - Voice output with multiple engines (pyttsx3, kokoro)
-- 🗣️ **Speech Recognition** - Whisper-based voice input
-- 📷 **Camera Integration (Sight)** - Computer vision with OpenCV
-- 🎥 **Vision Assistant** - Combined voice and vision capabilities
-- 🎙️ **Enhanced TTS Pro Mode** - Professional-grade voice interaction with RAG
-
-### 🔄 Dual Implementation
-- 🐍 **Python Version** - Full-featured production-ready application
-- ⚡ **TypeScript/Bun Version** - Modern, fast TypeScript implementation (in progress)
-- 🔀 **Shared Architecture** - Compatible configurations and features
-- 🎯 **Feature Parity** - Core features available in both versions
+- **Basic TTS** — `pyttsx3` + Whisper (`/voice`, `/tts`)
+- **TTS Pro** — `faster-whisper` + `kokoro` + RAG (`/tts_pro`)
+- **Camera** — OpenCV (`/sight`)
+- **Vision Assistant** — Combined voice + vision (`/vision`)
 
 ---
 
 ## ⚙️ Tech Stack ⚙️
 
-### Python Version
-`Python 3.8+` · `PyTorch` · `Transformers` · `SQLite` · `Flask` · `Textual` · `Rich` · `Cryptography` · `Playwright` · `OpenCV` · `Whisper`
-
-### TypeScript/Bun Version
-`TypeScript` · `Bun` · `React/Ink` · `better-sqlite3` · `Hono` · `@xenova/transformers`
+`Python 3.8+` · `PyTorch` · `Transformers` · `SQLite` · `Flask` · `Rich` · `Cryptography` · `Playwright` · `OpenCV` · `Whisper` · `faster-whisper` · `kokoro` · `sentence-transformers` · `chromadb`
 
 ---
 
 ## 🚀 Quick Start 🚀
 
 ### Prerequisites
-- **Python 3.8+** (for Python version)
-- **Bun** (for TypeScript version, optional)
-- **Ollama** (recommended) or HuggingFace models
+- **Python 3.8+**
+- **Ollama** (recommended for local) — or a cloud API key
 
 ### Installation
 
-1. **Clone the repository**
-   ```bash
-   git clone https://github.com/your-username/ai-terminal-pro.git
-   cd ai-terminal-pro
-   ```
-
-2. **Install dependencies**
-   ```bash
-   # For Python version
-   pip install -r requirements.txt
-   
-   # For minimal installation (core features only)
-   pip install requests beautifulsoup4 transformers torch cryptography flask flask-cors textual rich
-   ```
-
-3. **Configure your backend**
-   
-   Edit `config.json`:
-   ```json
-   {
-     "backend": "ollama",
-     "model_name": "qwen2.5-coder:latest",
-     "enable_dangerous_commands": true,
-     "max_context_window": 2048,
-     "temperature": 0.7
-   }
-   ```
-
-4. **Run the application**
-   ```bash
-   python ai.py
-   ```
-
-### Optional Features Installation
-
-**For Text-to-Speech (Basic):**
 ```bash
-pip install openai-whisper pyttsx3 sounddevice soundfile
+# Clone
+git clone https://github.com/repackedadmin/-AI-Terminal-Pro-.git
+cd -AI-Terminal-Pro-
+
+# Install dependencies
+pip install -r requirements.txt
+
+# Run
+python ai.py
 ```
 
-**For Enhanced TTS Pro:**
+**Minimal install** (core only):
 ```bash
-pip install faster-whisper kokoro pyaudio sentence-transformers chromadb tiktoken pyyaml
+pip install requests beautifulsoup4 transformers torch cryptography flask flask-cors rich
 ```
 
-**For Camera/Vision (Sight mode):**
-```bash
-pip install opencv-python numpy
-```
+**First run**: Select backend from Settings (menu 9 → option 4).
 
-**For Web Browsing:**
-```bash
-pip install playwright
-python -m playwright install chromium
-```
+---
 
-**For Model Training:**
-```bash
-pip install peft datasets accelerate trl
-```
+## ⚙️ Backend Configuration ⚙️
+
+### Local Backends (No API Key)
+
+| Backend | Setup |
+|---------|-------|
+| **Ollama** | `ollama pull qwen2.5-coder:latest` → Settings → Backend |
+| **llama.cpp** | Start server (default `http://127.0.0.1:8080`) → Settings → Backend |
+| **HuggingFace** | Settings → Backend → enter model ID (e.g. `mistralai/Mistral-7B-Instruct-v0.3`) |
+
+### Cloud Backends (API Key Required)
+
+1. **Settings** (menu 9) → **Manage Cloud API Keys** (option 5)
+2. Add/Update API key for your provider
+3. **Change AI Backend** (option 4) → select cloud provider
+4. Choose model from list (or press Enter for default)
+
+| Provider | Backend Option | API Key URL |
+|----------|----------------|-------------|
+| OpenAI | 4 | https://platform.openai.com/api-keys |
+| Anthropic | 5 | https://console.anthropic.com/ |
+| Google Gemini | 6 | https://ai.google.dev/ |
+| OpenRouter | 7 | https://openrouter.ai/keys |
+| Groq | 8 | https://console.groq.com/ |
+| DeepSeek | 9 | https://platform.deepseek.com/api_keys |
+| HuggingFace Cloud | 10 | https://huggingface.co/settings/tokens |
+
+Keys are **encrypted at rest** and never logged.
+
+### Settings Submenu (Main Menu → 9)
+
+| # | Option | Description |
+|---|--------|--------------|
+| 1 | Toggle Dangerous Commands | Allow CMD/file ops outside sandbox |
+| 2 | Edit System Prompt | Customize AI behavior |
+| 3 | Set Default Editor | VS Code, Cursor, Sublime for tools/MCP |
+| 4 | Change AI Backend | Switch between 10 backends |
+| 5 | Manage Cloud API Keys | Add/remove encrypted keys |
+| 6 | Back | Return to main menu |
 
 ---
 
 ## 📖 Usage Guide 📖
 
-### Main Menu Options
+### Main Menu
 
-1. **Start Chat** - Interactive conversation with RAG context
-2. **Document Loader (RAG)** - Add documents for context retrieval
-3. **Tool Management** - Create and manage custom tools
-4. **MCP Server Management** - Configure Model Context Protocol servers
-5. **Model Training** - Fine-tune, LoRA, and RLHF training
-6. **API Management** - Create and manage encrypted API endpoints
-7. **App Builder** - Multi-agent development system
-8. **Update from GitHub** - Auto-update with backups
-9. **Settings** - Configure application settings
-10. **Exit** - Exit the application
+| # | Option | Description |
+|---|--------|--------------|
+| 1 | Start Chat | Interactive chat with RAG context |
+| 2 | Document Loader (RAG) | Add documents for context |
+| 3 | Tool Management | Create/manage custom tools |
+| 4 | MCP Server Management | Configure MCP servers |
+| 5 | Model Training | Fine-tune, LoRA, RLHF |
+| 6 | API Management | Encrypted API endpoints |
+| 7 | App Builder | Multi-agent development |
+| 8 | Update from GitHub | Auto-update with backups |
+| 9 | Settings | Backend, keys, editor |
+| 10 | Exit | Quit |
 
 ### Chat Commands
 
-- `/help` or `/?` - Show available commands
-- `/new [name]` - Create new chat session
-- `/save [filename]` - Save current chat to file
-- `/load [id|filename]` - Load chat session
-- `/project [name|desc]` - Create/switch project
-- `/back` - Return to main menu
-- `/camera` - Launch camera-only assistant
-- `/voice` or `/tts` - Launch voice/TTS assistant
-- `/vision` - Launch unified Vision + Voice assistant
+| Command | Description |
+|---------|-------------|
+| `/help` or `/?` | Show all commands |
+| `/new [name]` | New chat session |
+| `/save [filename]` | Save chat to file |
+| `/load [id\|filename]` | Load chat session |
+| `/project [name\|desc]` | Create/switch project |
+| `/back` | Return to main menu |
+| `/traverse` | Interactive directory browser |
+| `/browser [subcmd]` | Playwright browser automation |
+| `/camera` | Camera-only assistant |
+| `/voice` or `/tts` | Basic voice/TTS |
+| `/tts_pro` | Enhanced TTS Pro |
+| `/vision` | Vision + Voice assistant |
 
-### Tool Execution
+### `/browser` Subcommands
 
-Use the `ACTION:` syntax to execute tools:
+| Subcommand | Example | Description |
+|------------|---------|-------------|
+| `open <url>` | `/browser open google.com` | Navigate to URL |
+| `back` | `/browser back` | Go back |
+| `forward` | `/browser forward` | Go forward |
+| `refresh` | `/browser refresh` | Refresh page |
+| `url` | `/browser url` | Show current URL |
+| `screenshot [path]` | `/browser screenshot` | Take screenshot |
+| `html` | `/browser html` | Get page HTML |
+| `text` | `/browser text` | Get page text |
+| `click <selector>` | `/browser click button#submit` | Click element |
+| `fill <sel> <text>` | `/browser fill input#email x@y.com` | Fill input |
+| `scroll <dir>` | `/browser scroll down` | Scroll up/down/top/bottom |
+| `js <code>` | `/browser js document.title` | Execute JavaScript |
+| `wait <ms>` | `/browser wait 2000` | Wait milliseconds |
+| `pdf [path]` | `/browser pdf` | Export to PDF |
+| `status` | `/browser status` | Show browser status |
+| `close` | `/browser close` | Close browser |
+
+---
+
+## 🎯 ACTION Reference 🎯
+
+All tools use: `ACTION: TOOL_NAME [arguments]`
+
+### File Operations
+| Action | Format | Example |
+|--------|--------|---------|
+| `FILE_READ` | `path` | `ACTION: FILE_READ ~/Desktop/file.txt` |
+| `FILE_WRITE` | `path \| content` | `ACTION: FILE_WRITE out.txt \| Hello` |
+| `FILE_EDIT` | `path \|\|\| old \|\|\| new` | `ACTION: FILE_EDIT f.py \|\|\| bug \|\|\| fix` |
+| `FILE_APPEND` | `path \| content` | `ACTION: FILE_APPEND log.txt \| line` |
+| `FILE_LIST` | `[path]` | `ACTION: FILE_LIST ~/Desktop` |
+
+### Shell Commands (requires Dangerous Commands enabled)
+| Action | Format | Example |
+|--------|--------|---------|
+| `CMD` | `command` | `ACTION: CMD ls -la` (Linux) |
+| `CMD` | `command` | `ACTION: CMD dir` (Windows) |
+
+### Web Browsing (Playwright)
+| Action | Format | Example |
+|--------|--------|---------|
+| `BROWSE` | `url(s)` | `ACTION: BROWSE https://google.com` |
+| `BROWSE_SEARCH` | `query` | `ACTION: BROWSE_SEARCH python tutorial` |
+| `BROWSE_CLICK_FIRST` | — | `ACTION: BROWSE_CLICK_FIRST` |
+| `BROWSE_CLICK` | `selector` | `ACTION: BROWSE_CLICK button#submit` |
+| `BROWSE_TYPE` | `selector \| text` | `ACTION: BROWSE_TYPE input#q \| hello` |
+| `BROWSE_PRESS` | `selector \| key` | `ACTION: BROWSE_PRESS input#q \| Enter` |
+| `BROWSE_WAIT` | `milliseconds` | `ACTION: BROWSE_WAIT 2000` |
+
+*Multiple URLs: `ACTION: BROWSE url1, url2, url3`*
+
+### Installed Software Registry
+| Action | Format | Example |
+|--------|--------|---------|
+| `APPS_LIST` | `[filter]` | `ACTION: APPS_LIST code` |
+| `APPS_DETECT` | — | `ACTION: APPS_DETECT` |
+| `LAUNCH_APP` | `name` | `ACTION: LAUNCH_APP code` |
+| `LAUNCH_APP` | `name \| args` | `ACTION: LAUNCH_APP python3 \| --version` |
+| `LAUNCH_APP` | `name \| --capture` | `ACTION: LAUNCH_APP python3 \| --capture` |
+
+*`--capture` captures CLI output in I-Frame for terminal apps.*
+
+### Desktop Automation
+- **Platform Detection**: Auto-detects Windows, Linux, macOS
+- **Desktop Path**: `~/Desktop/` works on all platforms
+- **CMD**: Windows uses `dir`, `mkdir`, `type`, `del`; Linux uses `ls`, `mkdir`, `cat`, `rm`
+
+---
+
+## 📁 Project Structure 📁
+
 ```
-ACTION: TOOL_NAME arg1 arg2 ...
+ai_latest/
+├── ai.py                 # Main application (~14k lines)
+├── config.json           # User config (backend, keys, etc.)
+├── requirements.txt      # Dependencies
+├── README.md             # This file
+├── CONTRIBUTING.md       # Contribution guidelines
+├── ai_memory.sqlite      # Chat history, RAG documents
+├── software_registry.sqlite  # Installed apps cache
+├── app_projects.sqlite   # App Builder projects
+├── api/                  # API keys, encryption
+├── apps/                 # App Builder outputs
+├── custom_tools/         # Custom tool definitions
+├── documents/            # RAG documents
+├── extensions/           # Plugin extensions
+├── training/             # Fine-tuning data, models
+│   ├── data/
+│   ├── models/
+│   ├── lora/
+│   └── reinforcement/
+└── tui/                  # TUI components
+    ├── app_integration.py
+    └── components/
 ```
 
 ---
 
-## 🎯 Key Capabilities 🎯
+## Optional Features Installation
 
-### RAG (Retrieval-Augmented Generation)
-- **Document Ingestion**: Load PDFs, text files, code, markdown
-- **Semantic Search**: Vector embeddings for intelligent context retrieval
-- **Project Memory**: Project-specific context storage
-- **Session History**: Persistent conversation memory
+| Feature | Command |
+|---------|---------|
+| **TTS Basic** | `pip install openai-whisper pyttsx3 sounddevice soundfile` |
+| **TTS Pro** | `pip install faster-whisper kokoro pyaudio sentence-transformers chromadb tiktoken pyyaml` |
+| **Camera/Vision** | `pip install opencv-python numpy` |
+| **Web Browsing** | `pip install playwright` then `python -m playwright install chromium` |
+| **Model Training** | `pip install peft datasets accelerate trl` |
 
-### Custom Tools
-- **Python Tools**: Write custom Python functions
-- **JSON/YAML Tools**: Define tools declaratively
-- **MCP Tools**: Integrate Model Context Protocol servers
-- **Web Tools**: Browser automation and web scraping
-- **File Tools**: File system operations (with safety checks)
-
-### Multi-Agent Development
-- **App Builder**: Orchestrate multiple specialized agents
-- **Agents**: SpecificationWriter, Architect, TechLead, Developer, CodeMonkey, Reviewer, Troubleshooter, Debugger, TechnicalWriter
-- **Project Tracking**: Manage development projects with persistent state
-- **Code Generation**: Automated code generation and review
-
-### API Server
-- **RESTful Endpoints**: `/chat`, `/health`, `/info`
-- **Encryption**: Fernet-based encryption for secure communication
-- **Authentication**: API key support
-- **CORS**: Configurable cross-origin resource sharing
-- **Multiple Instances**: Run multiple API servers on different ports
+*Chromium auto-installs on first BROWSE action if missing.*
 
 ---
 
-## 📚 Documentation 📚
+## Troubleshooting
 
-For detailed documentation, see:
-- **[WIKI.md](WIKI.md)** - Comprehensive documentation and guides
-- **[CONTRIBUTING.md](CONTRIBUTING.md)** - Contribution guidelines
-- **[TUI_INTEGRATION.md](TUI_INTEGRATION.md)** - Terminal UI integration details
-- **[MEMORYBANK.md](MEMORYBANK.md)** - Architecture and memory system
+| Issue | Solution |
+|-------|----------|
+| **Ollama not found** | Install: https://ollama.ai — run `ollama serve` |
+| **llama.cpp not responding** | Start server on port 8080; check Settings for base URL |
+| **Cloud API errors** | Verify key in Settings → Manage Cloud API Keys |
+| **Playwright fails** | Run `python -m playwright install chromium` |
+| **Database errors** | Self-healing runs on startup; delete `ai_memory.sqlite` to reset |
+| **No apps in APPS_LIST** | Run `ACTION: APPS_DETECT` to scan |
+| **Dangerous Commands denied** | Settings → Toggle Dangerous Commands |
 
 ---
 
 ## 🔑 Roadmap 🔑
 
 ### Completed ✅
-- ✅ Local model support (Ollama, HuggingFace)
-- ✅ RAG system with vector database
-- ✅ Custom tooling (Python, JSON, YAML)
-- ✅ MCP server integration
-- ✅ Text-to-Speech (TTS)
-- ✅ Camera/Vision (Sight) functionality
-- ✅ Web browsing with Playwright
-- ✅ Model training (Fine-tuning, LoRA, RLHF)
-- ✅ API server with encryption
-- ✅ Multi-agent App Builder
-- ✅ Modern Terminal UI (Textual)
-- ✅ Enhanced help system
-- ✅ Session and project management
+- Desktop automation (Windows, Linux, macOS)
+- Installed software registry (auto-detect, LAUNCH_APP, I-Frame)
+- Playwright web browsing (auto-install Chromium)
+- 10 backends (local + cloud)
+- Encrypted API keys, RAG, MCP, extensions
+- TTS (basic + Pro), Camera/Vision
+- Model training, App Builder, API server
 
 ### In Progress 🔄
-- 🔄 TypeScript/Bun version completion
-- 🔄 Full Textual menu system
-- 🔄 Enhanced settings UI
+- Full Textual TUI menu
+- Enhanced settings UI
+- Extension marketplace
 
 ### Planned 📋
-- 📋 Multi-purpose terminal GUI
-- 📋 Full automation capabilities
-- 📋 Background agent system
-- 📋 Vision (image generation)
-- 📋 API Gateway
-- 📋 GPU + CPU compatibility optimizations
-
-**Have ideas?** Let us know! Check out [CONTRIBUTING.md](CONTRIBUTING.md) to contribute.
+- Background agent system
+- API Gateway for multi-user
+- Image generation integration
+- Full automation pipeline
 
 ---
 
 ## 📸 Screenshots 📸
 
-<img width="1296" height="576" alt="FMJ9J61" src="https://github.com/user-attachments/assets/fbbc5ea5-451d-40b9-942a-8d0af8986478" />
-<img width="1296" height="576" alt="xjGMhsH" src="https://github.com/user-attachments/assets/8f42fc81-b09b-4ed4-b081-1e5881a09d0b" />
-<img width="1296" height="576" alt="xN0yKbW" src="https://github.com/user-attachments/assets/d3db41d6-d751-4f1f-a072-2aaab3e5af40" />
+<img width="1296" height="576" alt="Screenshot 1" src="https://github.com/user-attachments/assets/fbbc5ea5-451d-40b9-942a-8d0af8986478" />
+<img width="1296" height="576" alt="Screenshot 2" src="https://github.com/user-attachments/assets/8f42fc81-b09b-4ed4-b081-1e5881a09d0b" />
+<img width="1296" height="576" alt="Screenshot 3" src="https://github.com/user-attachments/assets/d3db41d6-d751-4f1f-a072-2aaab3e5af40" />
+
+---
+
+## 📚 Documentation 📚
+
+- **[CONTRIBUTING.md](CONTRIBUTING.md)** — Contribution guidelines
+- **[CLAUDE.md](CLAUDE.md)** — Architecture reference for developers/AI assistants
 
 ---
 
 ## 👥 Contributing 👥
 
-We welcome contributions! Whether it's fixing bugs, improving documentation, or adding new features check out our [CONTRIBUTING.md](CONTRIBUTING.md) to get started.
+Contributions welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 
 ---
 
 ## 📜 License 📜
 
-This project is licensed under the **MIT License** — see [LICENSE](LICENSE) for details.  
+**MIT License** — see [LICENSE](LICENSE).
 
 Use it. Modify it. Make it yours.
 
 ---
 
-**Your data. Your models. Your rules.**
+**Local when you want privacy. Cloud when you need power. Always your choice.**

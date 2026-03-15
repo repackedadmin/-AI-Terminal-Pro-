@@ -1,7 +1,7 @@
 {
     "first_run": false,
     "backend": "openrouter",
-    "model_name": "google/gemini-3.1-pro-preview",
+    "model_name": "openrouter/free",
     "llama_cpp_base_url": "http://127.0.0.1:8080",
     "fast_chat_mode": true,
     "system_prompt": "You are a helpful AI assistant. Provide clear, accurate, and concise answers. Only use ACTION tools when the user explicitly asks or the task requires external actions. Do not claim tool outputs or system information you did not actually obtain.",
@@ -14,14 +14,21 @@
     "builder_threads": 1,
     "default_editor_command": "",
     "cloud_api_keys": {
-        "openrouter": "gAAAAABpmuIqsSlQAHZ-R3K8d2TbGOrCAdWFvHPMvGhK6Rj94-esYPLdwXWxGfTtcSg9TVxsPviE99RwY2C7nA2ct574cWIgi-zxCynqQOkJZN-BknhnKdSqJBMzNUoVbG5XoZ0xYoaf0PTbz2jNNZg22iKJXeij6lTh7hs9xOplvYcE3H_6ryU="
+        "groq": "gAAAAABpodNDCQBaE1MbrW-Z1fAGOqSwN9N8F76-1i_WITt-JAU0QX8mxkT3mQpWrr20CwGgmeKVWoJUcYpMlaXt0TLWfK3ZEcwo5Vo7KFrE5jZmRsVrNdG60FykzNtv7gFBUkSnp3XAAf83qbo7LKWnLH87hFF9-Q==",
+        "openrouter": "gAAAAABpodWS9h-PjQucylGBocuTJrvHWy4ihUnP8lvs6dLm2ofteJJBILEhh0tuTo4jtfOYKLyxxA14s86w2XUpx1n731neRGZSMcy0vB1zQ6-8T9RtwXR-epKlRCjmOVMSKwLThXaj6lnrsbbC-eYMVYwv2iYfesJdDqRFpkJraGH9bi3Yoog="
     },
     "openai_model": "gpt-4o",
     "anthropic_model": "claude-3-5-sonnet-20241022",
     "gemini_model": "gemini-2.0-flash-exp",
-    "openrouter_model": "google/gemini-3.1-pro-preview",
+    "openrouter_model": "openrouter/free",
     "openai_base_url": "https://api.openai.com/v1",
     "anthropic_base_url": "https://api.anthropic.com/v1",
     "gemini_base_url": "https://generativelanguage.googleapis.com/v1beta",
-    "openrouter_base_url": "https://openrouter.ai/api/v1"
+    "openrouter_base_url": "https://openrouter.ai/api/v1",
+    "groq_model": "meta-llama/llama-4-maverick-17b-128e-instruct",
+    "groq_base_url": "https://api.groq.com/openai/v1",
+    "deepseek_model": "deepseek-chat",
+    "deepseek_base_url": "https://api.deepseek.com/v1",
+    "hf_cloud_model": "mistralai/Mistral-7B-Instruct-v0.3",
+    "hf_cloud_base_url": "https://api-inference.huggingface.co/v1"
 }
