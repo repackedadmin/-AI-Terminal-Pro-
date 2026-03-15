@@ -369,7 +369,6 @@ ai_latest/
 ## 📚 Documentation 📚
 
 - **[CONTRIBUTING.md](CONTRIBUTING.md)** — Contribution guidelines
-- **[CLAUDE.md](CLAUDE.md)** — Architecture reference for developers/AI assistants
 
 ---
 
